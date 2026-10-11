@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "exportedAt": "2026-10-11T13:23:52Z",
+  "tables": [
+    {
+      "name": "zones",
+      "rows": 5
+    },
+    {
+      "name": "data_sources",
+      "rows": 36
+    },
+    {
+      "name": "table_field_definitions",
+      "rows": 280
+    },
+    {
+      "name": "data_source_rows",
+      "rows": 2800
+    },
+    {
+      "name": "data_source_row_events",
+      "rows": 4289
+    },
+    {
+      "name": "connections",
+      "rows": 6
+    },
+    {
+      "name": "streams",
+      "rows": 6
+    },
+    {
+      "name": "attribute_definitions",
+      "rows": 112
+    },
+    {
+      "name": "polygons",
+      "rows": 450
+    },
+    {
+      "name": "circles",
+      "rows": 4
+    },
+    {
+      "name": "lines",
+      "rows": 672
+    },
+    {
+      "name": "markers",
+      "rows": 187
+    },
+    {
+      "name": "doors",
+      "rows": 175
+    },
+    {
+      "name": "stairs",
+      "rows": 12
+    },
+    {
+      "name": "text_labels",
+      "rows": 132
+    },
+    {
+      "name": "images",
+      "rows": 11
+    },
+    {
+      "name": "models",
+      "rows": 5
+    },
+    {
+      "name": "grids",
+      "rows": 196
+    },
+    {
+      "name": "bins",
+      "rows": 314
+    },
+    {
+      "name": "style_rules",
+      "rows": 79
+    },
+    {
+      "name": "data_link_configs",
+      "rows": 19
+    },
+    {
+      "name": "reports",
+      "rows": 84
+    },
+    {
+      "name": "solutions",
+      "rows": 1
+    },
+    {
+      "name": "solution_items",
+      "rows": 9
+    },
+    {
+      "name": "tenant_files",
+      "rows": 11
+    }
+  ],
+  "files": [
+    {
+      "key": "demo-Gemini_Generated_Image_dlo0xidlo0xidlo0-41b3defdcfc15c2d500179e7-plain.jpeg",
+      "contentType": "image/jpeg",
+      "size": 242627
+    },
+    {
+      "key": "demo-Gemini_Generated_Image_hfyqtqhfyqtqhfyq-a484865af36b1d9740f75fd9.jpeg",
+      "contentType": "image/jpeg",
+      "size": 663231
+    },
+    {
+      "key": "demo-Professional_floor_blueprint_of_a_202606271508-a59f3b806d2b97bc54b33950.jpeg",
+      "contentType": "image/jpeg",
+      "size": 580185
+    },
+    {
+      "key": "demo-Professional_floor_blueprint_of_a_202606271512-0c72a4caf4fc637d2425f948.jpeg",
+      "contentType": "image/jpeg",
+      "size": 622353
+    },
+    {
+      "key": "demo-Professional_floor_blueprint_of_a_202606271517-158557e8748847ba082e0284.jpeg",
+      "contentType": "image/jpeg",
+      "size": 503509
+    },
+    {
+      "key": "demo-Retail_store_architectural_floor-_2K_20261005170316.jpg-cb903e2004eed121f7b98689.jpeg",
+      "contentType": "image/jpeg",
+      "size": 568187
+    },
+    {
+      "key": "demo-Retail_store_architectural_floor-_2K_20261008125747-b0eedd178f6fa0d46431cd24.jpeg",
+      "contentType": "image/jpeg",
+      "size": 515462
+    },
+    {
+      "key": "demo-Retail_store_architectural_floor-_2K_20261008150939-fe523cc7c0205cab33c8de4c.jpeg",
+      "contentType": "image/jpeg",
+      "size": 491367
+    },
+    {
+      "key": "demo-Second_floor_mall_blueprint_layout_202607120633-b4d1fbda22c2cca4aa926baa-plain.jpeg",
+      "contentType": "image/jpeg",
+      "size": 241833
+    },
+    {
+      "key": "demo-Supermarket_architectural_floor_-_2K_202609101008-772d4a39e150981a21b1b128.jpeg",
+      "contentType": "image/jpeg",
+      "size": 439648
+    },
+    {
+      "key": "demo-Warehouse_ground_floor_plan_2K_202608261509-4110e469347b8c237c24f381.jpeg",
+      "contentType": "image/jpeg",
+      "size": 703150
+    }
+  ]
+}

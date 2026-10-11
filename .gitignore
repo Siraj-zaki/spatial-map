@@ -1,0 +1,64 @@
+# Dependencies & builds
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment — only the *.example files are committed
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+# Real production config — copy config.prod.example.yaml and keep it out of git
+backend/config.prod.yaml
+backend/config.prod.local.yaml
+
+# Backend build outputs & local data
+backend/bin/
+backend/uploads/
+backend/api
+backend/tmp/
+
+# AI worker (Python)
+backend/ai-worker/.venv/
+backend/ai-worker/models/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Cloudflare worker
+worker/node_modules/
+worker/.wrangler/
+worker/.dev.vars
+
+# Tests
+test-results/
+playwright-report/
+test-e2e/.profile/
+
+# Editors & OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Never commit data exports or dumps
+*.dump
+*-backup-*.json

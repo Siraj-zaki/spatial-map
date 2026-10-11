@@ -1,0 +1,156 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+  shutdown_timeout: "10s"
+  # CORS allow-list. In prod, replace with your SPA origin(s). Wildcard is
+  # honoured only when explicitly listed. Empty = block all cross-origin.
+  allowed_origins:
+    - "http://localhost:5173"
+    - "http://localhost:4173"
+  # IPs / CIDRs whose X-Forwarded-For / X-Real-IP headers may be trusted.
+  # Empty = trust nothing (use RemoteAddr only). In production, set this to
+  # your load balancer / reverse proxy IPs — otherwise the rate limiter can
+  # be bypassed by any caller spoofing X-Forwarded-For.
+  trusted_proxies: []
+
+database:
+  url: "postgres://spatial:spatial@localhost:5432/spatial?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 25
+  conn_max_lifetime: "30m"
+
+auth:
+  mode: "apikey"
+  api_key: "dev-api-key-change-in-production"
+  # HS256 signing secret for user-session JWTs (signup/login).
+  # MUST be set to a long random string in production. Empty disables JWT auth.
+  jwt_secret: "dev-jwt-secret-change-in-production"
+  # Bootstrap admin user — created on startup if no user with this email exists.
+  # Idempotent (won't reset password if the user already exists; use
+  # cmd/seed-admin for that). Leave both empty to disable.
+  #
+  # This file is committed, so never put real credentials here. Use the
+  # SGV_AUTH.BOOTSTRAP_EMAIL / SGV_AUTH.BOOTSTRAP_PASSWORD env vars or
+  # cmd/seed-admin instead.
+  #
+  # Prefer setting these via env vars (see backend/.env.example):
+  #   SGV_AUTH.BOOTSTRAP_EMAIL=admin@example.com
+  #   SGV_AUTH.BOOTSTRAP_PASSWORD=<a strong password>
+  bootstrap_email: ""
+  bootstrap_password: ""
+
+# ============================================================================
+# Mail (transactional OTP + notifications)
+# ============================================================================
+# When `host` is empty the backend falls back to the CONSOLE mailer —
+# OTP codes are printed to /tmp/api.log so dev works without SMTP setup.
+# For real delivery, uncomment ONE of the recipes below and fill in the
+# secret. Verify with:
+#
+#   SGV_CONFIG=config.dev.yaml go run ./cmd/mail-test you@example.com
+#
+# ---------------------------------------------------------------------------
+# Recipe 1 — RESEND (recommended, easy signup, 3000 emails/mo free)
+#   1. Sign up + verify domain at https://resend.com
+#   2. Create an API key: Dashboard > API Keys
+#   3. Fill:
+# mail:
+#   host: "smtp.resend.com"
+#   port: 465
+#   username: "resend"
+#   password: "re_YOUR_API_KEY_HERE"
+#   from: "no-reply@yourdomain.com"       # must be on a Resend-verified domain
+#   from_name: "Spatial Map"
+# ---------------------------------------------------------------------------
+# Recipe 2 — GMAIL (free, works with any @gmail account, rate-limited)
+#   1. Enable 2-Step Verification on your Google account
+#   2. Create an App Password: https://myaccount.google.com/apppasswords
+#      (name it "Spatial Map backend"; you get a 16-char code, NOT your Gmail pw)
+#   3. Fill:
+# mail:
+#   host: "smtp.gmail.com"
+#   port: 587
+#   username: "your.address@gmail.com"
+#   password: "abcd efgh ijkl mnop"       # the 16-char App Password, spaces OK
+#   from: "your.address@gmail.com"
+#   from_name: "Spatial Map"
+# ---------------------------------------------------------------------------
+# Recipe 3 — MAILTRAP (sandbox, catches all mail without delivering)
+#   Perfect for testing the OTP flow without a real inbox. Every send lands
+#   in your Mailtrap inbox, not the recipient's real address.
+#   1. Sign up at https://mailtrap.io > Email Testing > My Inbox
+#   2. Copy SMTP credentials from "Show Credentials"
+#   3. Fill:
+# mail:
+#   host: "sandbox.smtp.mailtrap.io"
+#   port: 2525
+#   username: "YOUR_MAILTRAP_USER"
+#   password: "YOUR_MAILTRAP_PASS"
+#   from: "no-reply@example.com"          # any address; Mailtrap doesn't verify
+#   from_name: "Spatial Map"
+# ---------------------------------------------------------------------------
+# Env-var override (recommended for prod — never commit real creds):
+#   SGV_MAIL.HOST, SGV_MAIL.PORT, SGV_MAIL.USERNAME, SGV_MAIL.PASSWORD,
+#   SGV_MAIL.FROM, SGV_MAIL.FROM_NAME
+# ============================================================================
+mail:
+  host: ""                                # empty = console mailer (dev default)
+  port: 587
+  username: ""
+  password: ""
+  from: "no-reply@spatialmap.local"
+  from_name: "Spatial Map"
+
+# Public origin of the SPA. Used for links in auth emails (sign-in,
+# password reset). Override with SGV_APP.PUBLIC_URL in production.
+app:
+  public_url: "http://localhost:5173"
+
+websocket:
+  write_wait: "10s"
+  pong_wait: "60s"
+  ping_period: "54s"
+  max_message_size: 65536
+  replay_event_count: 100
+
+migration:
+  on_start: true
+  path: "migrations"
+
+storage:
+  type: "local"
+  base_path: "./uploads"
+  # Relative so the SPA resolves image/model URLs against whatever origin
+  # it was loaded from — critical for LAN access. See backend/.env.example.
+  base_url: "/files"
+
+# ============================================================================
+# AI floor plan detection (Python ai-worker)
+# ============================================================================
+# Powers the "AI Map" tool. Off by default: url must point at a running
+# ai-worker AND the target tenant must have opted in via app_settings
+# key "ai_floorplan_enabled:tenant:{id}" = "true".
+#
+# The Go API is a thin dispatcher: it enqueues a task on the ai-worker
+# via POST /detect and polls GET /detect/{taskId} until the CV pipeline
+# (SAM 2 + Tesseract + OpenCV + Shapely) returns detections. The
+# Ollama-Cloud path was removed 2026-08 in favor of an in-house CV
+# pipeline — see docs/ai-floorplan.md for the architecture.
+ai_worker:
+  url: "http://ai-worker:8100"                    # compose-network hostname; override for `make dev`
+  request_timeout: "30s"                          # per single HTTP call to the worker
+  poll_interval: "3s"                             # pace of GET /detect/{taskId}
+  poll_max_duration: "300s"                       # matches Python Dramatiq time_limit
+  monthly_cap_per_tenant: 200
+  hourly_rate_per_tenant: 20                      # jobs / hour
+  hourly_burst_per_tenant: 3                      # back-to-back allowance
+
+# Demo workspace (internal/demo): five sample facilities with tables, live
+# data links and reports, loaded once into an empty database on first start.
+# Every new account joins it as an editor. Delete it from the Workspaces
+# page, or set false before the first start to begin empty.
+demo:
+  enabled: true

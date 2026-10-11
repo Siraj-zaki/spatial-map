@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+tests/
+.git/
+.gitignore
+# README.md is kept in the image context because pyproject.toml
+# declares it as the project readme; hatchling validates its
+# presence during `uv sync`.

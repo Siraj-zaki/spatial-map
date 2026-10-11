@@ -1,0 +1,11 @@
+[
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":null,"id":30,"report_id":null,"solution_id":5,"tenant_id":0,"zone_id":66},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":null,"id":31,"report_id":37,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":null,"id":32,"report_id":40,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":null,"id":33,"report_id":38,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":null,"id":34,"report_id":39,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":43,"id":35,"report_id":null,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":49,"id":36,"report_id":null,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":52,"id":37,"report_id":null,"solution_id":5,"tenant_id":0,"zone_id":null},
+{"added_at":"2026-10-05T07:05:22.503137+00:00","data_source_id":54,"id":38,"report_id":null,"solution_id":5,"tenant_id":0,"zone_id":null}
+]

@@ -1,0 +1,11 @@
+Model Information:
+* title:	Industrial Forklift (Pnuematic Tire)
+* source:	https://sketchfab.com/3d-models/industrial-forklift-pnuematic-tire-930b8091326e4bec9b2607d05548de4a
+* author:	doty_aecom (https://sketchfab.com/doty_aecom)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Industrial Forklift (Pnuematic Tire)" (https://sketchfab.com/3d-models/industrial-forklift-pnuematic-tire-930b8091326e4bec9b2607d05548de4a) by doty_aecom (https://sketchfab.com/doty_aecom) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

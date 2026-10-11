@@ -1,0 +1,1553 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 240 5.9% 10%;
+    --radius: 0.5rem;
+    /* Semantic status colours for badges, deltas and health indicators.
+       Palette-independent on purpose: "healthy" must read green in every
+       palette. Used as `text-success`, `bg-warning/10`, … (tailwind.config). */
+    --success: 142 72% 32%;
+    --warning: 32 95% 38%;
+    --danger: 0 72% 48%;
+    --info: 217 90% 48%;
+    /* Categorical data colours for charts and KPI tones (reports). Also
+       palette-independent: series must stay distinguishable whatever the
+       brand accent is — including the near-black zinc primary. */
+    --chart-1: 221 83% 53%;
+    --chart-2: 162 63% 38%;
+    --chart-3: 262 60% 58%;
+    --chart-4: 32 92% 50%;
+    --chart-5: 340 70% 55%;
+    --chart-6: 190 80% 40%;
+    --chart-7: 84 60% 38%;
+    /* Neutral — the "Other" slice and anything that shouldn't compete. */
+    --chart-8: 215 16% 55%;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 3.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+    --success: 142 65% 58%;
+    --warning: 38 92% 60%;
+    --danger: 0 84% 68%;
+    --info: 217 91% 68%;
+    --chart-1: 217 91% 65%;
+    --chart-2: 158 55% 50%;
+    --chart-3: 262 75% 72%;
+    --chart-4: 38 92% 60%;
+    --chart-5: 340 80% 68%;
+    --chart-6: 190 75% 55%;
+    --chart-7: 84 55% 55%;
+    --chart-8: 215 14% 60%;
+  }
+}
+
+/*
+ * Palettes — override ONLY the accent triple (primary, primary-foreground,
+ * ring). Backgrounds/cards/borders stay neutral across palettes so the
+ * surface design language stays consistent; only the brand accent shifts.
+ * Mirrors how shadcn's `/colors` palettes compose: pick a Tailwind hue,
+ * snap primary to ~600 in light mode + ~500 in dark mode.
+ *
+ * Apply with `<html class="theme-blue">` (light) or
+ * `<html class="dark theme-blue">` (dark). The ThemeProvider manages both
+ * classes — never set them by hand.
+ *
+ * Default palette = no class (uses the zinc-flavoured tokens above).
+ *
+ * IMPORTANT: These rules are intentionally OUTSIDE `@layer base`. Tailwind
+ * tree-shakes selectors inside layers when their class names don't appear
+ * as literal strings in `content` files — and palette classes are built
+ * dynamically (`theme-${id}`) so Tailwind can't see them. Keeping these
+ * rules outside any `@layer` directive bypasses the purge.
+ *
+ * Light primary ≈ Tailwind 600, Dark primary ≈ Tailwind 500. Foreground
+ * stays white-ish except for the lighter warm-tone palettes (yellow, amber,
+ * gold, mustard, peach, salmon) where white-on-warm fails WCAG contrast —
+ * those use a near-black foreground.
+ */
+
+  /* Red ------------------------------------------------------------------ */
+  .theme-red       { --primary: 0 72.2% 50.6%;   --primary-foreground: 0 85.7% 97.3%;   --ring: 0 72.2% 50.6%; }
+  .theme-red.dark  { --primary: 0 84.2% 60.2%;   --primary-foreground: 210 20% 98%;     --ring: 0 84.2% 60.2%; }
+
+  /* Orange --------------------------------------------------------------- */
+  .theme-orange      { --primary: 24.6 95% 53.1%;  --primary-foreground: 60 9.1% 97.8%;   --ring: 24.6 95% 53.1%; }
+  .theme-orange.dark { --primary: 20.5 90.2% 48.2%; --primary-foreground: 60 9.1% 97.8%;  --ring: 20.5 90.2% 48.2%; }
+
+  /* Amber ---------------------------------------------------------------- */
+  .theme-amber      { --primary: 32.1 94.6% 43.7%; --primary-foreground: 60 9.1% 97.8%;   --ring: 32.1 94.6% 43.7%; }
+  .theme-amber.dark { --primary: 38 92% 50%;       --primary-foreground: 26 83.3% 14.1%;  --ring: 38 92% 50%; }
+
+  /* Yellow (dark foreground — white-on-yellow fails contrast) ----------- */
+  .theme-yellow      { --primary: 47.9 95.8% 53.1%; --primary-foreground: 26 83.3% 14.1%; --ring: 47.9 95.8% 53.1%; }
+  .theme-yellow.dark { --primary: 47.9 95.8% 53.1%; --primary-foreground: 26 83.3% 14.1%; --ring: 47.9 95.8% 53.1%; }
+
+  /* Lime ----------------------------------------------------------------- */
+  .theme-lime      { --primary: 84.8 85.2% 34.5%; --primary-foreground: 138 76.5% 96.7%;  --ring: 84.8 85.2% 34.5%; }
+  .theme-lime.dark { --primary: 82 84% 67%;       --primary-foreground: 84 81% 14%;       --ring: 82 84% 67%; }
+
+  /* Green ---------------------------------------------------------------- */
+  .theme-green      { --primary: 142.1 76.2% 36.3%; --primary-foreground: 355.7 100% 97.3%; --ring: 142.1 76.2% 36.3%; }
+  .theme-green.dark { --primary: 142.1 70.6% 45.3%; --primary-foreground: 144.9 80.4% 10%;  --ring: 142.4 71.8% 29.2%; }
+
+  /* Emerald -------------------------------------------------------------- */
+  .theme-emerald      { --primary: 161.4 93.5% 30.4%; --primary-foreground: 152 81% 96%;    --ring: 161.4 93.5% 30.4%; }
+  .theme-emerald.dark { --primary: 156.2 71.6% 66.9%; --primary-foreground: 151 80% 14.5%;  --ring: 156.2 71.6% 66.9%; }
+
+  /* Teal ----------------------------------------------------------------- */
+  .theme-teal      { --primary: 173.4 80.4% 40%;   --primary-foreground: 166 76% 97%;    --ring: 173.4 80.4% 40%; }
+  .theme-teal.dark { --primary: 172.5 66% 50.4%;   --primary-foreground: 169 80% 12.4%;  --ring: 172.5 66% 50.4%; }
+
+  /* Cyan ----------------------------------------------------------------- */
+  .theme-cyan      { --primary: 188.7 94.5% 42.7%; --primary-foreground: 183 100% 96%;   --ring: 188.7 94.5% 42.7%; }
+  .theme-cyan.dark { --primary: 186.4 86.5% 60%;   --primary-foreground: 186 91% 13.7%;  --ring: 186.4 86.5% 60%; }
+
+  /* Sky ------------------------------------------------------------------ */
+  .theme-sky      { --primary: 198.6 88.7% 48.4%; --primary-foreground: 204 100% 97.1%; --ring: 198.6 88.7% 48.4%; }
+  .theme-sky.dark { --primary: 198.4 93.2% 59.6%; --primary-foreground: 204 80% 16.1%;  --ring: 198.4 93.2% 59.6%; }
+
+  /* Blue ----------------------------------------------------------------- */
+  .theme-blue      { --primary: 221.2 83.2% 53.3%; --primary-foreground: 210 40% 98%;     --ring: 221.2 83.2% 53.3%; }
+  .theme-blue.dark { --primary: 217.2 91.2% 59.8%; --primary-foreground: 222.2 47.4% 11.2%; --ring: 224.3 76.3% 48%; }
+
+  /* Indigo --------------------------------------------------------------- */
+  .theme-indigo      { --primary: 238.7 83.5% 66.7%; --primary-foreground: 226 100% 97.3%; --ring: 238.7 83.5% 66.7%; }
+  .theme-indigo.dark { --primary: 234.5 89.5% 73.9%; --primary-foreground: 226 70% 14.3%;  --ring: 234.5 89.5% 73.9%; }
+
+  /* Violet --------------------------------------------------------------- */
+  .theme-violet      { --primary: 262.1 83.3% 57.8%; --primary-foreground: 210 20% 98%;    --ring: 262.1 83.3% 57.8%; }
+  .theme-violet.dark { --primary: 263.4 70% 50.4%;   --primary-foreground: 210 20% 98%;    --ring: 263.4 70% 50.4%; }
+
+  /* Purple --------------------------------------------------------------- */
+  .theme-purple      { --primary: 271.5 81.3% 55.9%; --primary-foreground: 270 100% 97.8%; --ring: 271.5 81.3% 55.9%; }
+  .theme-purple.dark { --primary: 270.7 91% 65.1%;   --primary-foreground: 270 50% 14.7%;  --ring: 270.7 91% 65.1%; }
+
+  /* Fuchsia -------------------------------------------------------------- */
+  .theme-fuchsia      { --primary: 292.2 84.1% 60.6%; --primary-foreground: 289 100% 97.8%; --ring: 292.2 84.1% 60.6%; }
+  .theme-fuchsia.dark { --primary: 292 91.4% 72.5%;   --primary-foreground: 289 80% 14.5%;  --ring: 292 91.4% 72.5%; }
+
+  /* Pink ----------------------------------------------------------------- */
+  .theme-pink      { --primary: 329.7 86.5% 51%;   --primary-foreground: 322 100% 97.6%; --ring: 329.7 86.5% 51%; }
+  .theme-pink.dark { --primary: 330.4 81.2% 60.4%; --primary-foreground: 322 80% 14.1%;  --ring: 330.4 81.2% 60.4%; }
+
+  /* Rose ----------------------------------------------------------------- */
+  .theme-rose      { --primary: 346.8 77.2% 49.8%; --primary-foreground: 355.7 100% 97.3%; --ring: 346.8 77.2% 49.8%; }
+  .theme-rose.dark { --primary: 349.7 89.2% 60.2%; --primary-foreground: 355 100% 97.3%;   --ring: 349.7 89.2% 60.2%; }
+
+  /* Crimson (deep red between rose and red) ------------------------------ */
+  .theme-crimson      { --primary: 352 80% 40%;   --primary-foreground: 355 100% 97%;     --ring: 352 80% 40%; }
+  .theme-crimson.dark { --primary: 352 75% 55%;   --primary-foreground: 355 90% 14%;      --ring: 352 75% 55%; }
+
+  /* Maroon (dark wine red) ----------------------------------------------- */
+  .theme-maroon      { --primary: 0 65% 25%;     --primary-foreground: 0 60% 97%;        --ring: 0 65% 25%; }
+  .theme-maroon.dark { --primary: 0 55% 50%;     --primary-foreground: 0 80% 14%;        --ring: 0 55% 50%; }
+
+  /* Scarlet (bright bold red between red and orange) --------------------- */
+  .theme-scarlet      { --primary: 9 88% 52%;    --primary-foreground: 9 80% 97%;        --ring: 9 88% 52%; }
+  .theme-scarlet.dark { --primary: 9 85% 62%;    --primary-foreground: 9 80% 14%;        --ring: 9 85% 62%; }
+
+  /* Coral (warm pink-orange) --------------------------------------------- */
+  .theme-coral      { --primary: 12 85% 55%;     --primary-foreground: 12 80% 97%;       --ring: 12 85% 55%; }
+  .theme-coral.dark { --primary: 12 80% 65%;     --primary-foreground: 12 80% 14%;       --ring: 12 80% 65%; }
+
+  /* Salmon (pink-orange, lighter than coral) ----------------------------- */
+  .theme-salmon      { --primary: 6 75% 60%;     --primary-foreground: 6 80% 14%;        --ring: 6 75% 60%; }
+  .theme-salmon.dark { --primary: 6 75% 70%;     --primary-foreground: 6 80% 14%;        --ring: 6 75% 70%; }
+
+  /* Peach (soft warm orange — dark fg both modes) ------------------------ */
+  .theme-peach      { --primary: 28 95% 65%;     --primary-foreground: 25 80% 14%;       --ring: 28 95% 65%; }
+  .theme-peach.dark { --primary: 28 90% 72%;     --primary-foreground: 25 80% 14%;       --ring: 28 90% 72%; }
+
+  /* Tangerine (vivid orange, more red-shifted) --------------------------- */
+  .theme-tangerine      { --primary: 16 92% 50%; --primary-foreground: 16 80% 97%;       --ring: 16 92% 50%; }
+  .theme-tangerine.dark { --primary: 16 88% 60%; --primary-foreground: 16 80% 14%;       --ring: 16 88% 60%; }
+
+  /* Gold (rich yellow-gold — dark fg both modes) ------------------------- */
+  .theme-gold      { --primary: 42 88% 45%;      --primary-foreground: 40 80% 14%;       --ring: 42 88% 45%; }
+  .theme-gold.dark { --primary: 42 92% 58%;      --primary-foreground: 40 80% 14%;       --ring: 42 92% 58%; }
+
+  /* Mustard (dark warm yellow — dark fg in dark mode) -------------------- */
+  .theme-mustard      { --primary: 45 78% 38%;   --primary-foreground: 45 60% 97%;       --ring: 45 78% 38%; }
+  .theme-mustard.dark { --primary: 45 88% 55%;   --primary-foreground: 45 80% 14%;       --ring: 45 88% 55%; }
+
+  /* Olive (yellow-green muted) ------------------------------------------- */
+  .theme-olive      { --primary: 82 42% 32%;     --primary-foreground: 82 30% 97%;       --ring: 82 42% 32%; }
+  .theme-olive.dark { --primary: 82 38% 55%;     --primary-foreground: 82 60% 12%;       --ring: 82 38% 55%; }
+
+  /* Sage (muted desaturated green) --------------------------------------- */
+  .theme-sage      { --primary: 120 18% 38%;     --primary-foreground: 120 25% 97%;      --ring: 120 18% 38%; }
+  .theme-sage.dark { --primary: 120 22% 62%;     --primary-foreground: 120 30% 10%;      --ring: 120 22% 62%; }
+
+  /* Forest (deep dark green) --------------------------------------------- */
+  .theme-forest      { --primary: 140 65% 22%;   --primary-foreground: 140 40% 97%;      --ring: 140 65% 22%; }
+  .theme-forest.dark { --primary: 140 55% 48%;   --primary-foreground: 140 60% 10%;      --ring: 140 55% 48%; }
+
+  /* Mint (fresh cool green-cyan, between emerald and teal) --------------- */
+  .theme-mint      { --primary: 167 70% 40%;     --primary-foreground: 167 50% 97%;      --ring: 167 70% 40%; }
+  .theme-mint.dark { --primary: 167 65% 58%;     --primary-foreground: 167 70% 10%;      --ring: 167 65% 58%; }
+
+  /* Jade (rich blue-green, deeper than emerald) -------------------------- */
+  .theme-jade      { --primary: 152 75% 30%;     --primary-foreground: 152 50% 97%;      --ring: 152 75% 30%; }
+  .theme-jade.dark { --primary: 152 65% 50%;     --primary-foreground: 152 70% 10%;      --ring: 152 65% 50%; }
+
+  /* Ocean (deep teal-blue, between cyan and sky) ------------------------- */
+  .theme-ocean      { --primary: 200 85% 38%;    --primary-foreground: 200 50% 97%;      --ring: 200 85% 38%; }
+  .theme-ocean.dark { --primary: 200 80% 58%;    --primary-foreground: 200 80% 12%;      --ring: 200 80% 58%; }
+
+  /* Navy (deep dark blue) ------------------------------------------------ */
+  .theme-navy      { --primary: 220 72% 28%;     --primary-foreground: 220 50% 97%;      --ring: 220 72% 28%; }
+  .theme-navy.dark { --primary: 220 65% 62%;     --primary-foreground: 220 60% 12%;      --ring: 220 65% 62%; }
+
+  /* Royal (vivid royal blue between blue and indigo) --------------------- */
+  .theme-royal      { --primary: 232 78% 52%;    --primary-foreground: 232 50% 97%;      --ring: 232 78% 52%; }
+  .theme-royal.dark { --primary: 232 82% 68%;    --primary-foreground: 232 60% 12%;      --ring: 232 82% 68%; }
+
+  /* Periwinkle (light blue-purple) --------------------------------------- */
+  .theme-periwinkle      { --primary: 245 70% 65%; --primary-foreground: 245 60% 97%;    --ring: 245 70% 65%; }
+  .theme-periwinkle.dark { --primary: 245 78% 78%; --primary-foreground: 245 50% 12%;    --ring: 245 78% 78%; }
+
+  /* Lavender (soft purple) ----------------------------------------------- */
+  .theme-lavender      { --primary: 260 60% 60%; --primary-foreground: 260 60% 97%;      --ring: 260 60% 60%; }
+  .theme-lavender.dark { --primary: 260 72% 76%; --primary-foreground: 260 50% 12%;      --ring: 260 72% 76%; }
+
+  /* Plum (deep purple, between purple and fuchsia) ----------------------- */
+  .theme-plum      { --primary: 285 50% 35%;     --primary-foreground: 285 50% 97%;      --ring: 285 50% 35%; }
+  .theme-plum.dark { --primary: 285 55% 58%;     --primary-foreground: 285 50% 12%;      --ring: 285 55% 58%; }
+
+  /* Mauve (muted dusty purple-pink) -------------------------------------- */
+  .theme-mauve      { --primary: 310 28% 48%;    --primary-foreground: 310 40% 97%;      --ring: 310 28% 48%; }
+  .theme-mauve.dark { --primary: 310 32% 70%;    --primary-foreground: 310 30% 12%;      --ring: 310 32% 70%; }
+
+  /* Magenta (vivid pink-purple between fuchsia and pink) ----------------- */
+  .theme-magenta      { --primary: 315 85% 50%;  --primary-foreground: 315 50% 97%;      --ring: 315 85% 50%; }
+  .theme-magenta.dark { --primary: 315 85% 65%;  --primary-foreground: 315 50% 12%;      --ring: 315 85% 65%; }
+
+  /* Slate (cool blue-grey) ----------------------------------------------- */
+  .theme-slate      { --primary: 215 28% 28%;    --primary-foreground: 210 40% 98%;      --ring: 215 28% 28%; }
+  .theme-slate.dark { --primary: 215 22% 70%;    --primary-foreground: 222 47% 11%;      --ring: 215 22% 70%; }
+
+  /* Stone (warm beige-grey) ---------------------------------------------- */
+  .theme-stone      { --primary: 30 8% 35%;      --primary-foreground: 60 9% 98%;        --ring: 30 8% 35%; }
+  .theme-stone.dark { --primary: 30 10% 72%;     --primary-foreground: 20 14% 10%;       --ring: 30 10% 72%; }
+
+  /* Bronze (warm metallic brown) ----------------------------------------- */
+  .theme-bronze      { --primary: 30 52% 35%;    --primary-foreground: 30 40% 97%;       --ring: 30 52% 35%; }
+  .theme-bronze.dark { --primary: 30 50% 58%;    --primary-foreground: 30 50% 12%;       --ring: 30 50% 58%; }
+
+  /* Copper (reddish brown) ----------------------------------------------- */
+  .theme-copper      { --primary: 20 68% 40%;    --primary-foreground: 20 40% 97%;       --ring: 20 68% 40%; }
+  .theme-copper.dark { --primary: 20 68% 60%;    --primary-foreground: 20 50% 12%;       --ring: 20 68% 60%; }
+
+  /* Mocha (warm brown) --------------------------------------------------- */
+  .theme-mocha      { --primary: 25 38% 30%;     --primary-foreground: 25 30% 97%;       --ring: 25 38% 30%; }
+  .theme-mocha.dark { --primary: 25 32% 60%;     --primary-foreground: 25 40% 12%;       --ring: 25 32% 60%; }
+
+  /* Midnight (very dark blue-purple accent) ------------------------------ */
+  .theme-midnight      { --primary: 235 62% 24%; --primary-foreground: 235 40% 97%;      --ring: 235 62% 24%; }
+  .theme-midnight.dark { --primary: 235 55% 60%; --primary-foreground: 235 40% 12%;      --ring: 235 55% 60%; }
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    /*
+     * Inter Variable ships stylistic sets that clean up the "a"
+     * (single-storey), "l" (straight), and open-tail 4 — every SaaS
+     * dashboard we've compared uses these. `tnum` gives us
+     * fixed-width digits so KPI numbers don't jitter as they animate
+     * from loading skeleton to real value. `cv11` fixes the small "i"
+     * glyph.
+     *
+     * Digits are PROPORTIONAL by default (2026-09): global `tabular-nums`
+     * also widened Inter's hyphen ("30 - day", "real - time") in every
+     * sentence. Numbers that must line up or not jitter opt in with the
+     * `tabular-nums` class — StatCard values, table cells (ui/table),
+     * countdowns, progress percentages.
+     */
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  /*
+   * Native <select> focus ring. Many selects in the app are bare
+   * `<select>` elements without shadcn's `focus-visible:ring-*`
+   * utilities — keyboard users get no focus indicator. This base rule
+   * applies a ring-1 with the theme's `--ring` color on `:focus-visible`
+   * for every native select. Tailwind's `focus-visible:ring-*`
+   * utilities (when present) win on specificity and override cleanly.
+   */
+  select:focus-visible {
+    @apply outline-none ring-1 ring-ring;
+  }
+}
+
+/*
+ * ====================================================================
+ * Mesh-gradient page background utility.
+ * --------------------------------------------------------------------
+ * Layered `radial-gradient`s in a fixed professional-blue palette
+ * plus a lighter accent from the active theme's --primary token so
+ * palette-picker changes still shift the overall temperature.
+ *
+ * Rationale for the fixed blue anchor: users read "blue" as the
+ * default SaaS-dashboard tint (Linear, Vercel, Notion). Tying the
+ * background solely to --primary would turn the whole page green /
+ * pink / amber whenever the user picked a coloured palette, which
+ * felt gimmicky in testing. The fixed blue keeps the surface calm
+ * and professional; the --primary bleed at the corners keeps the
+ * palette hint visible without dominating.
+ *
+ * Alphas are noticeably higher than the first pass — the previous
+ * 3–5% values were invisible in daylight and mid-brightness monitors.
+ * Dark mode needs even more (dark surfaces swallow low-alpha tints
+ * more aggressively).
+ *
+ * Scoped: apply on the specific route/section wrapper you want
+ * tinted (e.g. the Dashboard container). NOT applied globally on
+ * `body`.
+ * ==================================================================== */
+.sgv-mesh-bg {
+  position: relative;
+  isolation: isolate;
+  background-color: hsl(var(--background));
+  background-image:
+    /* Top-left: blue base — this is the "professional blue" anchor */
+    radial-gradient(ellipse 90% 65% at 12% -5%, hsl(217 91% 60% / 0.12), transparent 60%),
+    /* Top-right: primary bleed — palette-driven accent */
+    radial-gradient(ellipse 65% 55% at 88% 5%, hsl(var(--primary) / 0.10), transparent 65%),
+    /* Bottom-centre: cyan wash — depth, keeps the page from feeling top-heavy */
+    radial-gradient(ellipse 60% 45% at 50% 100%, hsl(199 89% 55% / 0.06), transparent 70%);
+}
+.dark .sgv-mesh-bg {
+  background-image:
+    radial-gradient(ellipse 90% 65% at 12% -5%, hsl(217 91% 60% / 0.20), transparent 60%),
+    radial-gradient(ellipse 65% 55% at 88% 5%, hsl(var(--primary) / 0.16), transparent 65%),
+    radial-gradient(ellipse 60% 45% at 50% 100%, hsl(199 89% 55% / 0.10), transparent 70%);
+}
+
+/*
+ * Editor-overlay mesh — the side-panel + map-toolbar float on top of a
+ * live Mapbox canvas, so the page-level `.sgv-mesh-bg` (with its solid
+ * `hsl(var(--background))` base) is too opaque. This variant keeps the
+ * three radial-gradient tints from the page mesh but skips the solid
+ * background so the underlying map still shows through the glassy card
+ * treatment. Pair with `bg-card/95 backdrop-blur-md` on the surface
+ * for the standard editor floating-card look.
+ *
+ * Deliberately does NOT set `position` — the consumer's own positioning
+ * (Tailwind `absolute`/`fixed`/`relative`) must win. Setting position
+ * here would break the side-panel's `absolute end-0` layout and cause
+ * it to reflow into normal document flow.
+ */
+.sgv-mesh-overlay {
+  background-image:
+    radial-gradient(ellipse 90% 65% at 12% -5%, hsl(217 91% 60% / 0.10), transparent 60%),
+    radial-gradient(ellipse 65% 55% at 88% 5%, hsl(var(--primary) / 0.10), transparent 65%),
+    radial-gradient(ellipse 60% 45% at 50% 100%, hsl(199 89% 55% / 0.06), transparent 70%);
+}
+.dark .sgv-mesh-overlay {
+  background-image:
+    radial-gradient(ellipse 90% 65% at 12% -5%, hsl(217 91% 60% / 0.16), transparent 60%),
+    radial-gradient(ellipse 65% 55% at 88% 5%, hsl(var(--primary) / 0.14), transparent 65%),
+    radial-gradient(ellipse 60% 45% at 50% 100%, hsl(199 89% 55% / 0.08), transparent 70%);
+}
+
+/*
+ * Glass card — reusable class matching the dashboard's floating-card
+ * treatment. Use for any surface that should read as a "detached card"
+ * over the mesh (side-panel sub-panels, map-toolbar sub-groups, etc.).
+ * Kept as a class so a tone bump can be applied in one place.
+ */
+.sgv-glass-card {
+  background-color: hsl(var(--card) / 0.7);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  border: 1px solid hsl(var(--border) / 0.6);
+  box-shadow:
+    0 1px 2px 0 rgb(0 0 0 / 0.04),
+    0 1px 3px 0 rgb(0 0 0 / 0.02),
+    inset 0 0 0 1px rgb(0 0 0 / 0.02);
+  border-radius: 0.75rem;
+}
+.dark .sgv-glass-card {
+  box-shadow:
+    0 1px 2px 0 rgb(0 0 0 / 0.15),
+    0 1px 3px 0 rgb(0 0 0 / 0.1),
+    inset 0 0 0 1px rgb(255 255 255 / 0.03);
+}
+
+/*
+ * Grid overlay — subtle dotted background pattern rendered on top of
+ * the mesh. Uses the border colour so it fades automatically with the
+ * theme. Optional companion to `.sgv-mesh-bg`; add both classes to
+ * layer the grid dots over the gradient.
+ */
+.sgv-grid-overlay::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(hsl(var(--border) / 0.6) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 40%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 40%, transparent 100%);
+  opacity: 0.5;
+}
+.dark .sgv-grid-overlay::before {
+  opacity: 0.35;
+}
+
+/* ====================================================================
+ * App motion (workspace pages, 2026-09)
+ *
+ * Same contract as the auth screens below: every class renders its final
+ * state by default and only animates under prefers-reduced-motion:
+ * no-preference. Durations follow NN/g (feedback ~150ms, content entry
+ * 200–350ms, ease-out); nothing loops.
+ *   .sgv-rise        — page sections rise in, staggered by --sgv-i
+ *   .sgv-fade        — swapped content (tab panels, filter results)
+ *   .sgv-lift        — cards: subtle hover lift
+ *   .sgv-toast       — toast entry
+ *   .sgv-row-in      — table rows that just mounted (page/filter change),
+ *                      staggered by --sgv-i; background refreshes reuse
+ *                      the same DOM rows, so they don't re-animate
+ *   .sgv-row-new     — a record that arrived live: a soft highlight that
+ *                      fades out (the only "attention" motion on data)
+ *   .sgv-live-dot    — the "live" indicator's single soft ping
+ * ==================================================================== */
+/* Facility explorer: the picked data row on the map (a row placed by
+   coordinates has no shape to highlight). */
+.sgv-explorer-pin {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: hsl(var(--primary));
+  border: 3px solid hsl(var(--background));
+  box-shadow: 0 0 0 2px hsl(var(--primary) / 0.5), 0 4px 12px hsl(var(--foreground) / 0.3);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sgv-explorer-pin {
+    animation: sgv-explorer-pin-pulse 1.6s ease-out infinite;
+  }
+}
+@keyframes sgv-explorer-pin-pulse {
+  0% { box-shadow: 0 0 0 2px hsl(var(--primary) / 0.6), 0 4px 12px hsl(var(--foreground) / 0.3); }
+  70% { box-shadow: 0 0 0 16px hsl(var(--primary) / 0), 0 4px 12px hsl(var(--foreground) / 0.3); }
+  100% { box-shadow: 0 0 0 2px hsl(var(--primary) / 0), 0 4px 12px hsl(var(--foreground) / 0.3); }
+}
+
+/* ====================================================================
+ * Full-map report (report layout `map`, explorer-map-layout.tsx)
+ *
+ *   .sgv-glass         — frosted panel over the map: translucent card
+ *                        colour, blur + saturate, hairline border, a top
+ *                        highlight and a soft two-layer shadow. Tokens
+ *                        only, so dark mode and every palette follow.
+ *   .sgv-glass-dense   — the same, more opaque, for text-heavy panels.
+ *   .sgv-panel-*       — panels slide in (staggered by --sgv-i) and slide
+ *                        out instead of vanishing ([data-open="false"]).
+ *                        Entrances fill `backwards`, never `both`: a held
+ *                        opacity on an ancestor becomes a backdrop root
+ *                        and the glass stops blurring the map.
+ *   .sgv-kpi-up/-down  — a number that changed on refresh glows once.
+ *   .sgv-explorer-hover — the ghost pin a hovered list row shows.
+ * Same motion contract as above: final state by default, motion only
+ * under prefers-reduced-motion: no-preference, nothing loops.
+ * ==================================================================== */
+.sgv-glass {
+  background: hsl(var(--card) / 0.74);
+  -webkit-backdrop-filter: blur(20px) saturate(1.7);
+  backdrop-filter: blur(20px) saturate(1.7);
+  border: 1px solid hsl(var(--border) / 0.75);
+  border-radius: 16px;
+  box-shadow:
+    inset 0 1px 0 0 hsl(var(--background) / 0.6),
+    0 1px 2px 0 hsl(var(--foreground) / 0.06),
+    0 18px 40px -18px hsl(var(--foreground) / 0.28);
+}
+.sgv-glass-dense {
+  background: hsl(var(--card) / 0.88);
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .sgv-glass,
+  .sgv-glass-dense {
+    background: hsl(var(--card) / 0.97);
+  }
+}
+.sgv-panel-left[data-open='false'] {
+  transform: translateX(calc(-100% - 24px));
+  opacity: 0;
+  pointer-events: none;
+}
+.sgv-panel-right[data-open='false'] {
+  transform: translateX(calc(100% + 24px));
+  opacity: 0;
+  pointer-events: none;
+}
+[dir='rtl'] .sgv-panel-left[data-open='false'] {
+  transform: translateX(calc(100% + 24px));
+}
+[dir='rtl'] .sgv-panel-right[data-open='false'] {
+  transform: translateX(calc(-100% - 24px));
+}
+.sgv-fade-swap[data-open='false'] {
+  opacity: 0;
+  pointer-events: none;
+}
+.sgv-explorer-hover {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: hsl(var(--primary) / 0.25);
+  border: 2px solid hsl(var(--primary));
+  box-shadow: 0 0 0 6px hsl(var(--primary) / 0.12);
+  pointer-events: none;
+}
+/* Indeterminate progress (the app splash, map loading overlays): a
+   segment sweeping across its track. Static (a still segment) under
+   reduced motion — the one deliberate loop, only while something loads. */
+@media (prefers-reduced-motion: no-preference) {
+  .sgv-indeterminate {
+    animation: sgv-indeterminate 1.3s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+  }
+}
+@keyframes sgv-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(330%); }
+}
+[dir='rtl'] .sgv-indeterminate {
+  animation-direction: reverse;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .sgv-panel-left,
+  .sgv-panel-right,
+  .sgv-fade-swap,
+  .sgv-glide {
+    transition:
+      transform 360ms cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 240ms ease-out,
+      inset 360ms cubic-bezier(0.22, 1, 0.36, 1),
+      inset-inline-start 360ms cubic-bezier(0.22, 1, 0.36, 1),
+      inset-inline-end 360ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .sgv-enter-left {
+    animation: sgv-map-in-left 460ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+    animation-delay: calc(min(var(--sgv-i, 0), 8) * 70ms);
+  }
+  .sgv-enter-right {
+    animation: sgv-map-in-right 460ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+    animation-delay: calc(min(var(--sgv-i, 0), 8) * 70ms);
+  }
+  .sgv-enter-down {
+    animation: sgv-map-in-down 420ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+    animation-delay: calc(min(var(--sgv-i, 0), 8) * 70ms);
+  }
+  .sgv-enter-up {
+    animation: sgv-map-in-up 420ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+    animation-delay: calc(min(var(--sgv-i, 0), 8) * 70ms);
+  }
+  .sgv-kpi-up {
+    animation: sgv-kpi-up 1800ms ease-out;
+  }
+  .sgv-kpi-down {
+    animation: sgv-kpi-down 1800ms ease-out;
+  }
+  .sgv-row {
+    transition: background-color 150ms ease-out, border-color 150ms ease-out;
+  }
+}
+@keyframes sgv-map-in-left {
+  from { opacity: 0; transform: translateX(-16px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-map-in-right {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-map-in-down {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-map-in-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-kpi-up {
+  from { box-shadow: 0 0 0 2px hsl(var(--success) / 0.55), 0 0 24px hsl(var(--success) / 0.35); }
+  to { box-shadow: 0 0 0 0 hsl(var(--success) / 0), 0 0 0 hsl(var(--success) / 0); }
+}
+@keyframes sgv-kpi-down {
+  from { box-shadow: 0 0 0 2px hsl(var(--danger) / 0.55), 0 0 24px hsl(var(--danger) / 0.35); }
+  to { box-shadow: 0 0 0 0 hsl(var(--danger) / 0), 0 0 0 hsl(var(--danger) / 0); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .sgv-rise {
+    animation: sgv-app-rise 340ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(min(var(--sgv-i, 0), 8) * 40ms);
+  }
+  .sgv-fade {
+    animation: sgv-app-fade 220ms ease-out both;
+  }
+  .sgv-lift {
+    transition: transform 160ms ease-out, box-shadow 160ms ease-out, border-color 160ms ease-out;
+  }
+  .sgv-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px -12px hsl(var(--foreground) / 0.18);
+  }
+  .sgv-toast {
+    animation: sgv-app-toast 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .sgv-row-in {
+    animation: sgv-app-row-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(min(var(--sgv-i, 0), 12) * 18ms);
+  }
+  .sgv-row-new {
+    animation: sgv-app-row-new 1600ms ease-out both;
+  }
+  .sgv-live-dot::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background: currentColor;
+    animation: sgv-app-ping 1600ms cubic-bezier(0, 0, 0.2, 1) 3;
+  }
+}
+@keyframes sgv-app-row-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-app-row-new {
+  from { background-color: hsl(var(--success) / 0.16); }
+  to { background-color: transparent; }
+}
+@keyframes sgv-app-ping {
+  from { transform: scale(1); opacity: 0.6; }
+  to { transform: scale(2.6); opacity: 0; }
+}
+@keyframes sgv-app-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-app-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes sgv-app-toast {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ====================================================================
+ * Auth screens (/login, /signup, /forgot-password)
+ *
+ * Every class below renders its FINAL state by default; the motion only
+ * exists inside `prefers-reduced-motion: no-preference`. So a user who
+ * asked the OS to reduce motion sees the finished page instantly, and
+ * nothing depends on an animation having run (WCAG 2.3.3).
+ *
+ * Timings follow NN/g's animation-duration guidance: ~100 ms for small
+ * feedback, 200–320 ms for step changes, ease-out on entry, nothing over
+ * ~400 ms except the decorative brand-panel loops.
+ *
+ * Colours are theme tokens only, so all 46 palettes × light/dark work.
+ * ==================================================================== */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Page entry: content rises in, children staggered via --sgv-i. */
+  .sgv-auth-rise {
+    animation: sgv-auth-rise 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(var(--sgv-i, 0) * 45ms);
+  }
+
+  /* Step change inside a multi-step form. Direction set by data-dir. */
+  .sgv-auth-step {
+    animation: sgv-auth-step-fwd 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .sgv-auth-step[data-dir='back'] {
+    animation-name: sgv-auth-step-back;
+  }
+  [dir='rtl'] .sgv-auth-step {
+    animation-name: sgv-auth-step-back;
+  }
+  [dir='rtl'] .sgv-auth-step[data-dir='back'] {
+    animation-name: sgv-auth-step-fwd;
+  }
+
+  /* Error nudge — never the only error signal (the alert text is). */
+  .sgv-auth-shake {
+    animation: sgv-auth-shake 280ms cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  }
+
+  /* Alerts expand in instead of popping. */
+  .sgv-auth-alert {
+    animation: sgv-auth-alert 200ms ease-out both;
+  }
+
+  /* Error alerts fade in AND nudge; both set `animation`, so combine. */
+  .sgv-auth-alert.sgv-auth-shake {
+    animation:
+      sgv-auth-alert 200ms ease-out both,
+      sgv-auth-shake 280ms cubic-bezier(0.36, 0.07, 0.19, 0.97) 60ms both;
+  }
+
+  /* OTP slot caret. */
+  .sgv-auth-caret {
+    animation: sgv-auth-caret 1s steps(1) infinite;
+  }
+
+  /* Success check: circle then tick draw in (pathLength="1"). */
+  .sgv-auth-check-circle {
+    stroke-dasharray: 1;
+    animation: sgv-auth-draw 420ms cubic-bezier(0.65, 0, 0.35, 1) both;
+  }
+  .sgv-auth-check-tick {
+    stroke-dasharray: 1;
+    animation: sgv-auth-draw 260ms cubic-bezier(0.65, 0, 0.35, 1) 340ms both;
+  }
+}
+
+@keyframes sgv-auth-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-auth-step-fwd {
+  from { opacity: 0; transform: translateX(14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-auth-step-back {
+  from { opacity: 0; transform: translateX(-14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-auth-shake {
+  0%, 100% { transform: none; }
+  20% { transform: translateX(-5px); }
+  40% { transform: translateX(5px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
+}
+@keyframes sgv-auth-alert {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-auth-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+@keyframes sgv-auth-draw {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+
+.mapboxgl-ctrl-top-right{
+  display: hidden!important;
+}
+
+/* ====================================================================
+   Marker depth occlusion — set by map-marker-overlay.tsx when a marker
+   sits behind a floor-plan plate (see src/lib/marker-occlusion.ts).
+   --------------------------------------------------------------------
+   `!important` is load-bearing: `mapboxgl.Marker` writes `opacity` and
+   `pointer-events` as INLINE styles on this same element every time it
+   re-evaluates fog / terrain fade, which would otherwise win over a
+   stylesheet rule and flash the marker back into view mid-pan.
+   ==================================================================== */
+.shape-marker[data-occluded='true'] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* ====================================================================
+   Map tooltip / popup — modern semantic design.
+   --------------------------------------------------------------------
+   `mapboxgl.Popup` renders outside the React tree, so the body is
+   styled here globally. The mapbox wrapper class stays `bin-hover-popup`
+   (kept for backwards compat with map-bin-overlay.tsx); the new
+   internal classes use the `sgv-tt-` (spatial-grid-vis-tooltip) prefix.
+   ==================================================================== */
+
+/* Per-variant accent tokens. Used for chips, link tiles, and status
+   icons. Tuned for both light and dark themes via opacity-blended
+   surfaces so they stay readable on either popover background. */
+.sgv-tt {
+  --sgv-tt-radius: 14px;
+  --sgv-tt-pad-x: 12px;
+  --sgv-tt-pad-y: 10px;
+  --sgv-tt-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --sgv-tt-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.28),
+                   0 6px 14px -6px rgba(0, 0, 0, 0.18);
+
+  --sgv-success-bg: 142 71% 45% / 0.16;
+  --sgv-success-fg: 142 76% 42%;
+  --sgv-warning-bg: 38 92% 50% / 0.18;
+  --sgv-warning-fg: 32 95% 44%;
+  --sgv-danger-bg:  0 84% 60% / 0.16;
+  --sgv-danger-fg:  0 72% 51%;
+  --sgv-critical-bg: 348 90% 56% / 0.20;
+  --sgv-critical-fg: 348 85% 48%;
+  --sgv-info-bg:    217 91% 60% / 0.16;
+  --sgv-info-fg:    217 90% 54%;
+  --sgv-primary-bg: 250 84% 60% / 0.16;
+  --sgv-primary-fg: 250 75% 56%;
+  --sgv-cool-bg:    189 94% 43% / 0.18;
+  --sgv-cool-fg:    189 90% 38%;
+  --sgv-hot-bg:     14 90% 56% / 0.18;
+  --sgv-hot-fg:     14 88% 49%;
+  --sgv-neutral-bg: 240 5% 50% / 0.14;
+  --sgv-neutral-fg: 240 5% 35%;
+}
+.dark .sgv-tt {
+  --sgv-tt-shadow: 0 20px 50px -10px rgba(0, 0, 0, 0.55),
+                   0 4px 14px -4px rgba(0, 0, 0, 0.45);
+  --sgv-success-fg: 142 70% 65%;
+  --sgv-warning-fg: 38 92% 65%;
+  --sgv-danger-fg:  0 84% 72%;
+  --sgv-critical-fg: 348 90% 72%;
+  --sgv-info-fg:    217 91% 72%;
+  --sgv-primary-fg: 250 90% 78%;
+  --sgv-cool-fg:    189 90% 65%;
+  --sgv-hot-fg:     14 92% 68%;
+  --sgv-neutral-fg: 240 5% 75%;
+}
+
+/* Mapbox wrapper override. Glass-style background with subtle border
+   + soft shadow; corners match the radius token. */
+.bin-hover-popup .mapboxgl-popup-content {
+  padding: 0;
+  background: hsl(var(--popover) / 0.92);
+  -webkit-backdrop-filter: saturate(180%) blur(18px);
+  backdrop-filter: saturate(180%) blur(18px);
+  color: hsl(var(--popover-foreground));
+  border: 1px solid hsl(var(--border) / 0.7);
+  border-radius: 14px;
+  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.28),
+              0 6px 14px -6px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  /* Stop Mapbox's default 250px max-width truncating our content. */
+  max-width: min(360px, 92vw) !important;
+  animation: sgv-tt-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top center;
+}
+.bin-hover-popup .mapboxgl-popup-tip {
+  border-top-color: hsl(var(--border) / 0.7) !important;
+  border-bottom-color: hsl(var(--border) / 0.7) !important;
+}
+
+/* Data-link hover popup — reuses the .bin-hover-popup visual treatment
+   for consistency. Prior to 2026-07-22 this class also stamped
+   `pointer-events: none` on the whole surface to prevent a small-marker
+   flicker loop (cursor on marker → popup covers marker → mouseleave
+   marker → dismiss → cursor back on marker → re-show). That fix
+   traded off interaction: the compact hover popup now needs to be
+   clickable (View more button) and its mouseenter/mouseleave events
+   drive the delayed-dismiss preservation. The flicker is now prevented
+   by the 180 ms grace period + hover-preservation flag in
+   `map-data-linked-overlay.tsx`'s popup lifecycle (matches
+   `map-shape-tooltip.tsx`). Leave the class present so future
+   variants can hang on it; the pointer-events rule is intentionally
+   gone. */
+@keyframes sgv-tt-in {
+  from { opacity: 0; transform: scale(0.96) translateY(-4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* ----------------------------------------------------------------- root */
+.sgv-tt {
+  width: 320px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: hsl(var(--popover-foreground));
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+/* --------------------------------------------------------------- header */
+.sgv-tt-header {
+  padding: 10px 12px 8px;
+  background:
+    linear-gradient(
+      135deg,
+      hsl(var(--sgv-primary-bg)) 0%,
+      hsl(var(--sgv-info-bg)) 100%
+    ),
+    hsl(var(--popover));
+  border-bottom: 1px solid hsl(var(--border) / 0.6);
+}
+.sgv-tt-header-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: hsl(var(--sgv-primary-fg));
+  margin-bottom: 4px;
+}
+.sgv-tt-header-kind-ico { width: 11px; height: 11px; }
+.sgv-tt-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sgv-tt-header-title {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sgv-tt-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--foreground));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.01em;
+}
+.sgv-tt-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------- icons */
+.sgv-tt-ico    { width: 13px; height: 13px; }
+.sgv-tt-ico-sm { width: 12px; height: 12px; }
+.sgv-tt-ico-xs { width: 10px; height: 10px; }
+.sgv-tt-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid hsl(var(--border) / 0.7);
+  background: hsl(var(--background) / 0.5);
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.sgv-tt-icon-btn:hover {
+  background: hsl(var(--accent));
+  border-color: hsl(var(--border));
+  transform: translateY(-1px);
+}
+
+/* --------------------------------------------------------------- chips */
+.sgv-tt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+}
+.sgv-tt-variant-success { background: hsl(var(--sgv-success-bg)); color: hsl(var(--sgv-success-fg)); border-color: hsl(var(--sgv-success-fg) / 0.22); }
+.sgv-tt-variant-warning { background: hsl(var(--sgv-warning-bg)); color: hsl(var(--sgv-warning-fg)); border-color: hsl(var(--sgv-warning-fg) / 0.25); }
+.sgv-tt-variant-danger  { background: hsl(var(--sgv-danger-bg));  color: hsl(var(--sgv-danger-fg));  border-color: hsl(var(--sgv-danger-fg) / 0.25); }
+.sgv-tt-variant-critical{
+  background: hsl(var(--sgv-critical-bg));
+  color: hsl(var(--sgv-critical-fg));
+  border-color: hsl(var(--sgv-critical-fg) / 0.35);
+  animation: sgv-tt-pulse 1.4s ease-in-out infinite;
+  font-weight: 700;
+}
+@keyframes sgv-tt-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(var(--sgv-critical-fg) / 0.35); }
+  50%      { box-shadow: 0 0 0 4px hsl(var(--sgv-critical-fg) / 0); }
+}
+.sgv-tt-variant-info    { background: hsl(var(--sgv-info-bg));    color: hsl(var(--sgv-info-fg));    border-color: hsl(var(--sgv-info-fg) / 0.22); }
+.sgv-tt-variant-primary { background: hsl(var(--sgv-primary-bg)); color: hsl(var(--sgv-primary-fg)); border-color: hsl(var(--sgv-primary-fg) / 0.22); }
+.sgv-tt-variant-cool    { background: hsl(var(--sgv-cool-bg));    color: hsl(var(--sgv-cool-fg));    border-color: hsl(var(--sgv-cool-fg) / 0.22); }
+.sgv-tt-variant-hot     { background: hsl(var(--sgv-hot-bg));     color: hsl(var(--sgv-hot-fg));     border-color: hsl(var(--sgv-hot-fg) / 0.22); }
+.sgv-tt-variant-neutral { background: hsl(var(--sgv-neutral-bg)); color: hsl(var(--sgv-neutral-fg)); border-color: hsl(var(--sgv-neutral-fg) / 0.22); }
+
+/* --------------------------------------------------------------- gallery */
+.sgv-tt-gallery {
+  background: #000;
+}
+.sgv-tt-gallery-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+}
+.sgv-tt-gallery-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.sgv-tt-gallery-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: background 120ms ease, transform 120ms ease;
+}
+.sgv-tt-gallery-nav:hover { background: rgba(0, 0, 0, 0.78); transform: translateY(-50%) scale(1.06); }
+.sgv-tt-gallery-prev { left: 8px; }
+.sgv-tt-gallery-next { right: 8px; }
+.sgv-tt-gallery-counter {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  font-size: 10px;
+  color: white;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-family: var(--sgv-tt-mono);
+  font-weight: 500;
+}
+.sgv-tt-gallery-strip {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.85);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.sgv-tt-gallery-strip::-webkit-scrollbar { display: none; }
+
+/* Visually hide the scrollbar on a scrollable surface while
+   keeping it scrollable. Used on tight overflow containers
+   (map-toolbar rail, viewer controls stack) where a visible
+   scrollbar would eat into the content width or look noisy. */
+.sgv-scroll-hide {
+  scrollbar-width: none;
+}
+.sgv-scroll-hide::-webkit-scrollbar { display: none; }
+.sgv-tt-gallery-thumb {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  background: #111;
+  opacity: 0.65;
+  transition: opacity 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.sgv-tt-gallery-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sgv-tt-gallery-thumb:hover { opacity: 0.9; }
+.sgv-tt-gallery-thumb.is-active {
+  opacity: 1;
+  border-color: hsl(var(--sgv-info-fg));
+  box-shadow: 0 0 0 1px hsl(var(--sgv-info-fg) / 0.5);
+}
+
+/* --------------------------------------------------------------- video */
+.sgv-tt-video-wrap {
+  background: #000;
+  padding: 0;
+}
+.sgv-tt-video {
+  width: 100%;
+  display: block;
+  max-height: 190px;
+  background: #000;
+}
+.sgv-tt-video-fallback {
+  padding: 14px;
+  text-align: center;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  background: hsl(var(--muted));
+}
+
+/* --------------------------------------------------------------- tiles */
+.sgv-tt-tiles {
+  padding: 10px 12px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sgv-tt-tile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: hsl(var(--muted) / 0.5);
+  border: 1px solid hsl(var(--border) / 0.6);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.sgv-tt-tile:hover {
+  background: hsl(var(--muted) / 0.8);
+  border-color: hsl(var(--border));
+}
+.sgv-tt-tile-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: hsl(var(--sgv-primary-bg));
+  color: hsl(var(--sgv-primary-fg));
+}
+.sgv-tt-tile.sgv-tt-variant-warning .sgv-tt-tile-ico {
+  background: hsl(var(--sgv-warning-bg));
+  color: hsl(var(--sgv-warning-fg));
+}
+.sgv-tt-tile-body { flex: 1; min-width: 0; }
+.sgv-tt-tile-label {
+  font-size: 9.5px;
+  color: hsl(var(--muted-foreground));
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  margin-bottom: 1px;
+}
+.sgv-tt-tile-url {
+  font-family: var(--sgv-tt-mono);
+  font-size: 10.5px;
+  color: hsl(var(--foreground));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sgv-tt-tile-actions { display: flex; gap: 4px; flex-shrink: 0; }
+
+/* --------------------------------------------------------------- fields */
+.sgv-tt-fields {
+  padding: 8px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sgv-tt-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px dashed hsl(var(--border) / 0.5);
+  min-height: 22px;
+}
+.sgv-tt-field:last-child { border-bottom: 0; }
+.sgv-tt-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: hsl(var(--muted-foreground));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.sgv-tt-field-ico {
+  width: 12px;
+  height: 12px;
+  color: hsl(var(--muted-foreground));
+}
+.sgv-tt-field-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 65%;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  text-align: right;
+}
+.sgv-tt-field-hint {
+  font-size: 9.5px;
+  color: hsl(var(--muted-foreground));
+  font-style: italic;
+  white-space: nowrap;
+}
+.sgv-tt-mono {
+  font-family: var(--sgv-tt-mono);
+  font-size: 11.5px;
+  color: hsl(var(--foreground));
+  word-break: break-all;
+  text-align: right;
+  letter-spacing: -0.005em;
+}
+.sgv-tt-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: hsl(var(--sgv-info-fg));
+  text-decoration: none;
+  font-family: var(--sgv-tt-mono);
+  font-size: 11.5px;
+  word-break: break-all;
+  text-align: right;
+}
+.sgv-tt-link:hover { text-decoration: underline; }
+
+/* Color swatch (palette) */
+.sgv-tt-color {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sgv-tt-color-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid hsl(var(--border));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+}
+
+/* --------------------------------------------------------- disclosure (JSON/array) */
+.sgv-tt-field-block {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.sgv-tt-disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: hsl(var(--muted-foreground));
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  text-align: left;
+}
+.sgv-tt-disclosure:hover { color: hsl(var(--foreground)); }
+.sgv-tt-field-label-text { flex: 1; }
+.sgv-tt-disclosure-hint {
+  font-family: var(--sgv-tt-mono);
+  font-size: 10px;
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--muted));
+  border-radius: 4px;
+  padding: 1px 6px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.sgv-tt-chevron {
+  transition: transform 160ms ease;
+  color: hsl(var(--muted-foreground));
+}
+.sgv-tt-chevron.is-open { transform: rotate(180deg); }
+.sgv-tt-json {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  background: hsl(var(--muted) / 0.6);
+  color: hsl(var(--foreground));
+  border-radius: 8px;
+  border: 1px solid hsl(var(--border) / 0.5);
+  font-family: var(--sgv-tt-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Array preview / list */
+.sgv-tt-array-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.sgv-tt-array-chip {
+  font-family: var(--sgv-tt-mono);
+  font-size: 10.5px;
+  padding: 2px 7px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  border-radius: 6px;
+  border: 1px solid hsl(var(--border) / 0.6);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sgv-tt-array-more {
+  font-size: 10.5px;
+  color: hsl(var(--muted-foreground));
+  padding: 2px 6px;
+  font-weight: 600;
+}
+.sgv-tt-array-list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 160px;
+  overflow: auto;
+}
+.sgv-tt-array-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: hsl(var(--muted) / 0.4);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.sgv-tt-array-idx {
+  font-family: var(--sgv-tt-mono);
+  font-size: 9.5px;
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--background));
+  width: 18px;
+  text-align: center;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------- empty */
+.sgv-tt-empty {
+  padding: 14px 12px 16px;
+  text-align: center;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* -------------------------------------------------- view route print */
+/* Map print layout (#view-root + .sgv-print-header). Scoped to
+ * `html.sgv-print-map` so it only applies when that view opts in — left
+ * global, it hid every page (nothing renders #view-root today), so any
+ * print came out blank. */
+.sgv-print-header {
+  display: none;
+}
+
+@media print {
+  /* Hide every app-level chrome — only the #view-root map + print header
+   * survive. We keep the structure simple: a header strip across the
+   * top of the page and the map fills the rest. The default Mapbox
+   * canvas survives because it's a direct descendant of #view-root. */
+  html.sgv-print-map body * {
+    visibility: hidden;
+  }
+  html.sgv-print-map #view-root,
+  html.sgv-print-map #view-root * {
+    visibility: visible;
+  }
+  html.sgv-print-map #view-root > div:not(.mapboxgl-map):not(.mapboxgl-canvas-container):not(.sgv-print-header) {
+    visibility: hidden !important;
+  }
+  /* The Mapbox map gets reflowed: 28mm of header at the top, map below. */
+  html.sgv-print-map #view-root .mapboxgl-map,
+  html.sgv-print-map #view-root .mapboxgl-canvas-container,
+  html.sgv-print-map #view-root .mapboxgl-canvas {
+    visibility: visible !important;
+    position: absolute !important;
+    top: 28mm !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: calc(100% - 28mm) !important;
+  }
+  /* Header strip: warehouse name + floor + timestamp on left, legend
+   * pill on right. Solid border at the bottom acts as a print-safe
+   * separator from the map. */
+  html.sgv-print-map .sgv-print-header {
+    display: flex !important;
+    visibility: visible !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    height: 28mm !important;
+    box-sizing: border-box;
+    padding: 8mm 10mm;
+    border-bottom: 1pt solid #000;
+    background: #fff;
+    color: #000;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12mm;
+    z-index: 9999;
+  }
+  html.sgv-print-map .sgv-print-header__title {
+    font-size: 18pt;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  html.sgv-print-map .sgv-print-header__meta {
+    font-size: 10pt;
+    color: #444;
+    margin-top: 2mm;
+  }
+  html.sgv-print-map .sgv-print-header__legend {
+    display: flex;
+    flex-direction: column;
+    gap: 2mm;
+    font-size: 9pt;
+  }
+  html.sgv-print-map .sgv-print-header__legend-row {
+    display: flex;
+    align-items: center;
+    gap: 3mm;
+  }
+  html.sgv-print-map .sgv-print-header__legend-swatch {
+    display: inline-block;
+    width: 4mm;
+    height: 4mm;
+    border: 1pt solid #000;
+  }
+}
+
+
+/* -------------------------------------------------- report print / PDF */
+/* `ReportPrintView` (components/reports/export/print-view.tsx) renders a
+ * print-only copy of a report into <body>. On screen it sits off-canvas
+ * but laid out (charts need a real width); while printing, everything
+ * else is hidden and it flows across pages. */
+.sgv-report-print {
+  position: fixed;
+  top: 0;
+  left: -100000px;
+  padding: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans Arabic', 'Noto Sans SC', sans-serif;
+}
+@media print {
+  html.sgv-printing-report,
+  html.sgv-printing-report body {
+    background: #fff !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  html.sgv-printing-report body > *:not(.sgv-report-print) {
+    display: none !important;
+  }
+  html.sgv-printing-report .sgv-report-print {
+    position: static !important;
+    left: auto !important;
+    width: auto !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  html.sgv-printing-report .sgv-print-grey {
+    filter: grayscale(1);
+  }
+  html.sgv-printing-report .sgv-print-block {
+    break-inside: avoid-page;
+  }
+  html.sgv-printing-report .sgv-report-print table {
+    break-inside: auto;
+  }
+  html.sgv-printing-report .sgv-report-print thead {
+    display: table-header-group;
+  }
+  html.sgv-printing-report .sgv-report-print tfoot {
+    display: table-row-group;
+  }
+  html.sgv-printing-report .sgv-report-print tr {
+    break-inside: avoid;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Route-preview endpoint markers (start / end pins for the wayfinding tool).
+ *
+ * The routing overlay drops two DOM markers on the map: the start is a
+ * filled emerald disc with a white ring (the "you are here" convention),
+ * the end is a red pin with a black centre (the "target" convention).
+ * Both use pure CSS so we don't pay the cost of an SVG per marker.
+ * -------------------------------------------------------------------------- */
+.sgv-route-endpoint {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 3px solid #ffffff;
+  box-shadow:
+    0 2px 6px -1px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.12);
+  transform: translate(0, 0);
+  pointer-events: none;
+}
+.sgv-route-endpoint--start {
+  background: #10b981; /* emerald-500 */
+}
+.sgv-route-endpoint--end {
+  background: #ef4444; /* red-500 */
+  position: relative;
+}
+.sgv-route-endpoint--end::after {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border-radius: 50%;
+  background: #ffffff;
+}

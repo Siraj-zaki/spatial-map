@@ -1,0 +1,11 @@
+Model Information:
+* title:	Forklift with Rig
+* source:	https://sketchfab.com/3d-models/forklift-with-rig-bb8b8dab8b4c4fc1ac6af310b70f1b6e
+* author:	Daniel Orozco (https://sketchfab.com/danorzc)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Forklift with Rig" (https://sketchfab.com/3d-models/forklift-with-rig-bb8b8dab8b4c4fc1ac6af310b70f1b6e) by Daniel Orozco (https://sketchfab.com/danorzc) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

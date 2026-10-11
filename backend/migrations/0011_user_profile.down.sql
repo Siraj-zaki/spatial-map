@@ -1,0 +1,7 @@
+ALTER TABLE users
+  DROP COLUMN IF EXISTS avatar_url,
+  DROP COLUMN IF EXISTS job_title,
+  DROP COLUMN IF EXISTS pronouns,
+  DROP COLUMN IF EXISTS location,
+  DROP COLUMN IF EXISTS bio,
+  DROP COLUMN IF EXISTS display_name;

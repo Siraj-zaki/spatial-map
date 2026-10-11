@@ -1,0 +1,1 @@
+-- irreversible: legacy live tables removed in Slice 6c2 of the data-link refactor.

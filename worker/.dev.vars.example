@@ -1,0 +1,13 @@
+# Copy this file to `.dev.vars` and fill in real values for `wrangler dev`.
+# `.dev.vars` is git-ignored. For deployed Workers use `wrangler secret put` instead.
+
+# Global API key. Gates the test REST endpoints (`/api/v1/test/*`), JWT
+# minting (`/api/v1/auth/issue-jwt`), webhook registration
+# (`/webhooks/:t/register`), and queue drain (`/webhooks/:t/drain`).
+# Generate with: openssl rand -hex 32
+API_KEY=replace-me-with-a-32-byte-hex-string
+
+# HMAC secret used to sign + verify the test JWTs the Worker mints.
+# Per-source webhook secrets are stored on each Durable Object instead.
+# Generate with: openssl rand -hex 32
+JWT_SECRET=replace-me-with-a-different-32-byte-hex-string

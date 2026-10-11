@@ -1,0 +1,8 @@
+[
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-22T16:13:48.823139+00:00","deleted_at":null,"id":30,"name":"Mall assets","tenant_id":0,"transport":"file","updated_at":"2026-07-22T16:13:49.824592+00:00"},
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-27T03:54:52.549552+00:00","deleted_at":null,"id":31,"name":"Mall cameras","tenant_id":0,"transport":"file","updated_at":"2026-07-27T03:54:52.549552+00:00"},
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-27T03:56:22.018711+00:00","deleted_at":null,"id":32,"name":"Mall CV detections","tenant_id":0,"transport":"file","updated_at":"2026-07-27T03:56:22.018711+00:00"},
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-27T03:57:03.130964+00:00","deleted_at":null,"id":33,"name":"Mall shipments","tenant_id":0,"transport":"file","updated_at":"2026-07-27T03:57:03.130964+00:00"},
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-27T03:57:36.80269+00:00","deleted_at":null,"id":34,"name":"Mall RFID tags","tenant_id":0,"transport":"file","updated_at":"2026-07-27T03:57:36.80269+00:00"},
+{"auth":{"mode":"none"},"config":{"transport":"file"},"created_at":"2026-07-27T03:58:08.290867+00:00","deleted_at":null,"id":35,"name":"Mall alerts","tenant_id":0,"transport":"file","updated_at":"2026-07-27T03:58:08.290867+00:00"}
+]

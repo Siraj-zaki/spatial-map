@@ -1,0 +1,11 @@
+Model Information:
+* title:	Rusty Metal Warehouse Shelving
+* source:	https://sketchfab.com/3d-models/rusty-metal-warehouse-shelving-ccc250d7e54e4e4399ca3a8c2b477020
+* author:	jimbogies (https://sketchfab.com/jimbogies)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Rusty Metal Warehouse Shelving" (https://sketchfab.com/3d-models/rusty-metal-warehouse-shelving-ccc250d7e54e4e4399ca3a8c2b477020) by jimbogies (https://sketchfab.com/jimbogies) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

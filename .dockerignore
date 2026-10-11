@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+backend
+worker
+e2e
+playwright-report
+test-results
+docs
+.env
+.env.*
+!.env.example
+*.md

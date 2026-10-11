@@ -1,0 +1,25 @@
+{
+  // Test backend for spatial-grid-vis. Local-only by design — `wrangler dev`
+  // serves http://localhost:8787 and the SPA at http://localhost:5173 is the
+  // only allowed CORS origin. To go public, add the deployed SPA origin to
+  // ALLOWED_ORIGINS and run `wrangler deploy`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "spatial-grid-vis-test-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:5173"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "WEBHOOK_QUEUE", "class_name": "WebhookQueue" },
+      { "name": "LIVE_STREAM", "class_name": "LiveStream" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["WebhookQueue"] },
+    { "tag": "v2", "new_sqlite_classes": ["LiveStream"] }
+  ],
+  "observability": { "enabled": true }
+}

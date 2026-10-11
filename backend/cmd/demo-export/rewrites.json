@@ -1,0 +1,102 @@
+[
+ {
+  "find": "(?i)\\bapple store\\b",
+  "replace": "Electronics Store"
+ },
+ {
+  "find": "\\bApple\\b",
+  "replace": "Electronics"
+ },
+ {
+  "find": "\\bGAP\\b",
+  "replace": "Denim Store"
+ },
+ {
+  "find": "\\b(Tiffany|Cartier)\\b",
+  "replace": "Jewelry Store"
+ },
+ {
+  "find": "(?i)\\bnordstrom( store)?\\b",
+  "replace": "Department Store A"
+ },
+ {
+  "find": "(?i)\\blululemon( store)?\\b",
+  "replace": "Activewear Store"
+ },
+ {
+  "find": "(?i)\\bcosta coffee\\b",
+  "replace": "Coffee House"
+ },
+ {
+  "find": "(?i)\\bmacy'?s?( store)?\\b",
+  "replace": "Department Store B"
+ },
+ {
+  "find": "(?i)\\bjc ?penney( store)?\\b",
+  "replace": "Department Store C"
+ },
+ {
+  "find": "(?i)\\bgap store\\b",
+  "replace": "Denim Store"
+ },
+ {
+  "find": "(?i)\\b(h and m|h&m)( store)?\\b",
+  "replace": "Fashion Store"
+ },
+ {
+  "find": "(?i)\\bnike\\b",
+  "replace": "Sportswear Store"
+ },
+ {
+  "find": "(?i)\\bzara( store)?\\b",
+  "replace": "Apparel Store"
+ },
+ {
+  "find": "(?i)\\bgamestop\\b",
+  "replace": "Game Store"
+ },
+ {
+  "find": "(?i)\\bsunglass hut\\b",
+  "replace": "Eyewear Store"
+ },
+ {
+  "find": "sgv-retail-mall-assets-250",
+  "replace": "Mall assets"
+ },
+ {
+  "find": "sgv-retail-mall-cameras",
+  "replace": "Mall cameras"
+ },
+ {
+  "find": "sgv-retail-mall-cv-detections",
+  "replace": "Mall CV detections"
+ },
+ {
+  "find": "sgv-retail-mall-shipments",
+  "replace": "Mall shipments"
+ },
+ {
+  "find": "sgv-retail-mall-rfid",
+  "replace": "Mall RFID tags"
+ },
+ {
+  "find": "sgv-retail-mall-alerts",
+  "replace": "Mall alerts"
+ },
+ {
+  "find": "\\bRETAIL MALL\\b",
+  "replace": "Retail Mall"
+ },
+ {
+  "find": "\\bJCP\\b",
+  "replace": "Department Store C"
+ },
+ {
+  "find": "Jewelry Store / Jewelry Store",
+  "replace": "Jewelry Store"
+ },
+ {
+  "find": "Electronics \\(high-value electronics\\)",
+  "replace": "high-value electronics"
+ }
+]

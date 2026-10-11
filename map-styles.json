@@ -1,0 +1,10 @@
+{
+  "standard": "mapbox://styles/mapbox/standard",
+  "standard-simple": "mapbox://styles/mapbox/navigation-day-v1",
+  "streets": "mapbox://styles/mapbox/streets-v12",
+  "outdoors": "mapbox://styles/mapbox/outdoors-v12",
+  "light": "mapbox://styles/mapbox/light-v11",
+  "dark": "mapbox://styles/mapbox/dark-v11",
+  "dusk": "mapbox://styles/mapbox/navigation-night-v1",
+  "satellite": "mapbox://styles/mapbox/satellite-streets-v12"
+}

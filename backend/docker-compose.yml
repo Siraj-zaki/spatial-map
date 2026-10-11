@@ -1,0 +1,182 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: sgv-postgres
+    environment:
+      POSTGRES_USER: spatial
+      POSTGRES_PASSWORD: spatial
+      POSTGRES_DB: spatial
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U spatial -d spatial"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO — S3-compatible object storage for uploaded images / 3D models.
+  # The API server proxies /files/{key} through to MinIO so the DB continues
+  # to hold same-origin relative URLs and the browser never sees the MinIO
+  # endpoint. Default creds match the SGV_STORAGE.MINIO_* env vars below.
+  minio:
+    image: minio/minio:latest
+    container_name: sgv-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console (http://localhost:9001)
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot init container: waits for MinIO, then creates the bucket
+  # `sgv-uploads` if missing. Idempotent, no-op on restart.
+  minio-init:
+    image: minio/mc:latest
+    container_name: sgv-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/sgv-uploads &&
+      echo 'minio bucket ready'"
+    restart: "no"
+
+  # Redis — Dramatiq broker + result backend for the ai-worker service
+  # below. Not used by the Go API for anything at present (the polling
+  # worker keeps its state in Postgres). Named volume keeps the queue
+  # across restarts even though queue state is technically ephemeral —
+  # persistence costs nothing at this scale and prevents a lost job on
+  # `docker compose restart`.
+  redis:
+    image: redis:7-alpine
+    container_name: sgv-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ai-worker — Python service running the AI Map detection pipeline.
+  # Reads floor-plan images from the shared MinIO bucket and enqueues
+  # results back to the Go API. Phase-1 skeleton returns a stub
+  # FeatureCollection; Phase 2 wires in SAM + OpenCV.
+  ai-worker:
+    # The AI Map tool's CV pipeline (SAM 2 + OpenCV + Tesseract). Heavy
+    # (~1.7 GB image, downloads model weights on build) — opt in with
+    # `docker compose --profile ai up -d`.
+    profiles: [ai]
+    build:
+      context: ./ai-worker
+      dockerfile: Dockerfile
+    container_name: sgv-ai-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Shared MinIO bucket — identical to the api service so both
+      # read/write from the same object store. Inside docker the
+      # hostname is the compose service name.
+      SGV_STORAGE.MINIO_ENDPOINT: minio:9000
+      SGV_STORAGE.MINIO_ACCESS_KEY: minioadmin
+      SGV_STORAGE.MINIO_SECRET_KEY: minioadmin
+      SGV_STORAGE.MINIO_BUCKET: sgv-uploads
+      SGV_STORAGE.MINIO_USE_SSL: "false"
+      SGV_REDIS.URL: redis://redis:6379/0
+      SGV_AI_WORKER.HOST: "0.0.0.0"
+      SGV_AI_WORKER.PORT: "8100"
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8100/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sgv-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # Optional: only when started with `--profile ai` (the AI Map tool).
+      ai-worker:
+        condition: service_healthy
+        required: false
+    environment:
+      SGV_DATABASE.URL: postgres://spatial:spatial@postgres:5432/spatial?sslmode=disable
+      # Auth is disabled in local dev by leaving SGV_AUTH.API_KEY unset.
+      # Set it (and matching VITE_API_KEY in the SPA .env) when you want to test enforced API-key auth.
+      # The JWT secret falls back to a dev placeholder; set SPATIAL_MAP_JWT_SECRET
+      # (e.g. `openssl rand -hex 32`) for anything beyond local testing.
+      SGV_AUTH.JWT_SECRET: ${SPATIAL_MAP_JWT_SECRET:-dev-jwt-secret-change-in-production}
+      # Optional first admin account, created on startup when both are set.
+      SGV_AUTH.BOOTSTRAP_EMAIL: ${SPATIAL_MAP_ADMIN_EMAIL:-}
+      SGV_AUTH.BOOTSTRAP_PASSWORD: ${SPATIAL_MAP_ADMIN_PASSWORD:-}
+      # Public SPA origin, used for links in auth emails.
+      SGV_APP.PUBLIC_URL: ${SPATIAL_MAP_PUBLIC_URL:-http://localhost:5173}
+      SGV_MIGRATION.ON_START: "true"
+      SGV_MIGRATION.PATH: /app/migrations
+      # Sample facilities, tables and reports in a shared "Demo workspace",
+      # loaded once into an empty database. SPATIAL_MAP_DEMO=false to start empty.
+      SGV_DEMO.ENABLED: ${SPATIAL_MAP_DEMO:-true}
+      # Storage backend. Options:
+      #   local           — filesystem at BASE_PATH (default; simplest).
+      #   minio           — MinIO bucket only. Requires the migrate-storage
+      #                     command to have been run for any pre-existing
+      #                     files, otherwise they 404.
+      #   minio-fallback  — MinIO primary + local disk read fallback. Safe
+      #                     zero-downtime cutover: existing files keep
+      #                     serving from disk, new uploads go to MinIO.
+      SGV_STORAGE.TYPE: minio-fallback
+      SGV_STORAGE.BASE_PATH: /app/uploads
+      SGV_STORAGE.BASE_URL: /files
+      SGV_STORAGE.MINIO_ENDPOINT: minio:9000
+      SGV_STORAGE.MINIO_ACCESS_KEY: minioadmin
+      SGV_STORAGE.MINIO_SECRET_KEY: minioadmin
+      SGV_STORAGE.MINIO_BUCKET: sgv-uploads
+      SGV_STORAGE.MINIO_USE_SSL: "false"
+      SGV_SERVER.PORT: "8080"
+      # AI worker — Python service that runs the CV pipeline. The
+      # hostname is the docker-compose service name; `make dev`
+      # overrides to http://localhost:8100.
+      SGV_AI_WORKER.URL: http://ai-worker:8100
+      LOG_LEVEL: debug
+    volumes:
+      - uploads:/app/uploads
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  pgdata:
+  uploads:
+  miniodata:
+  redisdata:

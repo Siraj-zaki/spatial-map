@@ -1,0 +1,7 @@
+[
+{"address":null,"center":"SRID=4326;POINT(0 0)","color":"#84cc16","created_at":"2026-06-27T11:27:36.143867+00:00","default_view":{"bearing":0,"lat":52.4772,"lng":8.4342,"pitch":0,"zoom":18.92},"description":"","id":58,"is_public":true,"name":"Hospital","share_token":null,"tenant_id":0,"updated_at":"2026-07-07T14:18:23.773002+00:00"},
+{"address":null,"center":"SRID=4326;POINT(0 0)","color":"#10b981","created_at":"2026-07-12T01:05:35.738132+00:00","default_view":null,"description":"","id":61,"is_public":true,"name":"Retail Mall","share_token":null,"tenant_id":0,"updated_at":"2026-07-12T01:05:35.738132+00:00"},
+{"address":null,"center":"SRID=4326;POINT(0 0)","color":"#f59e0b","created_at":"2026-08-26T10:46:47.64263+00:00","default_view":null,"description":"","id":65,"is_public":true,"name":"Acme Warehouse","share_token":null,"tenant_id":0,"updated_at":"2026-08-26T10:46:47.64263+00:00"},
+{"address":null,"center":"SRID=4326;POINT(0 0)","color":"#06b6d4","created_at":"2026-09-10T05:36:35.009707+00:00","default_view":null,"description":"","id":66,"is_public":true,"name":"Acme Supermarket","share_token":null,"tenant_id":0,"updated_at":"2026-09-10T05:36:35.009707+00:00"},
+{"address":null,"center":"SRID=4326;POINT(0 0)","color":"#84cc16","created_at":"2026-10-06T05:45:20.960433+00:00","default_view":null,"description":"","id":71,"is_public":true,"name":"Retail Mart Store","share_token":null,"tenant_id":0,"updated_at":"2026-10-06T05:45:20.960433+00:00"}
+]

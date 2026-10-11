@@ -1,0 +1,78 @@
+[project]
+name = "aiworker"
+version = "0.1.0"
+description = "Python worker for the AI Map floor-plan detection pipeline (SAM + Moondream + OpenCV). Consumed by the Go API via Dramatiq/Redis; reuses the shared sgv-uploads MinIO bucket."
+requires-python = ">=3.12"
+readme = "README.md"
+
+# Phase 2 adds the CV pipeline: SAM 2 (segment anything) + OpenCV
+# (contour extraction) + Shapely (polygon geometry). Torch is pinned
+# to the CPU-only index below — with CUDA wheels the container ships
+# ~8 GB of libraries we'd never use in this codebase.
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.33",
+    "dramatiq[redis]>=1.17,<1.18",
+    "minio>=7.2,<8",
+    "httpx>=0.27,<0.28",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    # ---- Phase 2: segmentation + vectorization ----
+    "torch>=2.5,<3",
+    "torchvision>=0.20,<1",
+    # Meta's official SAM 2 package on PyPI. Package + module name
+    # are both `sam2` (lowercase, no dash).
+    "sam2>=1.1,<2",
+    # opencv-python-headless — no GUI deps, cuts image size vs the
+    # `opencv-python` bundle.
+    "opencv-python-headless>=4.10,<5",
+    "shapely>=2.0,<3",
+    "numpy>=1.26,<3",
+    "pillow>=11,<12",
+    # ---- Phase 3: OCR for room labels ----
+    # pytesseract wraps the system `tesseract` binary (installed via
+    # apt in the runtime Dockerfile). Chosen over Moondream 3 /
+    # PaddleOCR: 10 MB apt package, CPU-fast, best-in-class recall on
+    # clean typewritten architectural text (our test corpus).
+    "pytesseract>=0.3.13,<0.4",
+]
+
+# Torch from the CPU-only PyTorch wheel index. In 2026 the default pip
+# install pulls ~8 GB of CUDA libraries we never use — this pin cuts
+# the container image from ~8 GB down to ~1.75 GB. Mac local dev also
+# works (CPU wheels run fine on Apple Silicon; slower than MPS but
+# consistent with prod).
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.6,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The importable package lives at src/aiworker/. Explicit here so hatch
+# doesn't try to detect + guess.
+packages = ["src/aiworker"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

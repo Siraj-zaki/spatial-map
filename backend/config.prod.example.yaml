@@ -1,0 +1,114 @@
+# Spatial Map — production configuration TEMPLATE.
+#
+# Copy this file somewhere outside the repo (e.g. /etc/spatial-map/config.yaml),
+# fill in the values, and point the API at it:
+#
+#   SGV_CONFIG=/etc/spatial-map/config.yaml ./api
+#
+# Every key can also be set (or overridden) with an env var: SGV_ + the
+# upper-cased dotted path, e.g. SGV_AUTH.JWT_SECRET, SGV_DATABASE.URL.
+# Prefer env vars / your platform's secret store for secrets, and NEVER
+# commit a filled-in copy of this file.
+#
+# In production mode the API refuses to start when auth.api_key or
+# auth.jwt_secret is empty or still a placeholder. Generate values with:
+#
+#   openssl rand -hex 32
+
+mode: "production"
+
+server:
+  # Bind to loopback when a reverse proxy (nginx, Caddy, Traefik) sits in
+  # front; use 0.0.0.0 inside a container.
+  host: "127.0.0.1"
+  port: 8080
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+  shutdown_timeout: "10s"
+  # Origins allowed to call the API cross-origin. When the SPA and the API
+  # are served from the same origin (recommended), this can stay empty.
+  allowed_origins:
+    - "https://maps.example.com"
+  # Reverse-proxy addresses whose X-Forwarded-For / X-Real-IP headers are
+  # trusted for rate limiting. Loopback covers a proxy on the same host.
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+
+database:
+  # Postgres 16 + PostGIS. Use sslmode=require (or verify-full) when the
+  # database is not on the same host.
+  url: "postgres://spatial_map:CHANGE_ME_DB_PASSWORD@localhost:5432/spatial_map?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 25
+  conn_max_lifetime: "30m"
+
+auth:
+  mode: "apikey"
+  # Long random values — see the header. Better: set via
+  # SGV_AUTH.API_KEY / SGV_AUTH.JWT_SECRET env vars.
+  api_key: ""
+  jwt_secret: ""
+  # Optional first admin, created on startup if missing. Better: set via
+  # SGV_AUTH.BOOTSTRAP_EMAIL / SGV_AUTH.BOOTSTRAP_PASSWORD, or run
+  # cmd/seed-admin once and leave these empty.
+  bootstrap_email: ""
+  bootstrap_password: ""
+
+# Public origin of the SPA; used for links in auth emails.
+app:
+  public_url: "https://maps.example.com"
+
+mail:
+  # SMTP relay for verification / password-reset codes. Leave host empty to
+  # print emails to the API log instead (fine for a single-admin install).
+  host: ""
+  port: 587
+  username: ""
+  password: ""                       # prefer SGV_MAIL.PASSWORD
+  from: "no-reply@example.com"
+  from_name: "Spatial Map"
+
+websocket:
+  write_wait: "10s"
+  pong_wait: "60s"
+  ping_period: "54s"
+  max_message_size: 65536
+  replay_event_count: 100
+
+migration:
+  on_start: true
+  path: "migrations"
+
+storage:
+  # "local" (filesystem), "minio" (any S3-compatible bucket) or
+  # "minio-fallback" (S3 primary + local read fallback, for migrating).
+  type: "local"
+  base_path: "/var/lib/spatial-map/uploads"
+  base_url: "/files"
+  # Only used when type is minio / minio-fallback:
+  # minio_endpoint: "s3.example.com"
+  # minio_access_key: ""             # prefer SGV_STORAGE.MINIO_ACCESS_KEY
+  # minio_secret_key: ""             # prefer SGV_STORAGE.MINIO_SECRET_KEY
+  # minio_bucket: "spatial-map-uploads"
+  # minio_region: "us-east-1"
+  # minio_use_ssl: true
+
+# Demo workspace (internal/demo): sample facilities, tables, data links and
+# reports, loaded once into an empty database on first start and joined by
+# every new account as an editor. Off here, so a production install starts
+# empty; set true to give a new install the samples.
+demo:
+  enabled: false
+
+# Optional Python AI worker (backend/ai-worker). Leave url empty to disable
+# the AI Map tool.
+ai_worker:
+  url: ""
+  request_timeout: "30s"
+  poll_interval: "3s"
+  poll_max_duration: "300s"
+  monthly_cap_per_tenant: 200
+  hourly_rate_per_tenant: 20
+  hourly_burst_per_tenant: 3

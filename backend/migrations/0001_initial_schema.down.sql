@@ -1,0 +1,40 @@
+DROP TABLE IF EXISTS cv_detections;
+DROP TABLE IF EXISTS cameras;
+DROP TABLE IF EXISTS shipments;
+DROP TABLE IF EXISTS rfid_reads;
+DROP TABLE IF EXISTS rfid_tags;
+DROP TABLE IF EXISTS sensor_readings;
+DROP TABLE IF EXISTS sensors;
+DROP TABLE IF EXISTS asset_positions;
+DROP TABLE IF EXISTS assets;
+
+DROP TABLE IF EXISTS data_sources;
+DROP TABLE IF EXISTS streams;
+DROP TABLE IF EXISTS connections;
+
+DROP TABLE IF EXISTS bins;
+
+DROP TABLE IF EXISTS user_models;
+DROP TABLE IF EXISTS text_labels;
+DROP TABLE IF EXISTS models;
+DROP TABLE IF EXISTS images;
+DROP TABLE IF EXISTS markers;
+DROP TABLE IF EXISTS lines;
+DROP TABLE IF EXISTS circles;
+DROP TABLE IF EXISTS polygons;
+DROP TABLE IF EXISTS grids;
+DROP TABLE IF EXISTS zones;
+
+DROP TABLE IF EXISTS entity_references;
+DROP TABLE IF EXISTS import_jobs;
+DROP TABLE IF EXISTS style_rules;
+DROP TABLE IF EXISTS attribute_definitions;
+
+DROP TABLE IF EXISTS app_settings;
+DROP TABLE IF EXISTS tenants;
+
+DROP TYPE IF EXISTS import_job_status;
+DROP TYPE IF EXISTS shipment_state;
+DROP TYPE IF EXISTS data_source_kind;
+DROP TYPE IF EXISTS bin_status;
+DROP TYPE IF EXISTS binding_kind;
