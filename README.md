@@ -2,9 +2,9 @@
 
 <img src="public/logo.png" alt="" height="64" />
 
-# Spatial Map
+# Spatial Map — open-source indoor mapping software
 
-**Open-source indoor mapping for real facilities** — draw multi-floor layouts on
+**Open-source indoor maps and digital twins for real facilities** — draw multi-floor layouts on
 a live map, link them to your own data (sensors, RFID, inventory, any table or
 API), and turn it into live 3D views, dashboards and reports.
 
