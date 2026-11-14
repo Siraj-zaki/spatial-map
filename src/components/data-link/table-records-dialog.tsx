@@ -197,7 +197,7 @@ export function TableRecordsDialog({
 }) {
   const { t, i18n } = useTranslation()
   const tableId = table.dataSource.id
-  const { canEdit } = useWorkspaceRole()
+  const canEdit = useWorkspaceRole().can('data.manage')
 
   const [{ page, pageSize, sortBy, sortDir, q }, setGrid] = useGridState(inline)
   // The box updates instantly; the query (and URL) once typing pauses. An

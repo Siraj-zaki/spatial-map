@@ -1,6 +1,6 @@
 -- Column order below matches the auto-generated `db.DataSource` model
 -- struct so sqlc reuses that type for every RETURNING/SELECT (see the
--- AGENTS.md note on column ordering).
+-- CLAUDE.md note on column ordering).
 
 -- name: CreateDataSource :one
 INSERT INTO data_sources (tenant_id, name, kind, zone_id, config, mapping, schedule, interval_seconds, entity_kind)

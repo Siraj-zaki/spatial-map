@@ -19,13 +19,15 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id, tenant_id, source_id, entity_key, payload, operation, ts, source_ip, auth_token_id;
 
 -- name: ListDataSourceRowEventsBySource :many
--- Windowed lookup for the recap / heatmap path. `since_ts` is the lower
--- bound; pass e.g. `now() - interval '24 hours'` from the handler.
+-- Windowed lookup for the history player / heatmap: every event with
+-- since <= ts <= until, oldest first. A "last 24 h" window passes
+-- until = now(); a custom range passes both ends.
 SELECT id, tenant_id, source_id, entity_key, payload, operation, ts, source_ip, auth_token_id
 FROM data_source_row_events
-WHERE source_id = $1 AND tenant_id = $2 AND ts >= $3
+WHERE source_id = sqlc.arg(source_id) AND tenant_id = sqlc.arg(tenant_id)
+  AND ts >= sqlc.arg(since)::timestamptz AND ts <= sqlc.arg(until)::timestamptz
 ORDER BY ts ASC
-LIMIT $4;
+LIMIT sqlc.arg(row_limit);
 
 -- name: ListDataSourceRowEventsForKey :many
 -- Per-entity trail — the per-row history view the user opens from the

@@ -1,6 +1,7 @@
 import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 import type { TFunction } from 'i18next'
 import { invalidateUploadLibrary } from '@/lib/upload-library'
 
@@ -75,6 +76,12 @@ export function useModelPlacementTool({
     if (!mapInstance) return
     const map = mapInstance
     map.getCanvas().style.cursor = modelConfig.modelAssetId ? 'crosshair' : ''
+    // Where the cursor touches the scene (at the model tool's elevation) —
+    // not the ground under it, which is off by the floor's height at pitch.
+    const at = (e: MapMouseEvent): [number, number] => {
+      const p = unprojectOnScene(map, e.point, modelConfig.elevation ?? 0)
+      return [p.lng, p.lat]
+    }
 
     // RAF-coalesce mousemove — every cursor tick triggers a preview
     // model source update in the overlay (setSourceModel on
@@ -91,7 +98,7 @@ export function useModelPlacementTool({
     }
     const onMove = (e: MapMouseEvent) => {
       if (!modelConfig.modelAssetId) return
-      pendingLngLat = [e.lngLat.lng, e.lngLat.lat]
+      pendingLngLat = at(e)
       if (moveRafId === 0) moveRafId = requestAnimationFrame(flushMove)
     }
     const onClick = (e: MapMouseEvent) => {
@@ -100,7 +107,7 @@ export function useModelPlacementTool({
       const now = new Date()
       void (async () => {
         const wid = activeWarehouseIdRef.current
-        const pos: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+        const pos: [number, number] = at(e)
         // Derive a friendlier default name from the picked asset — so
         // placing three different models yields three distinguishable
         // rows in the sidebar instead of three identical "Model" rows.

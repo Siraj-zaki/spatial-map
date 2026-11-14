@@ -108,7 +108,7 @@ function GridSkeleton({ count }: { count: number }) {
 
 export default function FilesPage() {
   const { t, i18n } = useTranslation()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('files.manage')
   const tenantId = useCurrentTenantId()
 
   // ---- URL state --------------------------------------------------------

@@ -4,7 +4,8 @@ import { type Grid } from './db'
 import { apiDb } from './api-db'
 import { saveSpatialEntity, useSpatialStore } from './spatial-store'
 import { queryCache } from './useApiQuery'
-import { buildGrid, type GridConfig } from './grid-generators'
+import { buildGrid, buildGridFromLine, type GridConfig } from './grid-generators'
+import { isPathGrid } from './grid-path'
 import { buildImageFeature } from './image-generators'
 import { buildLineFeature, lineLengthMeters } from './line-generators'
 import { buildPolygonFeature } from './polygon-generators'
@@ -37,6 +38,12 @@ export function gridBbox(grid: Grid): [number, number, number, number] {
 export function gridToFeatureCollection(
   grid: Grid
 ): GeoJSON.FeatureCollection<GeoJSON.Polygon> {
+  // Path-layout grids lay their cells along `config.path`; build them through
+  // the same entry point the renderer uses so exports match the map.
+  if (isPathGrid(grid.config)) {
+    const { cells } = buildGridFromLine(grid.start, grid.current, grid.config, { committed: true, gridId: grid.id })
+    return { type: 'FeatureCollection', features: cells } as GeoJSON.FeatureCollection<GeoJSON.Polygon>
+  }
   return buildGrid(gridBbox(grid), grid.config, grid.start, grid.id) as GeoJSON.FeatureCollection<GeoJSON.Polygon>
 }
 
@@ -333,6 +340,16 @@ export function updateGridGeometry(
   return saveSpatialEntity<Grid>('grids', id, { start, current })
 }
 
+/** Geometry and config in one save — a path-layout redraw changes both (the path lives in `config`). */
+export function updateGridShape(
+  id: number,
+  start: [number, number],
+  current: [number, number],
+  config: GridConfig,
+): Promise<void> {
+  return saveSpatialEntity<Grid>('grids', id, { start, current, config })
+}
+
 export function renameGrid(id: number, name: string): Promise<void> {
   return saveSpatialEntity<Grid>('grids', id, { name })
 }
@@ -371,7 +388,9 @@ export async function duplicateGrid(id: number): Promise<number | null> {
     start,
     current,
     config: { ...orig.config },
+    visible: orig.visible ?? true,
     zoneId: orig.zoneId,
+    floorPlanId: orig.floorPlanId,
     createdAt: now,
     updatedAt: now,
   })
@@ -455,6 +474,7 @@ export async function importGridsFromGeoJSON(
       start: [bbox[0], bbox[1]],
       current: [bbox[2], bbox[3]],
       config: defaultConfigForImport(),
+      visible: true,
       createdAt: now,
       updatedAt: now,
     })

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ChevronDown, ChevronLeft, ChevronRight, Loader2, MapPinned, Pencil, Save, Trash2, X } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, Eye, Loader2, MapPinned, Pencil, Save, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -30,6 +30,7 @@ import {
   deleteFacilityRow,
   facilityEditorHref,
   facilityFieldLabel,
+  facilityViewerHref,
   isFacilityRowDeletable,
   writeFacilityRow,
 } from '@/lib/reports/facility-sources'
@@ -410,7 +411,7 @@ export function EditableTableWidget({
                   </th>
                 )
               })}
-              {showActions && <th className={facility ? 'w-20' : 'w-8'} />}
+              {showActions && <th className={facility ? 'w-28' : 'w-8'} />}
             </tr>
           </thead>
           <tbody>
@@ -498,6 +499,21 @@ export function EditableTableWidget({
                                 title={t('reports.facility.openInEditorShort', { defaultValue: 'Open in editor' })}
                               >
                                 <MapPinned className="w-3 h-3" />
+                              </a>
+                            </Button>
+                          ) : null
+                        })()}
+                        {facility && k && (() => {
+                          // The read-only viewer, focused on this item (?focus=).
+                          const href = facilityViewerHref(k, facilityIdx !== undefined ? Number(row[facilityIdx]) : null)
+                          return href ? (
+                            <Button asChild variant="ghost" size="sm" className="h-6 w-6 p-0">
+                              <a
+                                href={href}
+                                aria-label={t('reports.facility.openInViewer', { name: rowName(k), defaultValue: 'Open {{name}} in the viewer' })}
+                                title={t('reports.facility.openInViewerShort', { defaultValue: 'Open in viewer' })}
+                              >
+                                <Eye className="w-3 h-3" />
                               </a>
                             </Button>
                           ) : null

@@ -45,6 +45,69 @@ type Visibility = 'visible' | 'none'
 
 const INSTALLED = Symbol.for('sgv.empty-layer-gate.installed')
 const SOURCE_WRAPPED = Symbol.for('sgv.empty-layer-gate.source-wrapped')
+const COUNT_HINTS = Symbol.for('sgv.empty-layer-gate.count-hints')
+const LAYER_API = Symbol.for('sgv.empty-layer-gate.layer-api')
+
+/** Per-feature test that mirrors a layer's own `filter` (see registerLayerFeaturePredicate). */
+export type LayerFeaturePredicate = (feature: { properties?: Record<string, unknown> | null; id?: unknown }) => boolean
+
+interface LayerApi {
+  setPredicate(layerId: string, predicate: LayerFeaturePredicate | null): void
+  setEmptyHint(layerId: string, empty: boolean | null): void
+}
+function layerApi(map: MapboxMapInstance): LayerApi | undefined {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (map as any)[LAYER_API] as LayerApi | undefined
+}
+
+/**
+ * Register a JS predicate that matches exactly the features a layer's own
+ * `filter` lets through (e.g. one opacity bucket of a shared source). On
+ * every `setData` of the layer's source the gate counts the matching
+ * features and hides the layer while that count is 0 — a layer whose filter
+ * passes nothing draws nothing, yet Mapbox still re-evaluates it every frame
+ * (on the stadium, ~30 empty opacity-bucket layers cost ~4 fps on Standard).
+ *
+ * The predicate MUST stay in lock-step with the layer's filter: if it ever
+ * returns false for a feature the filter would draw, that feature vanishes.
+ * When in doubt return true. Pass `null` to unregister. The registration is
+ * dropped when the layer is removed (style swap / unmount), so overlays
+ * register right after each `addLayer`. While the source's data is unknown
+ * (URL data, a diff-only `updateData` without a count hint) the predicate is
+ * ignored and the layer stays visible. No-op when the gate isn't installed.
+ */
+export function registerLayerFeaturePredicate(
+  map: MapboxMapInstance,
+  layerId: string,
+  predicate: LayerFeaturePredicate | null,
+): void {
+  layerApi(map)?.setPredicate(layerId, predicate)
+}
+
+/**
+ * Tell the gate a layer currently has nothing to draw for a reason the
+ * source data doesn't show — typically a selection/hover layer whose
+ * `filter` matches no id right now (`['==', id, -1]`). `true` hides it,
+ * `false` / `null` clears the hint (= today's behaviour). App intent still
+ * wins: a layer the app hid stays hidden. Dropped when the layer is removed.
+ */
+export function hintLayerEmpty(map: MapboxMapInstance, layerId: string, empty: boolean | null): void {
+  layerApi(map)?.setEmptyHint(layerId, empty)
+}
+
+/**
+ * Tell the gate how many features a source will hold after the NEXT
+ * `updateData` call on it. `updateData` carries only a diff, so the gate
+ * can't count it; without a hint the source's count becomes unknown
+ * (= visible). The GeoJSON diff writer knows the full size and passes it
+ * here right before it calls `updateData`. No-op when the gate isn't
+ * installed on this map.
+ */
+export function hintNextUpdateCount(map: MapboxMapInstance, sourceId: string, count: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const hints = (map as any)[COUNT_HINTS] as Map<string, number> | undefined
+  hints?.set(sourceId, count)
+}
 
 /**
  * Feature count of a GeoJSON source's `data`, or `null` when it can't be
@@ -75,6 +138,62 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
   const desired = new Map<string, Visibility>()
   /** layer id → visibility the gate last pushed, to skip redundant writes. */
   const applied = new Map<string, Visibility>()
+  /** source id → feature count after its next `updateData` (see hintNextUpdateCount). */
+  const countHints = new Map<string, number>()
+  anyMap[COUNT_HINTS] = countHints
+  /** source id → the last full data object pushed (null when unknown), for predicates. */
+  const lastData = new Map<string, unknown>()
+  /** layer id → predicate mirroring its filter (registerLayerFeaturePredicate). */
+  const predicates = new Map<string, LayerFeaturePredicate>()
+  /** layer id → number of source features its predicate passes, or null when unknown. */
+  const predicateCount = new Map<string, number | null>()
+  /** layer id → app hint that the layer has nothing to draw (hintLayerEmpty). */
+  const emptyHints = new Map<string, boolean>()
+
+  function countPredicate(data: unknown, predicate: LayerFeaturePredicate): number | null {
+    if (!data || typeof data !== 'object') return null
+    const feats = (data as { features?: unknown }).features
+    if (!Array.isArray(feats)) return null
+    let n = 0
+    for (const f of feats) {
+      try {
+        if (predicate(f as never)) n++
+      } catch {
+        return null
+      }
+      if (n > 0) return n // only zero vs non-zero matters
+    }
+    return n
+  }
+  function refreshPredicates(sourceId: string): void {
+    const ids = sourceLayers.get(sourceId)
+    if (!ids) return
+    const data = lastData.get(sourceId)
+    for (const layerId of ids) {
+      const p = predicates.get(layerId)
+      if (!p) continue
+      predicateCount.set(layerId, data === undefined || data === null ? null : countPredicate(data, p))
+    }
+  }
+  anyMap[LAYER_API] = {
+    setPredicate(layerId: string, predicate: LayerFeaturePredicate | null) {
+      if (!predicate) {
+        predicates.delete(layerId)
+        predicateCount.delete(layerId)
+      } else {
+        predicates.set(layerId, predicate)
+        const sourceId = layerSource.get(layerId)
+        const data = sourceId === undefined ? undefined : lastData.get(sourceId)
+        predicateCount.set(layerId, data === undefined || data === null ? null : countPredicate(data, predicate))
+      }
+      applyLayer(layerId)
+    },
+    setEmptyHint(layerId: string, empty: boolean | null) {
+      if (empty) emptyHints.set(layerId, true)
+      else emptyHints.delete(layerId)
+      applyLayer(layerId)
+    },
+  } satisfies LayerApi
 
   const origAddSource = map.addSource.bind(map)
   const origRemoveSource = map.removeSource.bind(map)
@@ -84,6 +203,8 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
 
   function effectiveVisibility(layerId: string): Visibility {
     if ((desired.get(layerId) ?? 'visible') === 'none') return 'none'
+    if (emptyHints.get(layerId)) return 'none'
+    if (predicateCount.get(layerId) === 0) return 'none'
     const sourceId = layerSource.get(layerId)
     if (sourceId === undefined) return 'visible'
     const count = featureCount.get(sourceId)
@@ -118,6 +239,10 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
    * synchronously, in the same call the overlay makes. Sources without
    * `setData` (raster, image, video, vector, model) stay untracked, which
    * leaves their layers ungated.
+   *
+   * `updateData` (dynamic GeoJSON sources) is wrapped too: it sends a diff,
+   * so the count comes from a `hintNextUpdateCount` the caller left just
+   * before, or becomes unknown (= visible) when there is none.
    */
   function trackSource(sourceId: string, initialData: unknown): void {
     const src = map.getSource(sourceId)
@@ -129,14 +254,33 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
       return
     }
     featureCount.set(sourceId, countFeatures(initialData))
+    lastData.set(sourceId, countFeatures(initialData) === null ? null : initialData)
+    refreshPredicates(sourceId)
     if (anySrc[SOURCE_WRAPPED]) return
     anySrc[SOURCE_WRAPPED] = true
     const origSetData = anySrc.setData.bind(anySrc)
     anySrc.setData = (data: unknown) => {
       const result = origSetData(data)
+      countHints.delete(sourceId)
       featureCount.set(sourceId, countFeatures(data))
+      lastData.set(sourceId, countFeatures(data) === null ? null : data)
+      refreshPredicates(sourceId)
       applySource(sourceId)
       return result
+    }
+    if (typeof anySrc.updateData === 'function') {
+      const origUpdateData = anySrc.updateData.bind(anySrc)
+      anySrc.updateData = (data: unknown) => {
+        const result = origUpdateData(data)
+        const hint = countHints.get(sourceId)
+        countHints.delete(sourceId)
+        featureCount.set(sourceId, hint ?? null)
+        // A diff can't be run through predicates; their layers fall back to visible.
+        lastData.set(sourceId, null)
+        refreshPredicates(sourceId)
+        applySource(sourceId)
+        return result
+      }
     }
   }
 
@@ -151,6 +295,8 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
 
   anyMap.removeSource = ((id: string) => {
     featureCount.delete(id)
+    countHints.delete(id)
+    lastData.delete(id)
     return origRemoveSource(id)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   }) as any
@@ -189,6 +335,9 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
     if (sourceId !== undefined) sourceLayers.get(sourceId)?.delete(id)
     layerSource.delete(id)
     applied.delete(id)
+    predicates.delete(id)
+    predicateCount.delete(id)
+    emptyHints.delete(id)
     return origRemoveLayer(id)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   }) as any
@@ -210,7 +359,7 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
   }) as any
 
   if (import.meta.env.DEV) {
-    anyMap.__emptyLayerGate = { layerSource, sourceLayers, featureCount, desired, applied }
+    anyMap.__emptyLayerGate = { layerSource, sourceLayers, featureCount, desired, applied, predicates, predicateCount, emptyHints }
   }
 
   return () => {
@@ -220,5 +369,7 @@ export function installEmptyLayerGate(map: MapboxMapInstance): () => void {
     anyMap.removeLayer = origRemoveLayer
     anyMap.setLayoutProperty = origSetLayoutProperty
     anyMap[INSTALLED] = false
+    if (anyMap[COUNT_HINTS] === countHints) anyMap[COUNT_HINTS] = undefined
+    anyMap[LAYER_API] = undefined
   }
 }

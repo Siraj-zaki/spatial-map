@@ -68,8 +68,6 @@ func toSolutionResponse(s db.Solution) SolutionResponse {
 	}
 }
 
-var solutionEditors = []string{RoleOwner, RoleAdmin, RoleEditor}
-
 func listSolutions(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := api.TenantID(r.Context())
@@ -183,7 +181,7 @@ func addSolutionItems(r *http.Request, qtx *db.Queries, solutionID, tenantID int
 
 func createSolution(q *db.Queries, pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, solutionEditors...) {
+		if !api.RequirePermission(w, r, api.PermSolutionsManage) {
 			return
 		}
 		var req SolutionRequest
@@ -236,7 +234,7 @@ func createSolution(q *db.Queries, pool *pgxpool.Pool) http.HandlerFunc {
 
 func updateSolution(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, solutionEditors...) {
+		if !api.RequirePermission(w, r, api.PermSolutionsManage) {
 			return
 		}
 		current, ok := loadSolution(w, r, q)
@@ -278,7 +276,7 @@ func updateSolution(q *db.Queries) http.HandlerFunc {
 
 func deleteSolution(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, solutionEditors...) {
+		if !api.RequirePermission(w, r, api.PermSolutionsManage) {
 			return
 		}
 		current, ok := loadSolution(w, r, q)
@@ -300,7 +298,7 @@ func deleteSolution(q *db.Queries) http.HandlerFunc {
 // the whole set (PUT).
 func changeSolutionItems(q *db.Queries, pool *pgxpool.Pool, mode string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, solutionEditors...) {
+		if !api.RequirePermission(w, r, api.PermSolutionsManage) {
 			return
 		}
 		current, ok := loadSolution(w, r, q)

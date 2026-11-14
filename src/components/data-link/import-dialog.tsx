@@ -858,7 +858,7 @@ function FileStep({
               b: <span className="font-medium" />,
               link: (
                 <a
-                  href="/integrations"
+                  href={sitePath('/integrations')}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-primary underline-offset-2 hover:underline"
@@ -2077,6 +2077,7 @@ function mappingToWireFormat(
 import { FieldMapper } from './field-mapper'
 import { ImportPreview } from './import-preview'
 import { SampleDownloadMenu } from './sample-download-menu'
+import { sitePath } from '@/lib/site'
 function FieldMapperBlock(props: Parameters<typeof FieldMapper>[0]) {
   return <FieldMapper {...props} />
 }

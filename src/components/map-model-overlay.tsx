@@ -35,6 +35,14 @@ import {
   type ModelEntry,
 } from '@/lib/model-generators'
 import type { ModelShape } from '@/lib/shapes'
+import { hasMapLayer } from '@/lib/data-link/dl-layer-stack'
+import {
+  focusFactor,
+  useFocusBlockers,
+  useFocusScene,
+  type FocusBlockers,
+  type FocusScene,
+} from '@/lib/focus/focus-scene'
 import mapboxgl, {
   type Map as MapboxMapInstance,
   type MapMouseEvent,
@@ -127,6 +135,112 @@ const PREVIEW_LAYER = 'model-shapes-preview-layer'
 
 const sourceIdFor = (shapeId: number) => `${SOURCE_PREFIX}${shapeId}`
 const layerIdFor = (shapeId: number) => `${LAYER_PREFIX}${shapeId}`
+
+// ---- Focus mode: per-item `model-opacity` factor ---------------------------
+//
+// While an item is focused (`src/lib/focus/focus-scene.ts`), only the
+// models / image planes right next to it fade: `model-opacity` ×
+// `focusFactor(...)` — FOCUS_FACTOR.near for an anchor in the focused
+// item's NEAR column (`scene.near`), 1 for the focused item itself and for
+// everything else. Model layers are one per shape, so the
+// fade is a plain per-layer `setPaintProperty('model-opacity', …)` —
+// written only when an item's factor changes (focus enter / change /
+// exit), never per camera move. Factor 1 hands the ORIGINAL paint value
+// back by identity, so with focus off nothing is written and the layers
+// are exactly what they were before focus mode existed.
+//
+// Note for verification: `translucent-layer-order.ts` counts every
+// `model` layer as opaque 3D whatever its `model-opacity` (it only
+// judges constant fill-extrusion opacity), so a faded model keeps its
+// place in the root order and translucent extrusions still draw after
+// it. That is deliberate — don't pin or re-sort model layers here.
+
+/** Shared "nothing faded" map — stable identity while focus is off. */
+const NO_FOCUS_FACTORS: ReadonlyMap<number, number> = new Map()
+
+function isZoomInput(v: unknown): boolean {
+  return Array.isArray(v) && v.length === 1 && v[0] === 'zoom'
+}
+
+function mentionsZoom(v: unknown): boolean {
+  if (!Array.isArray(v)) return false
+  if (v[0] === 'zoom') return true
+  for (const item of v) if (mentionsZoom(item)) return true
+  return false
+}
+
+function scaleStopOutput(v: unknown, factor: number): unknown {
+  return typeof v === 'number' ? v * factor : ['*', factor, v]
+}
+
+/**
+ * `model-opacity` × `factor`, keeping `['zoom']` the top-level input (a
+ * zoom curve nested inside another expression is invalid in Mapbox):
+ *
+ *  - a number is multiplied (missing = the spec default 1);
+ *  - `['interpolate', i, ['zoom'], z0, v0, …]` / `['step', ['zoom'], v0,
+ *    z1, v1, …]` keep their stops and get every OUTPUT scaled — numbers
+ *    multiplied, nested expressions wrapped in `['*', factor, v]`;
+ *  - any other expression is wrapped in `['*', factor, v]`, unless it
+ *    reads the zoom somewhere inside (wrapping would make it invalid) —
+ *    then it is left unfaded.
+ *
+ * `factor === 1` returns `value` itself (same reference), so callers can
+ * skip the write. The result stays a constant / zoom expression: no
+ * data-driven paint, so no relayout of the model source.
+ */
+export function scaleModelOpacity(value: unknown, factor: number): unknown {
+  if (factor === 1) return value
+  if (value === undefined || value === null) return factor
+  if (typeof value === 'number') return value * factor
+  if (!Array.isArray(value)) return value
+  const op = value[0]
+  if (op === 'interpolate' && isZoomInput(value[2])) {
+    const out: unknown[] = [op, value[1], value[2]]
+    for (let i = 3; i + 1 < value.length; i += 2) {
+      out.push(value[i], scaleStopOutput(value[i + 1], factor))
+    }
+    return out
+  }
+  if (op === 'step' && isZoomInput(value[1])) {
+    const out: unknown[] = [op, value[1], scaleStopOutput(value[2], factor)]
+    for (let i = 3; i + 1 < value.length; i += 2) {
+      out.push(value[i], scaleStopOutput(value[i + 1], factor))
+    }
+    return out
+  }
+  return mentionsZoom(value) ? value : ['*', factor, value]
+}
+
+/** `paint` with `model-opacity` scaled by `factor`; `paint` itself when nothing changes. */
+export function withFocusModelOpacity<P extends { 'model-opacity'?: unknown }>(paint: P, factor: number): P {
+  if (factor === 1) return paint
+  const base = paint['model-opacity']
+  const scaled = scaleModelOpacity(base, factor)
+  return scaled === base ? paint : { ...paint, 'model-opacity': scaled }
+}
+
+/**
+ * Focus factor per shape id, holding only the ids whose factor is not 1.
+ * Returns the shared NO_FOCUS_FACTORS (stable identity) when nothing is
+ * faded — always the case while focus is off. Shared with
+ * `map-image-plane-overlay.tsx` (kind 'image-planes').
+ */
+export function modelFocusFactors(
+  rows: ReadonlyArray<{ id?: number }> | undefined,
+  kind: 'models' | 'image-planes',
+  scene: FocusScene,
+  blockers: FocusBlockers,
+): ReadonlyMap<number, number> {
+  if (!scene.active || !rows) return NO_FOCUS_FACTORS
+  let out: Map<number, number> | null = null
+  for (const row of rows) {
+    if (row.id === undefined) continue
+    const f = focusFactor(scene, blockers, kind, row.id)
+    if (f !== 1) (out ??= new Map()).set(row.id, f)
+  }
+  return out ?? NO_FOCUS_FACTORS
+}
 
 /**
  * Convert a URI to an absolute URL. Mapbox tries to resolve relative
@@ -288,6 +402,26 @@ export function MapModelOverlay({
   // re-creates of the `models` array.
   const activeShapeIdsKey = entries.map((e) => e.shapeId).sort((a, b) => a - b).join('|')
 
+  // ---- Focus mode (see `scaleModelOpacity`) -----------------------------
+  // Per-shape opacity factor while an item is focused. The layer effect
+  // below reads it through a ref (so a focus change doesn't re-run that
+  // effect's `getStyle()` walk and `setModels` for every shape); the
+  // focus effect after it writes `model-opacity` for the shapes whose
+  // factor changed. `appliedFocusRef` = the factor each mounted layer
+  // currently shows.
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  const focusFactors = useMemo(
+    () => modelFocusFactors(models, 'models', focusScene, focusBlockers),
+    [models, focusScene, focusBlockers],
+  )
+  const focusFactorsRef = useRef(focusFactors)
+  const appliedFocusRef = useRef<Map<number, number>>(new Map())
+  // Declared BEFORE the layer effect so it sees this commit's factors.
+  useEffect(() => {
+    focusFactorsRef.current = focusFactors
+  }, [focusFactors])
+
   // ---- Source / layer per shape ----------------------------------------
   //
   // Per-shape URI signature that has actually been handed to Mapbox.
@@ -319,13 +453,14 @@ export function MapModelOverlay({
     new Map(),
   )
   useEffect(() => {
+    // Both Maps live for the component's lifetime (never reassigned).
+    const pending = pendingRetryRef.current
+    const listeners = pendingListenerRef.current
     return () => {
-      const pending = pendingRetryRef.current
       for (const timers of pending.values()) {
         for (const t of timers) clearTimeout(t)
       }
       pending.clear()
-      const listeners = pendingListenerRef.current
       if (map) {
         for (const fn of listeners.values()) {
           try {
@@ -380,6 +515,7 @@ export function MapModelOverlay({
       const sid = sourceIdFor(id)
       if (!wantedSources.has(sid)) {
         mountedUriRef.current.delete(id)
+        appliedFocusRef.current.delete(id)
         const pending = pendingRetryRef.current.get(id)
         if (pending) {
           for (const t of pending) clearTimeout(t)
@@ -397,9 +533,12 @@ export function MapModelOverlay({
     }
 
     // Add / update each wanted shape.
-    for (const { shapeId, entry, paint } of entries) {
+    for (const { shapeId, entry, paint: basePaint } of entries) {
       const sourceId = sourceIdFor(shapeId)
       const layerId = layerIdFor(shapeId)
+      // Focus fade (factor 1 → `basePaint` itself, i.e. no change).
+      const focusF = focusFactorsRef.current.get(shapeId) ?? 1
+      const paint = withFocusModelOpacity(basePaint, focusF)
       const wantedUri = entry.spec.uri
       const mountedUri = mountedUriRef.current.get(shapeId)
       // A full source remount is required when: (a) the source isn't
@@ -501,7 +640,9 @@ export function MapModelOverlay({
           const retryEntry = entry
           const retrySourceId = sourceId
           const retryLayerId = layerId
-          const retryPaint = paint
+          // Base paint: the focus factor is re-read when the retry fires
+          // (focus may have changed in the meantime).
+          const retryPaint = basePaint
           const retryUri = wantedUri
           const prevTimers = pendingRetryRef.current.get(retryShapeId)
           if (prevTimers) for (const t of prevTimers) clearTimeout(t)
@@ -582,6 +723,7 @@ export function MapModelOverlay({
                 models: { [retryEntry.key]: retryEntry.spec } as any,
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
               } as any)
+              const retryFocusF = focusFactorsRef.current.get(retryShapeId) ?? 1
               map.addLayer({
                 id: retryLayerId,
                 type: 'model',
@@ -591,8 +733,9 @@ export function MapModelOverlay({
                   'model-id': retryEntry.key as any,
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any,
-                paint: retryPaint as unknown as mapboxgl.ModelLayerSpecification['paint'],
+                paint: withFocusModelOpacity(retryPaint, retryFocusF) as unknown as mapboxgl.ModelLayerSpecification['paint'],
               })
+              appliedFocusRef.current.set(retryShapeId, retryFocusF)
               try { map.triggerRepaint() } catch { /* ignore */ }
               mountedUriRef.current.set(retryShapeId, retryUri)
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -638,6 +781,8 @@ export function MapModelOverlay({
           }
         }
       }
+      // The layer now shows `paint` — i.e. this focus factor.
+      appliedFocusRef.current.set(shapeId, focusF)
       // Master visibility — flip every layer at once.
       try {
         map.setLayoutProperty(
@@ -650,6 +795,35 @@ export function MapModelOverlay({
       }
     }
   }, [map, styleLoaded, entries, activeShapeIdsKey, committedVisible])
+
+  // ---- Focus fade -------------------------------------------------------
+  // Runs after the layer effect: writes `model-opacity` only for mounted
+  // layers whose factor differs from the one they show. Focus enter /
+  // change / exit (and scene changes) only — never per camera move. With
+  // focus off every factor is 1 = what every layer shows, so this writes
+  // nothing.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const applied = appliedFocusRef.current
+    for (const { shapeId, paint } of entries) {
+      const f = focusFactors.get(shapeId) ?? 1
+      const shown = applied.get(shapeId)
+      if (shown === undefined || shown === f) continue
+      const layerId = layerIdFor(shapeId)
+      if (!hasMapLayer(map, layerId)) continue
+      try {
+        map.setPaintProperty(
+          layerId,
+          'model-opacity',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          scaleModelOpacity(paint['model-opacity'], f) as any,
+        )
+        applied.set(shapeId, f)
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [map, styleLoaded, entries, focusFactors])
 
   // ---- Live preview (ghost at cursor) -----------------------------------
   //
@@ -888,6 +1062,19 @@ export function MapModelOverlay({
     modelsRef.current = models
   }, [models])
 
+  // The handle stands at the model's elevation: a DOM marker at altitude
+  // 0 sat on the ground under a second-floor model, and Marker's drag
+  // unprojects at the marker's own altitude, so the drag tracks the
+  // cursor on that floor too. Follows Elevation edits made mid-move.
+  const moveHandleRef = useRef<mapboxgl.Marker | null>(null)
+  const moveModelElevation =
+    transformState?.kind === 'move'
+      ? (models ?? []).find((m) => m.id === transformState.modelId)?.config.elevation ?? 0
+      : 0
+  useEffect(() => {
+    moveHandleRef.current?.setAltitude(Math.max(0, moveModelElevation))
+  }, [moveModelElevation])
+
   useEffect(() => {
     if (!map) return
     if (!transformState || transformState.kind !== 'move') return
@@ -912,7 +1099,9 @@ export function MapModelOverlay({
       draggable: true,
     })
       .setLngLat(model.position)
+      .setAltitude(Math.max(0, model.config.elevation ?? 0))
       .addTo(map)
+    moveHandleRef.current = handle
 
     // Bypass React state during drag. Rewriting the source spec via
     // `setSourceModel` on the transforming model's Mapbox source
@@ -995,6 +1184,7 @@ export function MapModelOverlay({
       }
       if (rafId !== 0) cancelAnimationFrame(rafId)
       pendingLngLat = null
+      if (moveHandleRef.current === handle) moveHandleRef.current = null
       handle.remove()
     }
   }, [map, transformState, urlMap, shapeExtras, boundingCenterMap])

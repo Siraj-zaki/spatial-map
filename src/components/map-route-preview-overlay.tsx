@@ -1,174 +1,81 @@
 /**
- * Route-preview overlay — draws the computed wayfinding path on the map.
+ * Route-preview overlay — draws the planned route on the map, on every
+ * floor it uses.
  *
- * Structure is a deliberate copy of the working `MapRouteOverlay`:
+ *   - Each walking leg is drawn at its floor's height, and lifted onto the
+ *     top of any raised walkable polygon on that floor (rooms drawn as
+ *     blocks, a floor-area slab) so the line isn't hidden inside it.
+ *   - A floor change through stairs or an escalator draws as a line that
+ *     climbs in short steps from the landing on one floor to the landing on
+ *     the next; every change also gets a small label at both ends
+ *     ("Stairs 1 ↑", "Lift ↓").
+ *   - Start / end pins are symbols at their floor's height (a DOM marker
+ *     can't be lifted off the ground, so on an upper floor it drifted).
  *
- *   - Style readiness gated by `whenStyleLoaded` (race-safe against
- *     cold-start / style-swap sequences).
- *   - `styleGen` counter re-runs the install effect after every style
- *     load so a `setStyle` mid-session re-adds our source + layers.
- *   - Install effect is IDEMPOTENT (checks `!getLayer(...)` per layer)
- *     and depends on `[map, styleLoaded, styleGen, featureCollection]`
- *     so it re-runs whenever data changes, guaranteeing the layers
- *     exist when we push new data.
- *   - Data push effect uses the same deps + calls `setData` on the
- *     source — plain and pushable.
- *   - `line-elevation-reference: 'sea'` + `line-z-offset` driven by
- *     the feature property (defaulting to 0) matches exactly how the
- *     user-drawn routes render — the same paint that already works
- *     for `RouteShape`. We don't invent new elevation math.
- *
- * The overlay also drops two DOM markers for start / end so the user
- * always sees where the path begins and ends.
+ * Structure follows `MapRouteOverlay`: style readiness via
+ * `whenStyleLoaded`, a `styleGen` counter re-running the idempotent install
+ * after a style swap, `line-elevation-reference: 'sea'` + per-feature
+ * `line-z-offset`. The layers are unslotted and kept last in the stack
+ * (see the keep-on-top effect below).
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
-import mapboxgl, { type GeoJSONSource, type Map as MapboxMapInstance } from 'mapbox-gl'
+import { useEffect, useMemo, useState } from 'react'
+import type { GeoJSONSource, Map as MapboxMapInstance } from 'mapbox-gl'
 
 import { whenStyleLoaded } from '@/lib/mapbox-style-ready'
-import type { RouteStatus } from '@/lib/routing'
+import type { Floor, RouteOption } from '@/lib/routing/floors'
+import { legRuns, surfacesOnFloor, type ElevatedPolygon } from '@/lib/routing/surface'
+import type { RoutePin, RoutePlanStatus } from '@/routes/create-grids/hooks/useRoutePreviewTool'
 
 const STROKE_SOURCE = 'route-preview-stroke-source'
 const STROKE_LAYER = 'route-preview-stroke-layer'
 const HALO_LAYER = 'route-preview-halo-layer'
+const POINT_SOURCE = 'route-preview-point-source'
+const PIN_LAYER = 'route-preview-pin-layer'
+const LABEL_LAYER = 'route-preview-label-layer'
 
-/** A walkable polygon with a raised top surface. */
-export interface ElevatedRoutePolygon {
-  vertices: [number, number][]
-  /** Metres above sea level for the polygon's TOP surface. */
-  topZ: number
-}
+/** Route colours: the same as before the multi-floor rework. */
+const OK = '#10b981'
+const FAIL = '#ef4444'
+const START = '#10b981'
+const END = '#ef4444'
 
 interface Props {
   map: MapboxMapInstance | null
-  start: [number, number] | null
-  end: [number, number] | null
-  path: [number, number][] | null
-  status: RouteStatus | null
-  /**
-   * Walkable polygons with height/elevation > 0. When the route
-   * crosses one of these, the segment inside is lifted to the
-   * polygon's top surface so the line stays visible over the
-   * extrusion instead of being clipped underneath.
-   */
-  elevatedPolygons?: ElevatedRoutePolygon[]
+  start: RoutePin | null
+  end: RoutePin | null
+  /** The chosen route option, when the planner found one. */
+  option: RouteOption | null
+  status: RoutePlanStatus | null
+  floors: Floor[]
+  elevatedPolygons?: ElevatedPolygon[]
+  /** Label at a floor change: "Stairs 1 ↑" where it is taken, "Stairs 1"
+   *  where it arrives (`dir` null). */
+  portalLabel: (kind: 'stairs' | 'escalator' | 'lift', name: string, dir: 'up' | 'down' | null) => string
 }
 
-/** Even-odd point-in-polygon on a lng/lat ring. */
-function pointInRing(p: [number, number], ring: [number, number][]): boolean {
-  let inside = false
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i]
-    const [xj, yj] = ring[j]
-    const intersect =
-      yi > p[1] !== yj > p[1] && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi
-    if (intersect) inside = !inside
+/** A floor change drawn as a line climbing in short steps. */
+function climb(a: [number, number], b: [number, number], za: number, zb: number) {
+  const n = 12
+  const out: Array<{ coordinates: [number, number][]; z: number }> = []
+  for (let i = 0; i < n; i++) {
+    const t0 = i / n
+    const t1 = (i + 1) / n
+    out.push({
+      coordinates: [
+        [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0],
+        [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1],
+      ],
+      z: za + (zb - za) * ((t0 + t1) / 2),
+    })
   }
-  return inside
-}
-
-/**
- * Return the maximum `topZ` of any elevated polygon that contains `p`.
- * Zero when the point is on open ground (no covering polygon).
- */
-function elevationAt(
-  p: [number, number],
-  polys: ReadonlyArray<ElevatedRoutePolygon>,
-): number {
-  let best = 0
-  for (const poly of polys) {
-    if (poly.topZ > best && pointInRing(p, poly.vertices)) best = poly.topZ
-  }
-  return best
-}
-
-/**
- * Slice a route path into contiguous LineString features grouped by
- * elevation zone. Where the path crosses a polygon boundary we
- * densify at 0.5 m intervals so the elevation "step" lands near the
- * actual boundary, then emit adjacent features with a shared endpoint
- * — the shared lng/lat with two elevations shows as a clean vertical
- * step-up in the pitched 3D view.
- *
- * The densification is coarse (0.5 m) because Mapbox interpolates
- * `line-z-offset` per-vertex; sub-half-metre precision at boundaries
- * isn't visible at typical zoom levels. Bumping this finer would just
- * add vertex count without visible benefit.
- */
-function segmentPathByElevation(
-  path: ReadonlyArray<[number, number]>,
-  polys: ReadonlyArray<ElevatedRoutePolygon>,
-): Array<{ coordinates: [number, number][]; elevation: number }> {
-  if (path.length < 2) return []
-  if (polys.length === 0) {
-    return [{ coordinates: path.map((p) => [p[0], p[1]]), elevation: 0 }]
-  }
-
-  const R = 6378137
-  const DEG = (Math.PI * R) / 180
-  // Fine sample all coordinates along the input path in lng/lat, then
-  // walk them assigning elevations.
-  const samples: Array<{ p: [number, number]; z: number }> = []
-  for (let i = 0; i + 1 < path.length; i++) {
-    const a = path[i]
-    const b = path[i + 1]
-    const cosLat = Math.cos(((a[1] + b[1]) / 2) * (Math.PI / 180))
-    const dx = (b[0] - a[0]) * DEG * cosLat
-    const dy = (b[1] - a[1]) * DEG
-    const segLen = Math.hypot(dx, dy)
-    const steps = Math.max(1, Math.ceil(segLen / 0.5))
-    for (let k = 0; k <= steps; k++) {
-      // Skip the endpoint of the previous sub-segment (it's the start
-      // of this one) to avoid duplicating vertices.
-      if (i > 0 && k === 0) continue
-      const t = k / steps
-      const p: [number, number] = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
-      samples.push({ p, z: elevationAt(p, polys) })
-    }
-  }
-
-  // Group into runs of same elevation; on transition, emit two features
-  // sharing the boundary lng/lat but at different elevations to make
-  // the step visible.
-  const out: Array<{ coordinates: [number, number][]; elevation: number }> = []
-  let run: [number, number][] = [samples[0].p]
-  let runZ = samples[0].z
-  for (let i = 1; i < samples.length; i++) {
-    const s = samples[i]
-    if (s.z === runZ) {
-      run.push(s.p)
-      continue
-    }
-    // Transition: close the current run at THIS sample's lng/lat (with
-    // the old Z), open a new run at THE SAME lng/lat (with the new Z).
-    run.push(s.p)
-    out.push({ coordinates: run, elevation: runZ })
-    run = [s.p]
-    runZ = s.z
-  }
-  out.push({ coordinates: run, elevation: runZ })
   return out
 }
 
-function strokeColorFor(status: RouteStatus | null): string {
-  if (status === 'ok') return '#10b981'
-  if (status === 'unreachable') return '#f59e0b'
-  if (status === 'start-blocked' || status === 'end-blocked') return '#ef4444'
-  return '#10b981'
-}
-
-export function MapRoutePreviewOverlay({
-  map,
-  start,
-  end,
-  path,
-  status,
-  elevatedPolygons,
-}: Props) {
+export function MapRoutePreviewOverlay({ map, start, end, option, status, floors, elevatedPolygons, portalLabel }: Props) {
   const [styleLoaded, setStyleLoaded] = useState(false)
   const [styleGen, setStyleGen] = useState(0)
 
-  // ---- Style readiness ---------------------------------------------------
   useEffect(() => {
     if (!map) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -185,188 +92,253 @@ export function MapRoutePreviewOverlay({
     )
   }, [map])
 
-  // ---- Feature collection -----------------------------------------------
-  // The path is sliced at every crossing into/out of an elevated
-  // walkable polygon so each slice carries its own `elevation`
-  // property. `line-z-offset` reads that per-feature and lifts the
-  // slice above the polygon extrusion, keeping the line visible in a
-  // pitched 3D view instead of clipping under the extrusion.
-  const featureCollection = useMemo<GeoJSON.FeatureCollection>(() => {
-    if (!path || path.length < 2) {
-      return { type: 'FeatureCollection', features: [] }
+  const floorZ = useMemo(() => new Map(floors.map((f) => [f.id, f.elevation])), [floors])
+
+  const lines = useMemo<GeoJSON.FeatureCollection>(() => {
+    const features: GeoJSON.Feature[] = []
+    if (option && status === 'ok') {
+      const lowestZ = floors[0]?.elevation ?? 0
+      for (const leg of option.legs) {
+        const z = leg.floorId == null ? lowestZ : (floorZ.get(leg.floorId) ?? 0)
+        // Lifted onto the raised areas on this floor (routing/surface.ts).
+        const polys = surfacesOnFloor(elevatedPolygons ?? [], z)
+        for (const r of legRuns(leg.waypoints, z, polys)) {
+          features.push({
+            type: 'Feature',
+            properties: { color: OK, elevation: r.z + 0.05 },
+            geometry: { type: 'LineString', coordinates: r.coordinates },
+          })
+        }
+      }
+      option.transitions.forEach((t, i) => {
+        if (t.portal.kind === 'lift') return // a lift goes straight up: its labels show it
+        const a = t.portal.at.get(t.fromFloor.id)
+        const b = t.portal.at.get(t.toFloor.id)
+        if (!a || !b) return
+        // Stairs: up the treads and across the landing, as built. Escalators:
+        // a steady incline from landing to landing.
+        const pieces = t.portal.climb?.length ? t.portal.climb : climb(a, b, t.fromFloor.elevation, t.toFloor.elevation)
+        for (const r of pieces) {
+          features.push({
+            type: 'Feature',
+            properties: { color: OK, elevation: r.z + 0.05 },
+            geometry: { type: 'LineString', coordinates: r.coordinates },
+          })
+        }
+        // The walks stop at the edge of the stair's footprint (it blocks
+        // walking); join each to its end of the climb so the line is unbroken.
+        const first = pieces[0].coordinates[0]
+        const lastPiece = pieces[pieces.length - 1]
+        const last = lastPiece.coordinates[lastPiece.coordinates.length - 1]
+        const near = (p: [number, number], q: [number, number]) => Math.hypot(p[0] - q[0], p[1] - q[1])
+        const join = (from: [number, number] | undefined, z: number) => {
+          if (!from) return
+          const to = near(from, first) <= near(from, last) ? first : last
+          if (near(from, to) < 1e-9) return
+          features.push({
+            type: 'Feature',
+            properties: { color: OK, elevation: z + 0.05 },
+            geometry: { type: 'LineString', coordinates: [from, to] },
+          })
+        }
+        const before = option.legs[i]?.waypoints
+        const after = option.legs[i + 1]?.waypoints
+        join(before?.[before.length - 1], t.fromFloor.elevation)
+        join(after?.[0], t.toFloor.elevation)
+      })
     }
-    const color = strokeColorFor(status)
-    const zones = segmentPathByElevation(path, elevatedPolygons ?? [])
-    return {
-      type: 'FeatureCollection',
-      features: zones.map((zone) => ({
+    return { type: 'FeatureCollection', features }
+  }, [option, status, floors, floorZ, elevatedPolygons])
+
+  const points = useMemo<GeoJSON.FeatureCollection>(() => {
+    const features: GeoJSON.Feature[] = []
+    const pin = (p: RoutePin, color: string) =>
+      features.push({
         type: 'Feature',
-        properties: {
-          color,
-          // 5 cm above the polygon top so the line sits visibly ON the
-          // surface rather than z-fighting the roof plane.
-          elevation: zone.elevation > 0 ? zone.elevation + 0.05 : 0,
-        },
-        geometry: { type: 'LineString', coordinates: zone.coordinates },
-      })),
+        properties: { kind: 'pin', color, elevation: p.z + 0.1 },
+        geometry: { type: 'Point', coordinates: p.coord },
+      })
+    if (start) pin(start, START)
+    // The end pin only with a route: a lone red dot reads as success.
+    if (end && status === 'ok') pin(end, END)
+    if (end && status && status !== 'ok') pin(end, FAIL)
+    if (option && status === 'ok') {
+      for (const t of option.transitions) {
+        const dir = t.toFloor.elevation > t.fromFloor.elevation ? 'up' : 'down'
+        for (const [floor, d] of [
+          [t.fromFloor, dir],
+          [t.toFloor, null],
+        ] as const) {
+          const at = t.portal.at.get(floor.id)
+          if (!at) continue
+          features.push({
+            type: 'Feature',
+            properties: { kind: 'label', text: portalLabel(t.portal.kind, t.portal.name, d), elevation: floor.elevation + 0.6 },
+            geometry: { type: 'Point', coordinates: at },
+          })
+        }
+      }
     }
-  }, [path, status, elevatedPolygons])
+    return { type: 'FeatureCollection', features }
+  }, [start, end, status, option, portalLabel])
 
   // ---- Install sources + layers (idempotent) ----------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
-
-    if (!map.getSource(STROKE_SOURCE)) {
-      map.addSource(STROKE_SOURCE, {
-        type: 'geojson',
-        data: featureCollection,
-        lineMetrics: true,
-      })
-      console.log('[route-preview] source installed', { id: STROKE_SOURCE })
+    try {
+      if (!map.getSource(STROKE_SOURCE)) map.addSource(STROKE_SOURCE, { type: 'geojson', data: lines, lineMetrics: true })
+      if (!map.getSource(POINT_SOURCE)) map.addSource(POINT_SOURCE, { type: 'geojson', data: points })
+      if (!map.getLayer(HALO_LAYER)) {
+        map.addLayer({
+          id: HALO_LAYER,
+          type: 'line',
+          source: STROKE_SOURCE,
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round',
+            'line-elevation-reference': 'sea',
+            'line-z-offset': ['coalesce', ['get', 'elevation'], 0],
+          },
+          // The route always draws in full, over walls, slabs and floors —
+          // a route you can't see is no route. Partial values (0.35 / 0.55)
+          // looked right on the ground floor, but Mapbox counted an upper
+          // floor's line (z ≈ 7 m) as occluded even with nothing above it,
+          // so it faded or vanished there.
+          paint: {
+            'line-color': '#ffffff',
+            'line-width': 12,
+            'line-opacity': 0.9,
+            'line-emissive-strength': 1,
+            'line-occlusion-opacity': 1,
+          },
+        })
+      }
+      if (!map.getLayer(STROKE_LAYER)) {
+        map.addLayer({
+          id: STROKE_LAYER,
+          type: 'line',
+          source: STROKE_SOURCE,
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round',
+            'line-elevation-reference': 'sea',
+            'line-z-offset': ['coalesce', ['get', 'elevation'], 0],
+          },
+          paint: {
+            'line-color': ['coalesce', ['get', 'color'], OK],
+            'line-width': 6,
+            'line-opacity': 1,
+            'line-emissive-strength': 1,
+            'line-occlusion-opacity': 1,
+          },
+        })
+      }
+      // Pins: a bullet glyph — `circle` has no z-offset in Mapbox 3.25,
+      // `symbol` does (same trick as the draw tools' vertex dots).
+      if (!map.getLayer(PIN_LAYER)) {
+        map.addLayer({
+          id: PIN_LAYER,
+          type: 'symbol',
+          source: POINT_SOURCE,
+          filter: ['==', ['get', 'kind'], 'pin'],
+          layout: {
+            'text-field': '●',
+            'text-font': ['literal', ['Open Sans Semibold', 'Arial Unicode MS Bold']],
+            'text-size': 26,
+            'text-allow-overlap': true,
+            'text-ignore-placement': true,
+            'symbol-z-elevate': false,
+          },
+          paint: {
+            // Paint property in Mapbox 3.25 (in layout it is ignored and the
+            // pin sits on the ground under an upper floor).
+            'symbol-z-offset': ['coalesce', ['get', 'elevation'], 0],
+            'text-color': ['coalesce', ['get', 'color'], OK],
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 3,
+            'text-emissive-strength': 1,
+            'text-occlusion-opacity': 1,
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any)
+      }
+      if (!map.getLayer(LABEL_LAYER)) {
+        map.addLayer({
+          id: LABEL_LAYER,
+          type: 'symbol',
+          source: POINT_SOURCE,
+          filter: ['==', ['get', 'kind'], 'label'],
+          layout: {
+            'text-field': ['get', 'text'],
+            'text-font': ['literal', ['Open Sans Semibold', 'Arial Unicode MS Bold']],
+            'text-size': 12,
+            'text-anchor': 'bottom',
+            'text-offset': ['literal', [0, -0.6]],
+            'text-allow-overlap': true,
+            'symbol-z-elevate': false,
+          },
+          paint: {
+            'symbol-z-offset': ['coalesce', ['get', 'elevation'], 0],
+            'text-color': '#065f46',
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 2,
+            'text-emissive-strength': 1,
+            'text-occlusion-opacity': 1,
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any)
+      }
+    } catch (err) {
+      console.warn('[route-preview] install failed', err)
     }
+  }, [map, styleLoaded, styleGen, lines, points])
 
-    // White halo underneath for contrast on any basemap.
-    // `slot: 'top'` (Mapbox v3) forces the layer to render AFTER all
-    // 3D fill-extrusions in the pipeline, regardless of layer array
-    // order. Without it, a line at `line-z-offset` above a
-    // fill-extrusion still gets occluded by the extrusion's top face
-    // in top-down view — the fill-extrusion depth-writes at the roof
-    // z and the line's fragments fail the depth test even though the
-    // line is nominally 5 cm above. The `top` slot side-steps this
-    // by putting the line in the "on-top-of-3D" render pass.
-    if (!map.getLayer(HALO_LAYER)) {
-      map.addLayer({
-        id: HALO_LAYER,
-        type: 'line',
-        source: STROKE_SOURCE,
-        slot: 'top',
-        layout: {
-          'line-cap': 'round',
-          'line-join': 'round',
-          'line-elevation-reference': 'sea',
-          'line-z-offset': ['coalesce', ['get', 'elevation'], 0],
-        },
-        paint: {
-          'line-color': '#ffffff',
-          'line-width': 12,
-          'line-opacity': 0.9,
-          'line-emissive-strength': 1,
-        },
-      })
-      console.log('[route-preview] halo layer installed', { id: HALO_LAYER })
+  // ---- Keep on top -------------------------------------------------------
+  // Not `slot: 'top'`: Mapbox draws every unslotted overlay layer (floor
+  // plans, polygon slabs, walls) after the basemap's slots. An elevated line
+  // writes no depth, so an upper floor's sheet or slab drawn later painted
+  // straight over a route a few cm above it — most visibly in the flat
+  // (orthographic) top-down view. Last in the stack, the route draws after
+  // them; the occlusion pass still covers anything really in front of it.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const ORDER = [HALO_LAYER, STROKE_LAYER, PIN_LAYER, LABEL_LAYER]
+    const raise = () => {
+      try {
+        const layers = map.getStyle()?.layers ?? []
+        if (layers[layers.length - 1]?.id === LABEL_LAYER) return
+        for (const id of ORDER) if (map.getLayer(id)) map.moveLayer(id)
+      } catch { /* style torn down */ }
     }
-
-    // Coloured stroke on top.
-    if (!map.getLayer(STROKE_LAYER)) {
-      map.addLayer({
-        id: STROKE_LAYER,
-        type: 'line',
-        source: STROKE_SOURCE,
-        slot: 'top',
-        layout: {
-          'line-cap': 'round',
-          'line-join': 'round',
-          'line-elevation-reference': 'sea',
-          'line-z-offset': ['coalesce', ['get', 'elevation'], 0],
-        },
-        paint: {
-          'line-color': ['coalesce', ['get', 'color'], '#10b981'],
-          'line-width': 6,
-          'line-opacity': 1,
-          'line-emissive-strength': 1,
-        },
-      })
-      console.log('[route-preview] stroke layer installed', { id: STROKE_LAYER })
+    raise()
+    // An overlay that mounts or re-adds its layers later lands above ours.
+    map.on('styledata', raise)
+    return () => {
+      map.off('styledata', raise)
     }
-  }, [map, styleLoaded, styleGen, featureCollection])
+  }, [map, styleLoaded, styleGen])
 
   // ---- Data refresh -----------------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
-    const src = map.getSource(STROKE_SOURCE) as GeoJSONSource | undefined
-    if (!src || typeof src.setData !== 'function') {
-      console.warn('[route-preview] source not found on data push', {
-        hasSource: !!src,
-      })
-      return
-    }
-    src.setData(featureCollection)
-    const coords =
-      featureCollection.features[0]?.geometry?.type === 'LineString'
-        ? (featureCollection.features[0].geometry.coordinates as [number, number][])
-        : []
-    console.log('[route-preview] data pushed', {
-      featureCount: featureCollection.features.length,
-      waypointCount: coords.length,
-      firstWaypoint: coords[0] ?? null,
-      lastWaypoint: coords[coords.length - 1] ?? null,
-      allWaypoints: coords,
-      status,
-      // What Mapbox now reports as present in the style — settles the
-      // "is the layer actually there?" question definitively.
-      strokeLayerPresent: !!map.getLayer(STROKE_LAYER),
-      haloLayerPresent: !!map.getLayer(HALO_LAYER),
-      sourcePresent: !!map.getSource(STROKE_SOURCE),
-    })
-  }, [map, styleLoaded, styleGen, featureCollection, status])
+    try {
+      ;(map.getSource(STROKE_SOURCE) as GeoJSONSource | undefined)?.setData(lines)
+      ;(map.getSource(POINT_SOURCE) as GeoJSONSource | undefined)?.setData(points)
+    } catch { /* style torn down */ }
+  }, [map, styleLoaded, styleGen, lines, points])
 
-  // ---- DOM markers for endpoints ----------------------------------------
-  const startMarkerRef = useRef<mapboxgl.Marker | null>(null)
-  const endMarkerRef = useRef<mapboxgl.Marker | null>(null)
-
-  // Marker visibility rule:
-  //   - Start marker always shown when a start point is placed (even
-  //     if no end yet, so the user sees where they clicked).
-  //   - End marker ONLY shown when the pathfinder produced a valid
-  //     route (`status === 'ok'`). For unreachable / blocked statuses
-  //     we hide the end dot so the UI doesn't look like a successful
-  //     route with two pins and no line.
+  // ---- Teardown: the route vanishes with the tool ------------------------
   useEffect(() => {
     if (!map) return
-    if (!start) {
-      startMarkerRef.current?.remove()
-      startMarkerRef.current = null
-      return
-    }
-    if (!startMarkerRef.current) {
-      const el = document.createElement('div')
-      el.className = 'sgv-route-endpoint sgv-route-endpoint--start'
-      el.setAttribute('aria-label', 'Route start')
-      startMarkerRef.current = new mapboxgl.Marker({ element: el, anchor: 'center' })
-        .setLngLat(start)
-        .addTo(map)
-    } else {
-      startMarkerRef.current.setLngLat(start)
-    }
     return () => {
-      startMarkerRef.current?.remove()
-      startMarkerRef.current = null
+      for (const id of [LABEL_LAYER, PIN_LAYER, STROKE_LAYER, HALO_LAYER]) {
+        try { if (map.getLayer(id)) map.removeLayer(id) } catch { /* map disposed */ }
+      }
+      for (const id of [POINT_SOURCE, STROKE_SOURCE]) {
+        try { if (map.getSource(id)) map.removeSource(id) } catch { /* map disposed */ }
+      }
     }
-  }, [map, start])
-
-  useEffect(() => {
-    if (!map) return
-    const showEnd = end !== null && status === 'ok'
-    if (!showEnd) {
-      endMarkerRef.current?.remove()
-      endMarkerRef.current = null
-      return
-    }
-    if (!endMarkerRef.current) {
-      const el = document.createElement('div')
-      el.className = 'sgv-route-endpoint sgv-route-endpoint--end'
-      el.setAttribute('aria-label', 'Route end')
-      endMarkerRef.current = new mapboxgl.Marker({ element: el, anchor: 'center' })
-        .setLngLat(end!)
-        .addTo(map)
-    } else {
-      endMarkerRef.current.setLngLat(end!)
-    }
-    return () => {
-      endMarkerRef.current?.remove()
-      endMarkerRef.current = null
-    }
-  }, [map, end, status])
+  }, [map])
 
   return null
 }

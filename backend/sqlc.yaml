@@ -51,6 +51,7 @@ sql:
       - "migrations/0046_facility_sources.up.sql"
       - "migrations/0047_drop_billing.up.sql"
       - "migrations/0048_demo_workspace.up.sql"
+      - "migrations/0049_report_share_links.up.sql"
     gen:
       go:
         package: "db"

@@ -16,6 +16,11 @@
  *   4. (Optional) precompute a Euclidean distance transform so the
  *      post-processing pass can push waypoints toward corridor centres.
  *
+ * The grid is laid out in the building's frame (projection.ts): its rows
+ * run along the main wall direction, found from the walls / doors / racks
+ * (`sceneAxisDeg`) unless the request names one. Door mouths are kept on
+ * the grid (`doors`) so the post-process can route through their centres.
+ *
  * All rasterization is done with plain integer scan conversion — no
  * canvas / no WASM. At 25 cm cells a 100 × 60 m warehouse compiles in
  * < 30 ms on a mid-tier laptop, which is well under the "instantly
@@ -23,7 +28,14 @@
  */
 
 import type { RoutingScene } from './types.ts'
-import { fromLocal, makeLocalFrame, pickAnchor, toLocal, type LocalFrame } from './projection.ts'
+import {
+  dominantAxisDeg,
+  fromLocal,
+  makeLocalFrame,
+  pickAnchor,
+  toLocal,
+  type LocalFrame,
+} from './projection.ts'
 
 /** Compiled scene ready for A*. All coordinates are grid-cell indices. */
 export interface CompiledGrid {
@@ -48,6 +60,37 @@ export interface CompiledGrid {
    * `buildDistanceTransform`.
    */
   dist?: Float32Array
+  /**
+   * Door mouths (jamb → jamb) in fractional cell coordinates, cell
+   * centre = index + 0.5 — the same convention the post-process works
+   * in. Routes are pulled through their centres.
+   */
+  doors?: { a: [number, number]; b: [number, number] }[]
+  /** How far a door's opening reaches either side of the mouth, in cells
+   *  (widest wall half-thickness + agent radius). */
+  doorDepthCells?: number
+  /** Optional: 1 where a WALL blocks the cell (door openings punched), so a
+   *  caller can tell walls from rack / object cells. Same layout as `occ`. */
+  wall?: Uint8Array
+}
+
+/**
+ * Building axis from the scene: walls vote with their full length, door
+ * mouths and obstacle edges (rack cells) at half weight — a floor with
+ * racks but no walls still lines up with its racks.
+ */
+function sceneAxisDeg(scene: RoutingScene, anchor: [number, number]): number {
+  const segs: { a: [number, number]; b: [number, number]; weight?: number }[] = []
+  for (const w of scene.walls ?? []) {
+    for (let i = 0; i + 1 < w.vertices.length; i++) segs.push({ a: w.vertices[i], b: w.vertices[i + 1] })
+  }
+  for (const d of scene.doors ?? []) segs.push({ a: d.vertices[0], b: d.vertices[1], weight: 0.5 })
+  for (const o of scene.obstacles ?? []) {
+    for (let i = 0; i < o.vertices.length; i++) {
+      segs.push({ a: o.vertices[i], b: o.vertices[(i + 1) % o.vertices.length], weight: 0.5 })
+    }
+  }
+  return dominantAxisDeg(segs, anchor)
 }
 
 // ---------------------------------------------------------------------------
@@ -59,8 +102,13 @@ export interface CompiledGrid {
  * projection anchor + tight bbox. Cheap: one linear pass over each
  * shape's vertex list, no allocations beyond the returned array.
  */
-function collectSamples(scene: RoutingScene, start: [number, number], end: [number, number]): [number, number][] {
-  const out: [number, number][] = [start, end]
+function collectSamples(
+  scene: RoutingScene,
+  start: [number, number],
+  end: [number, number],
+  include: ReadonlyArray<[number, number]> = [],
+): [number, number][] {
+  const out: [number, number][] = [start, end, ...include]
   for (const w of scene.walls ?? []) for (const v of w.vertices) out.push(v)
   for (const d of scene.doors ?? []) for (const v of d.vertices) out.push(v)
   for (const o of scene.obstacles ?? []) for (const v of o.vertices) out.push(v)
@@ -311,12 +359,18 @@ export interface CompileOptions {
   end: [number, number]
   /** When true, populate `dist` in the returned grid. */
   withDistanceTransform?: boolean
+  /** When true, populate `wall` in the returned grid. */
+  withWallMask?: boolean
+  /** More lng/lat points the grid must cover (beyond start / end). */
+  include?: ReadonlyArray<[number, number]>
+  /** Building axis (maths degrees). Omitted → found from the walls. */
+  axisDeg?: number
 }
 
 export function compileScene(scene: RoutingScene, opts: CompileOptions): CompiledGrid {
-  const samples = collectSamples(scene, opts.start, opts.end)
+  const samples = collectSamples(scene, opts.start, opts.end, opts.include)
   const anchor = pickAnchor(samples)
-  const frame = makeLocalFrame(anchor)
+  const frame = makeLocalFrame(anchor, opts.axisDeg ?? sceneAxisDeg(scene, anchor))
 
   // Project every sample to local metres to find the bbox.
   const localSamples: [number, number][] = samples.map((ll) => toLocal(frame, ll))
@@ -384,6 +438,7 @@ export function compileScene(scene: RoutingScene, opts: CompileOptions): Compile
   }
 
   // Pass 3: walls — polylines thickened by wallThickness/2 + agentRadius.
+  const wall = opts.withWallMask ? new Uint8Array(width * height) : undefined
   for (const w of scene.walls ?? []) {
     const halfThickness = ((w.thicknessMeters ?? 0.3) / 2) / cellSize
     const dilate = halfThickness + agentRadiusCells
@@ -392,8 +447,10 @@ export function compileScene(scene: RoutingScene, opts: CompileOptions): Compile
       const [ax, ay] = cells[i]
       const [bx, by] = cells[i + 1]
       rasterSegment(occ, width, height, ax, ay, bx, by, dilate, 1)
+      if (wall) rasterSegment(wall, width, height, ax, ay, bx, by, dilate, 1)
     }
   }
+  if (wall) grid.wall = wall
 
   // Pass 4: doors — punch openings back out of the walls. The punch
   // rectangle's PERPENDICULAR half-width has to cover:
@@ -409,6 +466,8 @@ export function compileScene(scene: RoutingScene, opts: CompileOptions): Compile
     0.3,
   )) / 2
   const defaultOverClear = maxWallHalf + agentRadius
+  grid.doors = []
+  grid.doorDepthCells = defaultOverClear / cellSize
   for (const door of scene.doors ?? []) {
     const overClearMeters = Math.max(
       door.overClearMeters ?? defaultOverClear,
@@ -419,6 +478,8 @@ export function compileScene(scene: RoutingScene, opts: CompileOptions): Compile
     const [ax, ay] = toCell(door.vertices[0])
     const [bx, by] = toCell(door.vertices[1])
     punchDoor(occ, width, height, ax, ay, bx, by, overClearCells)
+    if (wall) punchDoor(wall, width, height, ax, ay, bx, by, overClearCells)
+    grid.doors.push({ a: [ax, ay], b: [bx, by] })
   }
 
   if (opts.withDistanceTransform) buildDistanceTransform(grid)

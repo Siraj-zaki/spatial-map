@@ -120,40 +120,46 @@ func listDataSourceRowsHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "invalid data-source id")
 			return
 		}
-		// Confirm the source exists in-tenant before reading rows —
-		// otherwise a stale bookmark returns rows scoped to another
-		// tenant's id which is a subtle leak.
-		if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
-			ID: sourceID, TenantID: tenantID,
-		}); err != nil {
-			api.NotFound(w, "data_source not found")
-			return
-		}
-		rows, err := q.ListDataSourceRows(r.Context(), db.ListDataSourceRowsParams{
-			SourceID: sourceID, TenantID: tenantID,
-		})
-		if err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-		out := make([]DataSourceRowResponse, 0, len(rows))
-		for _, row := range rows {
-			out = append(out, DataSourceRowResponse{
-				ID:              row.ID,
-				SourceID:        row.SourceID,
-				EntityKey:       row.EntityKey,
-				Payload:         row.Payload,
-				Position:        parseWktPoint(row.PositionWkt),
-				LinkedShapeName: row.LinkedShapeName.String,
-				TS:              api.FormatTime(row.Ts),
-				UpdatedAt:       api.FormatTime(row.UpdatedAt),
-			})
-		}
-		api.JSON(w, http.StatusOK, map[string]any{
-			"rows":  out,
-			"count": len(out),
+		serveDataSourceRows(w, r, q, tenantID, sourceID)
+	}
+}
+
+// serveDataSourceRows writes every row of a source in the given tenant.
+// Shared by the signed-in route and the report share-link route.
+func serveDataSourceRows(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID, sourceID int64) {
+	// Confirm the source exists in-tenant before reading rows —
+	// otherwise a stale bookmark returns rows scoped to another
+	// tenant's id which is a subtle leak.
+	if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
+		ID: sourceID, TenantID: tenantID,
+	}); err != nil {
+		api.NotFound(w, "data_source not found")
+		return
+	}
+	rows, err := q.ListDataSourceRows(r.Context(), db.ListDataSourceRowsParams{
+		SourceID: sourceID, TenantID: tenantID,
+	})
+	if err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+	out := make([]DataSourceRowResponse, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, DataSourceRowResponse{
+			ID:              row.ID,
+			SourceID:        row.SourceID,
+			EntityKey:       row.EntityKey,
+			Payload:         row.Payload,
+			Position:        parseWktPoint(row.PositionWkt),
+			LinkedShapeName: row.LinkedShapeName.String,
+			TS:              api.FormatTime(row.Ts),
+			UpdatedAt:       api.FormatTime(row.UpdatedAt),
 		})
 	}
+	api.JSON(w, http.StatusOK, map[string]any{
+		"rows":  out,
+		"count": len(out),
+	})
 }
 
 func getDataSourceRowHandler(q *db.Queries) http.HandlerFunc {

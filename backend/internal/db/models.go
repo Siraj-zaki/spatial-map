@@ -784,7 +784,7 @@ type Route struct {
 type ShareLink struct {
 	ID             int64              `json:"id"`
 	TenantID       int64              `json:"tenant_id"`
-	ZoneID         int64              `json:"zone_id"`
+	ZoneID         pgtype.Int8        `json:"zone_id"`
 	Token          string             `json:"token"`
 	Label          string             `json:"label"`
 	Settings       json.RawMessage    `json:"settings"`
@@ -797,6 +797,7 @@ type ShareLink struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
 	RevokedBy      pgtype.Int8        `json:"revoked_by"`
+	ReportID       pgtype.Int8        `json:"report_id"`
 }
 
 type Solution struct {

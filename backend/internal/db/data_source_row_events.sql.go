@@ -71,26 +71,30 @@ func (q *Queries) InsertDataSourceRowEvent(ctx context.Context, arg InsertDataSo
 const listDataSourceRowEventsBySource = `-- name: ListDataSourceRowEventsBySource :many
 SELECT id, tenant_id, source_id, entity_key, payload, operation, ts, source_ip, auth_token_id
 FROM data_source_row_events
-WHERE source_id = $1 AND tenant_id = $2 AND ts >= $3
+WHERE source_id = $1 AND tenant_id = $2
+  AND ts >= $3::timestamptz AND ts <= $4::timestamptz
 ORDER BY ts ASC
-LIMIT $4
+LIMIT $5
 `
 
 type ListDataSourceRowEventsBySourceParams struct {
 	SourceID int64              `json:"source_id"`
 	TenantID int64              `json:"tenant_id"`
-	Ts       pgtype.Timestamptz `json:"ts"`
-	Limit    int32              `json:"limit"`
+	Since    pgtype.Timestamptz `json:"since"`
+	Until    pgtype.Timestamptz `json:"until"`
+	RowLimit int32              `json:"row_limit"`
 }
 
-// Windowed lookup for the recap / heatmap path. `since_ts` is the lower
-// bound; pass e.g. `now() - interval '24 hours'` from the handler.
+// Windowed lookup for the history player / heatmap: every event with
+// since <= ts <= until, oldest first. A "last 24 h" window passes
+// until = now(); a custom range passes both ends.
 func (q *Queries) ListDataSourceRowEventsBySource(ctx context.Context, arg ListDataSourceRowEventsBySourceParams) ([]DataSourceRowEvent, error) {
 	rows, err := q.db.Query(ctx, listDataSourceRowEventsBySource,
 		arg.SourceID,
 		arg.TenantID,
-		arg.Ts,
-		arg.Limit,
+		arg.Since,
+		arg.Until,
+		arg.RowLimit,
 	)
 	if err != nil {
 		return nil, err

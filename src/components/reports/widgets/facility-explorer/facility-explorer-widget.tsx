@@ -21,6 +21,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Eye,
   EyeOff,
   Loader2,
   MapPinned,
@@ -49,6 +50,8 @@ import {
   facilityEditorHref,
   facilityEntityName,
   facilityFieldLabel,
+  facilityViewerDataHref,
+  facilityViewerHref,
   isFacilityRowDeletable,
   writeFacilityRow,
 } from '@/lib/reports/facility-sources'
@@ -63,6 +66,20 @@ import type { MapInsets } from './facility-map'
 import { useSpatialStore } from '@/lib/spatial-store'
 import { evaluateEntityRules } from '@/lib/data-link/style-rule-evaluator'
 import { useSourceSchema } from '@/components/reports/builder/wizard/use-source-schema'
+import { isWatchableStream, LiveStreamPlayer } from '@/components/live-stream-player'
+import { classifyValue } from '@/lib/rich-data'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import type { ClusterPick } from '@/lib/data-link/point-clusters'
+import { readClusterBinding, toPointClusterSpec, type ReportClusterConfig } from '@/lib/reports/cluster-config'
+import { reportShareToken } from '@/lib/reports/report-share'
+import { readHiddenLayersFromURL, rowKeyFilter, writeHiddenLayersToURL } from '@/lib/reports/report-map-layers'
+import type { DataLinkConfig, DataLinkFilter } from '@/lib/db'
+import { TableHistoryPlayer } from '@/components/view/table-history-player'
+import { ClusterControl, useClusterSetting } from './cluster-control'
+import { HeatmapControl, useHeatmapSetting, useHeatNumberFields } from './heatmap-control'
+import { HEATMAP_OFF, heatmapSpecFor, resolveHeatLayers, type HeatmapSetting } from '@/lib/reports/heatmap-config'
+import { LayersControl } from './layers-control'
+import { sitePath } from '@/lib/site'
 
 interface ExplorerTab {
   /** `facility` (default): rows are shapes of a built-in facility source.
@@ -251,13 +268,74 @@ export function FacilityExplorerWidget({
     [floorsKey],
   )
   const mapFloor = mapFloors !== null && mapFloors.size === 1 ? [...mapFloors][0] : null
-  const rows = useMemo(() => {
+  const floorRows = useMemo(() => {
     if (mapFloors === null) return allRows
     return allRows.filter((r) => {
       const f = placements.get(r.entity_key)?.floor
       return f === null || f === undefined || mapFloors.has(f)
     })
   }, [allRows, placements, mapFloors])
+
+  // ---- map clustering ------------------------------------------------------
+  // The author's default (`bindings.cluster`, absent = off), overridden by
+  // the viewer's choice in the URL. Only linked-data tabs drawn as points
+  // cluster. A bubble whose items can't separate on screen narrows the
+  // list to them (`clusterPick`, a removable chip).
+  const clusterBinding = (widget.bindings as Record<string, unknown> | undefined)?.cluster
+  const clusterDefault = useMemo(() => readClusterBinding(clusterBinding), [clusterBinding])
+  const [clusterCfg, setClusterCfgRaw] = useClusterSetting(clusterDefault)
+  const [clusterPick, setClusterPick] = useState<ClusterPick | null>(null)
+  // The viewer's heatmap (URL only): heats the point layers ticked in its
+  // menu (default: the open tab's). Clustering and the heatmap exclude each
+  // other.
+  const [heatCfg, setHeatCfgRaw] = useHeatmapSetting()
+  const setClusterCfg = (next: ReportClusterConfig) => {
+    setClusterPick(null)
+    setClusterCfgRaw(next)
+    if (next.mode !== 'off' && heatCfg.mode !== 'off') setHeatCfgRaw(HEATMAP_OFF)
+  }
+  const setHeatCfg = (next: HeatmapSetting) => {
+    setHeatCfgRaw(next)
+    if (next.mode !== 'off' && clusterCfg.mode !== 'off') {
+      setClusterPick(null)
+      setClusterCfgRaw({ ...clusterCfg, mode: 'off' })
+    }
+  }
+  const clusterable =
+    isData && !!link && (link.renderMode === 'point-at-coord' || link.renderMode === 'history-movement')
+  // Stable per setting: the map re-clusters only when it changes.
+  const { mode: clusterMode, radius: clusterRadius, field: clusterField } = clusterCfg
+  const clusterSpec = useMemo(
+    () => (clusterable ? toPointClusterSpec({ mode: clusterMode, radius: clusterRadius, field: clusterField }) : null),
+    [clusterable, clusterMode, clusterRadius, clusterField],
+  )
+  // A heatmap is flat: with several floors stacked it waits for one floor.
+  const heatBlocked = floors.length > 1 && (mapFloors === null || mapFloors.size > 1)
+  // Fields worth grouping by: 2–100 distinct values in the report rows,
+  // never the key, the coordinates or the elevation.
+  const coordLng = link?.fieldMapping?.coordFields?.lng
+  const coordLat = link?.fieldMapping?.coordFields?.lat
+  const elevationField = link?.fieldMapping?.elevationField
+  const clusterFields = useMemo(() => {
+    if (!clusterable) return []
+    const skip = new Set(['entity_key', coordLng ?? 'lng', coordLat ?? 'lat', elevationField ?? 'elevation'])
+    const distinct = new Map<string, Set<string>>()
+    for (const r of allRows) {
+      for (const [k, v] of Object.entries(r)) {
+        if (skip.has(k) || v === null || v === undefined || v === '' || typeof v === 'object') continue
+        let set = distinct.get(k)
+        if (!set) distinct.set(k, (set = new Set()))
+        if (set.size <= 100) set.add(String(v))
+      }
+    }
+    const out = [...distinct].filter(([, set]) => set.size >= 2 && set.size <= 100).map(([k]) => k)
+    if (clusterField && !out.includes(clusterField)) out.push(clusterField)
+    return out
+  }, [clusterable, allRows, coordLng, coordLat, elevationField, clusterField])
+  const rows = useMemo(
+    () => (clusterPick ? floorRows.filter((r) => clusterPick.keys.has(r.entity_key)) : floorRows),
+    [floorRows, clusterPick],
+  )
 
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   // Hovering a row shows where it is (a ghost pin; the camera stays).
@@ -273,15 +351,30 @@ export function FacilityExplorerWidget({
   const selectedRow = selectedIdx >= 0 ? rows[selectedIdx] : null
   const selectedPlacement = selectedKey ? placements.get(selectedKey) : undefined
   const selectedShape = selectedPlacement?.shape ?? null
+  // The picked item's floor is always on the map: add it (or switch a
+  // one-floor view to it) instead of focusing something that isn't drawn.
+  const pickedFloor = selectedPlacement?.floor ?? null
+  if (pickedFloor !== null && mapFloors !== null && !mapFloors.has(pickedFloor) && floors.some((f) => f.id === pickedFloor)) {
+    setFloorSel(mapFloors.size === 1 ? new Set([pickedFloor]) : new Set([...mapFloors, pickedFloor]))
+  }
 
   const [editing, setEditing] = useState(false)
   const select = useCallback((key: string | null) => {
     setSelectedKey(key)
     setEditing(false)
   }, [])
+  // A click on the map that picks nothing lets go of the item.
+  const clearSelection = useCallback(() => select(null), [select])
+  // A linked-data record is focused through its live symbol on the map.
+  const linkId = isData ? link?.id : undefined
+  const selectedDl = useMemo(
+    () => (linkId !== undefined && selectedKey ? { configId: linkId, entityKey: selectedKey } : null),
+    [linkId, selectedKey],
+  )
   // Hiding the picked item's floor closes the item.
   const pickFloors = (next: ReadonlySet<number> | null) => {
     setFloorSel(next)
+    setClusterPick(null)
     const f = itemFloor(selectedKey ? allRows.find((r) => r.entity_key === selectedKey) : null)
     if (next !== null && f !== null && !next.has(f)) select(null)
   }
@@ -290,16 +383,128 @@ export function FacilityExplorerWidget({
   const changeTab = (i: number) => {
     setTabIdx(i)
     setSortBy('name')
+    setClusterPick(null)
     select(null)
   }
 
+  const notInList = () =>
+    toast.info(t('reports.explorer.notInList', { defaultValue: 'That item isn’t in this list — clear the filters to see it.' }))
+  // A pick outside the cluster the list is narrowed to lets go of it.
   const onMapSelect = (kind: ExplorerKind, id: number) => {
-    const hit = rows.find((r) => {
+    const hit = floorRows.find((r) => {
       const s = placements.get(r.entity_key)?.shape
       return s?.kind === kind && s.shape.id === id
     })
+    if (hit && clusterPick && !clusterPick.keys.has(hit.entity_key)) setClusterPick(null)
     if (hit) select(hit.entity_key)
-    else toast.info(t('reports.explorer.notInList', { defaultValue: 'That item isn’t in this list — clear the filters to see it.' }))
+    else notInList()
+  }
+  // ---- live map layers -----------------------------------------------------
+  // Every linked-data tab's layer draws at once (the open tab's is the one the
+  // list reads), each narrowed to its tab's rows — so the report's viewer
+  // filters narrow the map too. The viewer can hide layers (`?layersOff=`).
+  const tabLinks = useMemo(
+    () =>
+      tabs.flatMap((tb, i) => {
+        if (tb.kind !== 'dataLink' || tb.dataLinkId === undefined) return []
+        const l = dataLinkConfigs.find((c) => c.id === tb.dataLinkId)
+        return l ? [{ i, tab: tb, link: l }] : []
+      }),
+    [tabs, dataLinkConfigs],
+  )
+  const [hiddenLinks, setHiddenLinksRaw] = useState<ReadonlySet<number>>(() => readHiddenLayersFromURL())
+  const setHiddenLinks = (next: ReadonlySet<number>) => {
+    setHiddenLinksRaw(next)
+    writeHiddenLayersToURL(next)
+  }
+  const mapLinks = useMemo<ReadonlyArray<DataLinkConfig>>(
+    () => tabLinks.filter(({ link: l }) => l.id === linkId || !hiddenLinks.has(l.id as number)).map(({ link: l }) => l),
+    [tabLinks, hiddenLinks, linkId],
+  )
+  // Heat: any point layer on the map, each in its own colour when several
+  // are ticked; with one, weighted by a number field of its table.
+  const heatLayers = useMemo(
+    () =>
+      tabLinks
+        .filter(({ link: l }) => (l.renderMode === 'point-at-coord' || l.renderMode === 'history-movement') && mapLinks.includes(l))
+        .map(({ tab: tb, link: l }) => ({ id: l.id as number, name: tb.title?.trim() || facilityEntityName(tb.entity, tb.label), sourceId: l.sourceId })),
+    [tabLinks, mapLinks],
+  )
+  const heatIds = useMemo(() => heatLayers.map((l) => l.id), [heatLayers])
+  const heated = useMemo(() => resolveHeatLayers(heatCfg, heatIds, isData ? link?.id : undefined), [heatCfg, heatIds, isData, link?.id])
+  const heatSpec = useMemo(() => heatmapSpecFor(heatCfg, heated, heatIds, heatBlocked), [heatCfg, heated, heatIds, heatBlocked])
+  const heatNumberFields = useHeatNumberFields(
+    heatCfg.mode !== 'off' && heated.length === 1 ? heatLayers.find((l) => l.id === heated[0])?.sourceId : null,
+  )
+  const results = ctx?.results
+  const mapFilters = useMemo(() => {
+    const out: Record<number, DataLinkFilter | null> = {}
+    for (const { tab: tb, link: l } of tabLinks) {
+      const r = results?.[tb.queryRef]
+      if (r) out[l.id as number] = rowKeyFilter(toRows(r), r.columns.map((c) => c.name))
+    }
+    return out
+  }, [tabLinks, results])
+
+  // A live data symbol clicked on the map picks its record — on another
+  // layer, that layer's tab opens on it.
+  const onMapSelectDl = (configId: number, entityKey: string) => {
+    if (linkId === undefined || configId !== linkId) {
+      const other = tabLinks.find((x) => x.link.id === configId)
+      const r = other ? results?.[other.tab.queryRef] : undefined
+      if (!other || !r || !toRows(r).some((x) => x.entity_key === entityKey)) {
+        if (other) notInList()
+        return
+      }
+      setTabIdx(other.i)
+      setSortBy('name')
+      setClusterPick(null)
+      select(entityKey)
+      return
+    }
+    const hit = floorRows.find((r) => r.entity_key === entityKey)
+    if (hit && clusterPick && !clusterPick.keys.has(hit.entity_key)) setClusterPick(null)
+    if (hit) select(hit.entity_key)
+    else notInList()
+  }
+
+  // The report's filters narrowed the open tab: one row left is picked (the
+  // camera flies to it and follows it while history plays), a few are framed.
+  const seenMost = useRef<{ tab: string; count: number }>({ tab: '', count: 0 })
+  const dismissed = useRef<string | null>(null)
+  const [frame, setFrame] = useState<{ key: string; bounds: [number, number, number, number] } | null>(null)
+  const narrowKey = loading || !tab ? null : `${tab.queryRef}|${allRows.length}|${allRows[0]?.entity_key ?? ''}|${allRows.at(-1)?.entity_key ?? ''}`
+  useEffect(() => {
+    if (!narrowKey || !tab || !loaded) return
+    const most = seenMost.current.tab === tab.queryRef ? seenMost.current.count : 0
+    seenMost.current = { tab: tab.queryRef, count: Math.max(most, allRows.length) }
+    if (allRows.length === 1 && dismissed.current !== allRows[0].entity_key) {
+      select(allRows[0].entity_key)
+      return
+    }
+    if (allRows.length === 0 || allRows.length >= most) return
+    let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity
+    for (const r of allRows.slice(0, 500)) {
+      const p = placements.get(r.entity_key)
+      const b = p?.point ? [p.point[0], p.point[1], p.point[0], p.point[1]] : p?.shape ? shapeBounds(p.shape) : null
+      if (!b) continue
+      w = Math.min(w, b[0]); s = Math.min(s, b[1]); e = Math.max(e, b[2]); n = Math.max(n, b[3])
+    }
+    if (Number.isFinite(w)) setFrame({ key: narrowKey, bounds: [w, s, e, n] })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [narrowKey, loaded])
+  // A viewer who lets go of the single filtered row keeps it let go.
+  const prevSelected = useRef<string | null>(null)
+  useEffect(() => {
+    if (prevSelected.current !== null && selectedKey === null && allRows.length === 1) dismissed.current = prevSelected.current
+    if (selectedKey !== null) dismissed.current = null
+    prevSelected.current = selectedKey
+  }, [selectedKey, allRows])
+  // A bubble whose items can't separate: the list shows just them.
+  const onClusterPick = (pick: ClusterPick) => {
+    if (linkId === undefined || pick.configId !== linkId) return
+    select(null)
+    setClusterPick(pick)
   }
 
   // Keep the picked row in view.
@@ -382,13 +587,14 @@ export function FacilityExplorerWidget({
               sourceId: tab.sourceId,
               icon: link?.style?.defaultIcon,
               colour: rowColour(selectedRow),
+              dataLinkId: link?.id,
               hiddenFields: [link?.fieldMapping?.coordFields?.lng, link?.fieldMapping?.coordFields?.lat].filter((f): f is string => !!f),
               fieldLabel,
               linked: Boolean(link),
             }
           : undefined
       }
-      editable={isData ? [] : (tab.editable ?? []).filter((c) => c in columnTypes)}
+      editable={isData || reportShareToken() !== null ? [] : (tab.editable ?? []).filter((c) => c in columnTypes)}
       embedded={Boolean(chrome)}
       columns={qr?.columns ?? []}
       columnTypes={columnTypes}
@@ -420,11 +626,39 @@ export function FacilityExplorerWidget({
   const list = (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-        <span className="text-xs text-muted-foreground" aria-live="polite">
-          {loading
-            ? t('reports.explorer.loading', { defaultValue: 'Loading…' })
-            : t('reports.explorer.count', { count: rows.length, defaultValue: '{{count}} items' })}
-        </span>
+        {clusterPick && !loading ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setClusterPick(null)}
+                aria-label={t('reports.cluster.clear', { defaultValue: 'Show all items' })}
+                className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full border bg-secondary px-2.5 py-0.5 text-xs text-secondary-foreground transition-colors hover:bg-accent"
+              >
+                <span className="truncate" aria-live="polite">
+                  {clusterPick.labelKind !== 'location' && clusterPick.label
+                    ? t('reports.cluster.chipNamed', { label: clusterPick.label, count: rows.length, defaultValue: '{{label}} · {{count}} items' })
+                    : t('reports.cluster.chip', { count: rows.length, defaultValue: 'Cluster · {{count}} items' })}
+                </span>
+                <X className="h-3 w-3 shrink-0" aria-hidden />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="space-y-1">
+              {clusterPick.breakdown.map((e) => (
+                <span key={e.color} className="flex items-center gap-2">
+                  <span className="h-2 w-2 shrink-0 rounded-full ring-1 ring-background" style={{ background: e.color }} aria-hidden />
+                  <span className="tabular-nums">{e.count}</span>
+                </span>
+              ))}
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          <span className="text-xs text-muted-foreground" aria-live="polite">
+            {loading
+              ? t('reports.explorer.loading', { defaultValue: 'Loading…' })
+              : t('reports.explorer.count', { count: rows.length, defaultValue: '{{count}} items' })}
+          </span>
+        )}
         <label className={cn('ms-auto flex items-center gap-1.5 text-xs text-muted-foreground', loading && 'invisible')}>
           <ArrowDownWideNarrow className="h-3.5 w-3.5" aria-hidden />
           <span className="sr-only">{t('reports.explorer.sortBy', { defaultValue: 'Sort by' })}</span>
@@ -457,14 +691,18 @@ export function FacilityExplorerWidget({
             <SearchX className="h-8 w-8 text-muted-foreground/60" aria-hidden />
             <p className="text-sm font-medium">{t('reports.explorer.emptyTitle', { defaultValue: 'Nothing to show' })}</p>
             <p className="max-w-[16rem] text-xs text-muted-foreground">
-              {t('reports.explorer.emptyBody', { defaultValue: 'Try clearing the filters above, or add items in the editor.' })}
+              {reportShareToken() === null
+                ? t('reports.explorer.emptyBody', { defaultValue: 'Try clearing the filters above, or add items in the editor.' })
+                : t('reports.explorer.emptyBodyShared', { defaultValue: 'Try clearing the filters above.' })}
             </p>
-            <Button asChild variant="outline" size="sm" className="mt-1">
-              <a href={`/create-grids?warehouseId=${zoneId}`}>
-                <MapPinned className="h-3.5 w-3.5" />
-                {t('reports.explorer.openEditor', { defaultValue: 'Open the editor' })}
-              </a>
-            </Button>
+            {reportShareToken() === null && (
+              <Button asChild variant="outline" size="sm" className="mt-1">
+                <a href={sitePath(`/create-grids?warehouseId=${zoneId}`)}>
+                  <MapPinned className="h-3.5 w-3.5" />
+                  {t('reports.explorer.openEditor', { defaultValue: 'Open the editor' })}
+                </a>
+              </Button>
+            )}
           </div>
         )}
         {!loading &&
@@ -528,6 +766,11 @@ export function FacilityExplorerWidget({
     </div>
   )
 
+  // The picked record of a point layer stays in view while it moves.
+  const follow =
+    isData && link && selectedKey && selectedRow && (link.renderMode === 'history-movement' || link.renderMode === 'point-at-coord')
+      ? { config: link, entityKey: selectedKey, livePoint: selectedPlacement?.point ?? null, label: titleOf(selectedRow) }
+      : null
   const renderMap = (opts: { rightInset?: number; insets?: MapInsets }) =>
     Number.isFinite(zoneId) ? (
       // Fades in once the facility is loaded and framed — never a flash of
@@ -538,15 +781,34 @@ export function FacilityExplorerWidget({
         floors={mapFloors}
         selected={selectedShape}
         selectedPoint={selectedPlacement?.point ?? null}
+        selectedDl={selectedDl}
+        onSelectDl={mapLinks.length > 0 ? onMapSelectDl : undefined}
+        onClearSelection={clearSelection}
         selectableKind={isData ? linkShapeKind(link) : ((parseEntityKey(`${entityApiKind(tab.entity)}:0`)?.kind as ExplorerKind) ?? null)}
         onSelect={onMapSelect}
         rightInset={opts.rightInset}
         insets={opts.insets}
         hoverPoint={hoverPoint}
-        dataLinks={isData && link ? linkList(link) : undefined}
+        dataLinks={mapLinks.length > 0 ? mapLinks : undefined}
+        configFilters={mapFilters}
         styleRules={styleRules}
         styleId={chrome?.mapStyle}
+        cluster={clusterSpec}
+        heatmap={heatSpec}
+        onClusterPick={isData ? onClusterPick : undefined}
+        follow={follow}
+        frame={frame}
       />
+      {loaded && (
+        <TableHistoryPlayer
+          configs={mapLinks}
+          style={{
+            insetInlineStart: (opts.insets?.left ?? 0) + 16,
+            insetInlineEnd: (opts.insets?.right ?? 0) + (opts.rightInset ?? 0) + 16,
+            bottom: (opts.insets?.bottom ?? 0) + 16,
+          }}
+        />
+      )}
       </div>
     ) : null
   const floorButtons =
@@ -593,12 +855,57 @@ export function FacilityExplorerWidget({
     </div>
   ) : null
 
+  const clusterOnly =
+    clusterable || heatLayers.length > 0 ? (
+      <>
+        {clusterable && (
+          <ClusterControl
+            value={clusterCfg}
+            defaultValue={clusterDefault}
+            onChange={setClusterCfg}
+            fields={clusterFields}
+            fieldLabel={fieldLabel}
+          />
+        )}
+        {heatLayers.length > 0 && (
+          <HeatmapControl
+            value={heatCfg}
+            onChange={setHeatCfg}
+            numericFields={heatNumberFields}
+            fieldLabel={fieldLabel}
+            layers={heatLayers}
+            defaultLayerId={isData ? link?.id : undefined}
+            blockedReason={heatBlocked ? t('heatmap.pickOneFloor', { defaultValue: 'Pick one floor to see the heatmap — several stacked floors would blur together.' }) : null}
+          />
+        )}
+      </>
+    ) : null
+  const layersControl =
+    tabLinks.length > 1 ? (
+      <LayersControl
+        items={tabLinks.map(({ tab: tb, link: l }) => ({ link: l, label: tabLabel(tb), count: results?.[tb.queryRef]?.rowCount ?? null }))}
+        hidden={hiddenLinks}
+        pinnedId={linkId}
+        onChange={setHiddenLinks}
+      />
+    ) : null
+  // Layers + clustering share the map's control slot.
+  const clusterControl =
+    layersControl || clusterOnly ? (
+      <>
+        {layersControl}
+        {clusterOnly}
+      </>
+    ) : null
+
   const mapPane = (
     <div className="relative min-h-0 overflow-hidden bg-muted/40">
       {renderMap({ rightInset: wide && selectedRow ? DETAIL_WIDTH : 0 })}
-      {floorButtons && (
-        <div className="absolute start-3 top-3 z-10 flex max-w-[calc(100%-1.5rem)] gap-1 overflow-x-auto rounded-lg border bg-card/90 p-1 shadow-sm backdrop-blur">
+      {(floorButtons || clusterControl) && (
+        <div className="absolute start-3 top-3 z-10 flex max-w-[calc(100%-1.5rem)] items-center gap-1 overflow-x-auto rounded-lg border bg-card/90 p-1 shadow-sm backdrop-blur">
           {floorButtons}
+          {floorButtons && clusterControl && <span className="mx-0.5 h-5 w-px shrink-0 bg-border" aria-hidden />}
+          {clusterControl}
         </div>
       )}
       {mapLoading}
@@ -666,6 +973,7 @@ export function FacilityExplorerWidget({
               onChange={pickFloors}
             />
           }
+          clusterControl={clusterControl}
           loading={mapLoading}
           renderMap={(insets) => renderMap({ insets })}
           onKeyDown={onKeyDown}
@@ -705,16 +1013,6 @@ export function FacilityExplorerWidget({
   )
 }
 
-/** Stable one-element array per link object (the overlay keys on it). */
-const linkLists = new WeakMap<object, readonly import('@/lib/db').DataLinkConfig[]>()
-function linkList(link: import('@/lib/db').DataLinkConfig): readonly import('@/lib/db').DataLinkConfig[] {
-  let list = linkLists.get(link)
-  if (!list) {
-    list = [link]
-    linkLists.set(link, list)
-  }
-  return list
-}
 
 /** List / detail preview for a row: its shape, else the link's point
  *  icon, else a neutral glyph (not on the map). */
@@ -792,6 +1090,8 @@ interface DataDetail {
   fieldLabel: (key: string) => string
   /** The report's data link still exists. */
   linked: boolean
+  /** That link's id (the viewer focuses the record's live symbol). */
+  dataLinkId?: number
 }
 
 function ExplorerDetail({
@@ -840,7 +1140,20 @@ function ExplorerDetail({
   const { t } = useTranslation()
   const key = row.entity_key
   const shapeKey = data ? (data.placement?.shape ? `${data.placement.shape.kind}:${data.placement.shape.shape.id}` : null) : key
-  const href = shapeKey ? facilityEditorHref(shapeKey, Number(row.facility_id) || zoneId) : null
+  const facilityId = Number(row.facility_id) || zoneId
+  // A shared report links nowhere inside the workspace.
+  const shared = reportShareToken() !== null
+  const href = shapeKey && !shared ? facilityEditorHref(shapeKey, facilityId) : null
+  // The read-only viewer, opened focused on the item: a record through its
+  // live symbol (only when it is placed on the map at all).
+  const viewerHref = shared
+    ? null
+    : data
+      ? data.placement?.shape || data.placement?.point
+        ? facilityViewerDataHref(data.dataLinkId, key, facilityId)
+        : null
+      : facilityViewerHref(key, facilityId)
+  const itemName = (data ? data.title : String(row.name ?? '')) || facilityEntityName(entity)
   const label = data ? data.fieldLabel : (k: string) => facilityFieldLabel(k)
   // A floor's own "floor" column is always empty; a data row hides only
   // its key and the coordinates that placed it.
@@ -851,7 +1164,12 @@ function ExplorerDetail({
   const statusCol = data ? allFacts.find((c) => c.type === 'text' && /status|state|condition|health/i.test(c.name) && row[c.name]) : undefined
   const tiles = allFacts.filter((c) => c.type === 'number' && typeof row[c.name] === 'number' && !c.name.endsWith('_id')).slice(0, 4)
   const tileNames = new Set(tiles.map((c) => c.name))
-  const facts = allFacts.filter((c) => !tileNames.has(c.name) && c.name !== statusCol?.name)
+  // A camera's watchable feed plays at the top instead of sitting in the list as a URL.
+  const liveCols = data
+    ? allFacts.filter((c) => isWatchableStream(row[c.name]) && classifyValue(c.name, row[c.name]).some((m) => m.kind === 'stream'))
+    : []
+  const facts = allFacts.filter((c) => !tileNames.has(c.name) && c.name !== statusCol?.name && !liveCols.includes(c))
+  const offline = statusCol ? /^offline$/i.test(String(row[statusCol.name])) : false
   const onMap = data
     ? data.placement?.shape
       ? `${data.placement.shape.shape.name || '—'} · ${facilityEntityName(placedEntity(data.placement.shape.kind))}`
@@ -900,6 +1218,16 @@ function ExplorerDetail({
             {String(row[statusCol.name])}
           </span>
         )}
+        {liveCols.map((c) => (
+          <LiveStreamPlayer
+            key={c.name}
+            src={String(row[c.name])}
+            title={data?.title}
+            subtitle={typeof row.area === 'string' ? row.area : undefined}
+            offline={offline}
+            className="mt-3 border"
+          />
+        ))}
         {!data && row.visible === false && (
           <p className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
             <EyeOff className="h-3 w-3" aria-hidden />
@@ -932,15 +1260,26 @@ function ExplorerDetail({
                   </a>
                 </Button>
               )}
-              {data && (
+              {viewerHref && (
+                <Button asChild size="sm" variant="outline">
+                  <a
+                    href={viewerHref}
+                    aria-label={t('reports.facility.openInViewer', { name: itemName, defaultValue: 'Open {{name}} in the viewer' })}
+                  >
+                    <Eye className="h-3.5 w-3.5" aria-hidden />
+                    {t('reports.facility.openInViewerShort', { defaultValue: 'Open in viewer' })}
+                  </a>
+                </Button>
+              )}
+              {data && !shared && (
                 <Button asChild size="sm" variant={href ? 'ghost' : 'outline'}>
-                  <a href={`/tables/${data.sourceId}`}>
+                  <a href={sitePath(`/tables/${data.sourceId}`)}>
                     <Table2 className="h-3.5 w-3.5" />
                     {t('reports.explorer.openTable', { defaultValue: 'Open in table' })}
                   </a>
                 </Button>
               )}
-              {!data && isFacilityRowDeletable(key) && (
+              {!data && !shared && isFacilityRowDeletable(key) && (
                 <Button size="sm" variant="ghost" className="text-danger hover:bg-danger/10 hover:text-danger" onClick={onDelete}>
                   <Trash2 className="h-3.5 w-3.5" />
                   {t('reports.facility.deleteRowShort', { defaultValue: 'Delete' })}

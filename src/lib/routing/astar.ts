@@ -30,7 +30,11 @@ import type { CompiledGrid } from './occupancy-grid.ts'
 import { isBlocked } from './occupancy-grid.ts'
 
 export interface AStarOptions {
-  /** Cost multiplier applied when the direction of travel changes. Default 0.35. */
+  /**
+   * Extra cost (metres) for each change of direction. Default 1 m: a turn
+   * has to save a metre of walking to be worth it, so routes take a few
+   * clean turns instead of wobbling between equal-length options.
+   */
   turnCost?: number
   /**
    * Weight for the "distance from nearest wall" bias in metres. Higher
@@ -181,7 +185,7 @@ export function findPath(
   opts: AStarOptions = {},
 ): AStarResult {
   const { width, height, cellSize, occ, dist } = grid
-  const turnCost = opts.turnCost ?? 0.35
+  const turnCost = opts.turnCost ?? 1
   const centreBias = opts.centreBias ?? 0.25
 
   const startIdx = start[1] * width + start[0]

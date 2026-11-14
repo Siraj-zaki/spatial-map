@@ -82,10 +82,11 @@ export async function handleWorkspaceSwitch(nextTenantId: number): Promise<void>
   //    serving cached rows from the old workspace.
   queryCache.invalidateAll()
 
-  // 4. Refresh the auth store's `tenants` array so subscribers re-read
-  //    the new active workspace. The switcher reads name/role from
-  //    useAuthStore, so this keeps it + role gates in sync without a
-  //    round-trip to /auth/me.
+  // 4. Refresh the auth store's `tenants` array so `isLocked`,
+  //    `trialEndsAt`, and the plan projection reflect the new active
+  //    workspace's state. The switcher usually reads role/plan from
+  //    useAuthStore, so this keeps the trial banner + role gates in
+  //    sync without a round-trip to /auth/me.
   useAuthStore.getState().setTenants(useAuthStore.getState().tenants)
 
   // 5. Re-hydrate the catalog for the new workspace. Runs in parallel

@@ -22,6 +22,7 @@
  */
 
 import { apiDelete, apiGet, apiPatch, apiPost, publicFetch } from '@/lib/api-client'
+import { openOnOwningSite, siteUrl } from '@/lib/site'
 import type { MapStyleId } from '@/components/mapbox-map'
 import type { ThemeMode, ThemePalette } from '@/components/theme-provider'
 import type { WarehouseView } from '@/hooks/usePublicWarehouse'
@@ -133,6 +134,8 @@ export interface ShareLink {
   id: number
   tenantId: number
   zoneId: number
+  /** Set on a report link (see lib/reports/report-share.ts). */
+  reportId?: number
   token: string
   label: string
   settings: ShareLinkSettings
@@ -201,7 +204,8 @@ function parseSettings(raw: unknown): ShareLinkSettings {
 
 /** Wire shape of a share-link row. Optional fields may arrive as
  *  null / empty strings; `parseLink` normalises them. */
-type RawShareLink = Omit<ShareLink, 'label' | 'settings' | 'expiresAt' | 'viewCount' | 'lastAccessedAt' | 'revokedAt'> & {
+export type RawShareLink = Omit<ShareLink, 'label' | 'settings' | 'expiresAt' | 'viewCount' | 'lastAccessedAt' | 'revokedAt' | 'reportId'> & {
+  reportId?: number | null
   label?: string | null
   settings?: unknown
   expiresAt?: string | null
@@ -215,6 +219,7 @@ function parseLink(raw: RawShareLink): ShareLink {
     id: raw.id,
     tenantId: raw.tenantId,
     zoneId: raw.zoneId,
+    reportId: raw.reportId ?? undefined,
     token: raw.token,
     label: raw.label ?? '',
     settings: parseSettings(raw.settings),
@@ -230,6 +235,9 @@ function parseLink(raw: RawShareLink): ShareLink {
     status: raw.status,
   }
 }
+
+/** Row parser, shared with the report links client. */
+export const parseShareLink = parseLink
 
 // ---- API surface ---------------------------------------------------
 
@@ -276,8 +284,12 @@ export async function deleteShareLink(id: number): Promise<void> {
  * envelope.
  */
 export async function fetchSharedWarehouse(token: string): Promise<PublicSharedWarehouse | null> {
+  return parseShared(() => openOnOwningSite(`share:${token}`, () => publicFetch<PublicSharedWarehouse>(`/share/${token}`)))
+}
+
+async function parseShared(load: () => Promise<PublicSharedWarehouse>): Promise<PublicSharedWarehouse | null> {
   try {
-    const raw = await publicFetch<PublicSharedWarehouse>(`/share/${token}`)
+    const raw = await load()
     return {
       link: {
         label: raw.link.label ?? '',
@@ -340,5 +352,5 @@ function parseWarehouseDates(view: WarehouseView): WarehouseView {
  */
 export function shareLinkUrl(token: string): string {
   if (typeof window === 'undefined') return `/share/${token}`
-  return `${window.location.origin}/share/${token}`
+  return siteUrl(`/share/${token}`)
 }

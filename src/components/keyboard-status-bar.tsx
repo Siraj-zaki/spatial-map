@@ -14,6 +14,8 @@ interface KeyboardHintProps {
   altHeld: boolean
   /** Click handler for the ? button — opens the cheatsheet. */
   onOpenCheatsheet: () => void
+  /** The grid tool is drawing a path-layout grid (click points, not two corners). */
+  gridPathLayout?: boolean
 }
 
 /**
@@ -29,10 +31,11 @@ export function KeyboardHint({
   shiftHeld,
   altHeld,
   onOpenCheatsheet,
+  gridPathLayout,
 }: KeyboardHintProps) {
   const { t } = useTranslation()
 
-  const hint = resolveHintKey({ activeTool, panelMode, transformActive, selectedCount })
+  const hint = resolveHintKey({ activeTool, panelMode, transformActive, selectedCount, gridPathLayout })
   const text = t(`kbHint.${hint}`, { defaultValue: DEFAULT_HINTS[hint] })
 
   const modifier = shiftHeld
@@ -72,10 +75,13 @@ const DEFAULT_HINTS = {
   pan: 'Drag to pan · V to select · ? for shortcuts',
   select: 'Click to select · Shift-click to add · Esc to deselect',
   drawingGrid: 'Click first corner · ⇧ square · ⌥ from center · Esc cancel',
+  drawingGridPath: 'Click to add points · double-click or Enter to finish · ⌫ undo point · Esc cancel',
   drawingMarker: 'Click to place marker · Esc cancel',
   drawingCircle: 'Drag to draw · ⇧ perfect circle · ⌥ from center · Esc cancel',
-  drawingPolygon: 'Click to add vertex · Enter to finish · ⌫ undo vertex · ⇧ constrain',
-  drawingLine: 'Click to add vertex · Enter to finish · ⌫ undo vertex · ⇧ constrain',
+  drawingPolygon: 'Click to add vertex · type a length + Enter · Enter to finish · ⌫ undo vertex · ⇧ angle lock',
+  drawingLine: 'Click to add vertex · type a length + Enter · Enter to finish · ⌫ undo vertex · ⇧ angle lock',
+  measuring: 'Click points to measure · click the first point to close an area · Enter keeps a guide · ⇧ angle lock · Esc cancel',
+  calibrating: 'Mark rooms or known lengths on the plan, enter their real size, then apply · Esc cancel',
   drawingImage: 'Drag to size · ⇧ square aspect · ⌥ from center · Esc cancel',
   drawingImagePlane: 'Click the map to place the image plane · Esc cancel',
   drawingModel: 'Click to place model · Esc cancel',
@@ -99,6 +105,7 @@ function resolveHintKey(state: {
   panelMode: SidePanelMode
   transformActive: boolean
   selectedCount: number
+  gridPathLayout?: boolean
 }): HintKey {
   if (state.transformActive) {
     switch (state.panelMode) {
@@ -134,7 +141,7 @@ function resolveHintKey(state: {
     case 'select':
       return 'select'
     case 'create-grid':
-      return 'drawingGrid'
+      return state.gridPathLayout ? 'drawingGridPath' : 'drawingGrid'
     case 'create-marker':
       return 'drawingMarker'
     case 'create-circle':
@@ -153,6 +160,10 @@ function resolveHintKey(state: {
       return 'drawingText'
     case 'create-stair':
       return 'drawingStair'
+    case 'measure':
+      return 'measuring'
+    case 'calibrate-image':
+      return 'calibrating'
     case 'zones':
       return 'zones'
     default:

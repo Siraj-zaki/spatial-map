@@ -1,6 +1,7 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 import type { TFunction } from 'i18next'
 
 import { apiDb } from '@/lib/api-db'
@@ -54,16 +55,22 @@ export function useTextLabelPlacementTool({
     }
     const map = mapInstance
     map.getCanvas().style.cursor = 'crosshair'
+    // Where the cursor touches the scene (at the label tool's elevation) —
+    // not the ground under it, which is off by the floor's height at pitch.
+    const at = (e: MapMouseEvent): [number, number] => {
+      const p = unprojectOnScene(map, e.point, textLabelConfig.elevation ?? 0)
+      return [p.lng, p.lat]
+    }
 
     const onMove = (e: MapMouseEvent) => {
-      setTextLabelCursor([e.lngLat.lng, e.lngLat.lat])
+      setTextLabelCursor(at(e))
     }
     const onClick = (e: MapMouseEvent) => {
       if (e.defaultPrevented) return
       const now = new Date()
       void (async () => {
         const wid = activeWarehouseIdRef.current
-        const pos: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+        const pos: [number, number] = at(e)
         const id = await apiDb.textLabels.add({
           name: t('textLabel.defaultName', { defaultValue: 'Text' }),
           unit: configUnit,

@@ -97,16 +97,6 @@ VALUES ($1, $2, $3, $4)
 ON CONFLICT (report_id, user_id) DO UPDATE
 SET can_edit = EXCLUDED.can_edit, granted_at = now(), granted_by = EXCLUDED.granted_by;
 
--- name: GrantTenantReportsToUser :exec
--- View access to every report of a workspace, for a member who joins the
--- demo workspace (handlers/auth.go): editors don't see a report without
--- a grant, and the demo's reports are the point of joining it.
-INSERT INTO report_permissions (report_id, user_id, can_edit)
-SELECT r.id, $2, false
-FROM reports r
-WHERE r.tenant_id = $1
-ON CONFLICT (report_id, user_id) DO NOTHING;
-
 -- name: DeleteReportPermission :exec
 DELETE FROM report_permissions WHERE report_id = $1 AND user_id = $2;
 
@@ -249,3 +239,13 @@ DELETE FROM report_runs WHERE report_id = $1 AND tenant_id = $2 AND ran_at < $3;
 SELECT coalesce(spec->'origin'->>'key', '')::text AS key
 FROM reports
 WHERE tenant_id = $1 AND zone_id = $2 AND spec->'origin'->>'kind' = sqlc.arg(kind)::text;
+
+-- name: GrantTenantReportsToUser :exec
+-- View access to every report of a workspace, for a member who joins the
+-- demo workspace (handlers/auth.go): editors don't see a report without
+-- a grant, and the demo's reports are the point of joining it.
+INSERT INTO report_permissions (report_id, user_id, can_edit)
+SELECT r.id, $2, false
+FROM reports r
+WHERE r.tenant_id = $1
+ON CONFLICT (report_id, user_id) DO NOTHING;

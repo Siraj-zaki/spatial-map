@@ -301,7 +301,7 @@ export interface ReportSpecV2 {
   /** Where a generated report came from — the facility report set
    *  stamps `{kind: 'facility-set', key, zoneId}`; carried through
    *  edits so the backfill still recognises it. */
-  origin?: { kind: string; key?: string; zoneId?: number }
+  origin?: { kind: string; key?: string; zoneId?: number; /** A generator's own settings (the master report's setup). */ config?: unknown }
 }
 
 /** Default layout the FE creates for fresh dashboards / migrated v1 rows.

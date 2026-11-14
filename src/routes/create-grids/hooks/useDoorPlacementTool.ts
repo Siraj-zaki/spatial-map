@@ -1,6 +1,7 @@
 import { useEffect, useRef, type Dispatch, type SetStateAction } from 'react'
 
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 import type { DoorShape } from '@/lib/door/types'
 import { useDoorStore } from '@/lib/door/store'
@@ -82,10 +83,11 @@ export function useDoorPlacementTool({
   // ---- Door selection lifecycle ------------------------------------------
   // Match the behavior the user expects from a CAD-style tool: Pan is
   // pure navigation, so switching to it (or to any creation tool other
-  // than create-door) clears the door selection.
+  // than create-door) clears the door selection. Marquee is a selection
+  // mode too — clearing here dropped every door a marquee drag picked.
   useEffect(() => {
     if (selectedDoorIds.size === 0) return
-    if (activeTool === 'select' || activeTool === 'create-door') return
+    if (activeTool === 'select' || activeTool === 'marquee' || activeTool === 'create-door') return
     setSelectedDoorIds(new Set())
   }, [activeTool, selectedDoorIds.size, setSelectedDoorIds]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -139,6 +141,12 @@ export function useDoorPlacementTool({
     }
     const map = mapInstance
     map.getCanvas().style.cursor = 'crosshair'
+    // Where the cursor touches the scene (at the door tool's current elevation) —
+    // not the ground under it, which is off by the floor's height at pitch.
+    const at = (e: MapMouseEvent): [number, number] => {
+      const p = unprojectOnScene(map, e.point, useDoorStore.getState().pendingConfig.elevation ?? 0)
+      return [p.lng, p.lat]
+    }
 
     // Preview + wall-snap commit width comes from the store's
     // `pendingWidthMeters` (bound to the Opening-width slider in the
@@ -185,7 +193,7 @@ export function useDoorPlacementTool({
 
     const onClick = (e: MapMouseEvent) => {
       if (e.originalEvent?.defaultPrevented) return
-      const lngLat: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+      const lngLat: [number, number] = at(e)
 
       // ---- Wall single-click commit -----------------------------
       // If the cursor is snapped to a wall AND no anchors placed
@@ -285,7 +293,7 @@ export function useDoorPlacementTool({
       }
     }
     const onMove = (e: MapMouseEvent) => {
-      pendingLngLat = [e.lngLat.lng, e.lngLat.lat]
+      pendingLngLat = at(e)
       if (moveRafId === 0) moveRafId = requestAnimationFrame(flushMove)
     }
 

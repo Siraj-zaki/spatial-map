@@ -25,6 +25,7 @@ import { apiDb } from './api-db'
 import { apiDelete } from './api-client'
 import { queryCache, useApiQuery } from './useApiQuery'
 import { useCurrentTenantId } from './data-link/tenant-service'
+import { reportShareToken, reportShareUserModels } from './reports/report-share'
 import { uploadModel, urlForModel } from './binary-store'
 import { invalidateUploadLibrary, renderModelThumbnail } from './upload-library'
 import {
@@ -98,9 +99,11 @@ function uploadedToAsset(row: UserModel): ModelAsset {
 /** Returns every available model asset (bundled + uploaded). */
 export function useModelAssets(): ModelAsset[] {
   const tenantId = useCurrentTenantId()
+  // A shared report's facility ships its models with the link.
+  const shared = reportShareToken()
   const uploadedQuery = useApiQuery(
-    () => apiDb.userModels.toArray(),
-    ['userModels', tenantId],
+    () => (shared !== null ? Promise.resolve(reportShareUserModels()) : apiDb.userModels.toArray()),
+    ['userModels', shared ?? tenantId],
     // Event-driven: fetch once per mount/invalidation, not on a timer.
     { intervalMs: 0 },
   )

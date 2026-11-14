@@ -16,6 +16,7 @@
  */
 
 import { apiGet } from '@/lib/api-client'
+import { sourceShareActive, sourceShareGet } from '@/lib/reports/report-share'
 
 /**
  * Wire shape from `dataSourceRowEventResponse`. `ts` is an ISO
@@ -36,6 +37,10 @@ export interface TableRowEvent {
 export interface ListTableEventsOpts {
   /** Seconds back from now. Backend clamps to (0, 30d]. Default 24h. */
   windowSec?: number
+  /** A custom range (epoch ms) instead of `windowSec` — both ends, at
+   *  most 31 days apart. */
+  from?: number
+  to?: number
   /** Max rows. Backend clamps to (0, 5000]. Default 500. */
   limit?: number
 }
@@ -50,9 +55,13 @@ export async function listTableEvents(
   opts: ListTableEventsOpts = {},
 ): Promise<TableRowEvent[]> {
   const qs = new URLSearchParams()
-  if (opts.windowSec !== undefined) qs.set('window', String(opts.windowSec))
+  if (opts.from !== undefined && opts.to !== undefined) {
+    qs.set('from', new Date(opts.from).toISOString())
+    qs.set('to', new Date(opts.to).toISOString())
+  } else if (opts.windowSec !== undefined) qs.set('window', String(opts.windowSec))
   if (opts.limit !== undefined) qs.set('limit', String(opts.limit))
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  if (sourceShareActive()) return sourceShareGet<TableRowEvent[]>(`/sources/${sourceId}/events${suffix}`)
   return apiGet<TableRowEvent[]>(`/tables/${sourceId}/events${suffix}`)
 }
 
@@ -69,6 +78,9 @@ export async function listRowEvents(
   const qs = new URLSearchParams()
   if (opts.limit !== undefined) qs.set('limit', String(opts.limit))
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  if (sourceShareActive()) {
+    return sourceShareGet<TableRowEvent[]>(`/sources/${sourceId}/events/${encodeURIComponent(entityKey)}${suffix}`)
+  }
   return apiGet<TableRowEvent[]>(
     `/tables/${sourceId}/events/${encodeURIComponent(entityKey)}${suffix}`,
   )

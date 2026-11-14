@@ -56,8 +56,6 @@ interface Entry {
   url: string
   thumbnail?: string
   orientation?: string
-  /** Credit line (author + license) for built-in models. */
-  attribution?: string
   uploaded?: LibraryModel
 }
 
@@ -99,7 +97,6 @@ export function ModelLibraryDialog({
       url: m.url,
       thumbnail: m.thumbnail,
       orientation: m.previewOrientation,
-      attribution: m.attribution,
     }))
   }, [query])
 
@@ -123,7 +120,7 @@ export function ModelLibraryDialog({
       // A placement may reference any duplicate row of the same file.
       for (const id of m.ids) map.set(`user_${id}`, e)
     }
-    for (const m of BUNDLED_MODELS) map.set(m.id, { assetId: m.id, name: m.label, url: m.url, thumbnail: m.thumbnail, orientation: m.previewOrientation, attribution: m.attribution })
+    for (const m of BUNDLED_MODELS) map.set(m.id, { assetId: m.id, name: m.label, url: m.url, thumbnail: m.thumbnail, orientation: m.previewOrientation })
     return map
   }, [library.data, rendered])
   const selected = (selectedId && allEntries.get(selectedId)) || null
@@ -569,12 +566,6 @@ function PreviewPanel({
             <>
               <dt className="text-muted-foreground">{t('modelLibrary.source', { defaultValue: 'Source' })}</dt>
               <dd className="truncate">{t('modelLibrary.builtinLong', { defaultValue: 'Built-in library' })}</dd>
-              {entry.attribution && (
-                <>
-                  <dt className="text-muted-foreground">{t('modelLibrary.credit', { defaultValue: 'Credit' })}</dt>
-                  <dd className="break-words">{entry.attribution}</dd>
-                </>
-              )}
             </>
           )}
         </dl>

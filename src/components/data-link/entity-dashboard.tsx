@@ -113,7 +113,7 @@ export function EntityDashboard() {
   const { t, i18n } = useTranslation()
   const navigate = useNavigate()
   const tenantId = useCurrentTenantId()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('data.manage')
   const adminOnly = t('common.needsAdmin', { defaultValue: 'Only workspace owners and admins can do this.' })
 
   const query = useApiQuery(() => listTables(), ['tables', tenantId], { intervalMs: 30000 })

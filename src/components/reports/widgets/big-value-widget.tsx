@@ -84,10 +84,13 @@ export function BigValueWidget({
 
   const columnType: ReportFieldType = result.columns[valueIdx].type
   const raw = row[valueIdx]
-  const formatted =
-    typeof b.decimals === 'number' && typeof raw === 'number' && (!b.format || b.format === 'number')
-      ? new Intl.NumberFormat(locale, { maximumFractionDigits: b.decimals }).format(raw)
-      : formatReportValue(raw, columnType, b.format, locale)
+  // One formatter for the static value and the count-up, so `decimals`
+  // holds once the animation lands (it used to finish on the raw float).
+  const formatNumber = (n: number) =>
+    typeof b.decimals === 'number' && (!b.format || b.format === 'number')
+      ? new Intl.NumberFormat(locale, { maximumFractionDigits: b.decimals }).format(n)
+      : formatReportValue(n, columnType, b.format, locale)
+  const formatted = typeof raw === 'number' ? formatNumber(raw) : formatReportValue(raw, columnType, b.format, locale)
   const label = b.label
     ? String(row[result.columns.findIndex((c) => c.name === b.label)] ?? '')
     : widget.title
@@ -134,7 +137,7 @@ export function BigValueWidget({
         {/* Numbers count up the first time they appear (static under
             reduced motion); integers stay whole on the way. */}
         {typeof raw === 'number' && Number.isFinite(raw) ? (
-          <CountUp value={raw} format={(n) => formatReportValue(Number.isInteger(raw) ? Math.round(n) : n, columnType, b.format, locale)} />
+          <CountUp value={raw} format={(n) => formatNumber(Number.isInteger(raw) ? Math.round(n) : n)} />
         ) : (
           formatted
         )}

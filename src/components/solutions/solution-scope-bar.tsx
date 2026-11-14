@@ -32,7 +32,7 @@ export function SolutionScopeBar() {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const { pathname } = useLocation()
-  const { canEdit } = useWorkspaceRole()
+  const canEdit = useWorkspaceRole().can('solutions.manage')
   const here = useSolutionLocation()
   const { data, isLoading } = useSolutions()
   const [managing, setManaging] = useState(false)

@@ -61,9 +61,12 @@ type ShareLinkRequest struct {
 // ShareLinkResponse is the row envelope returned to the editor. Fields
 // use camelCase to match the rest of the JSON API.
 type ShareLinkResponse struct {
-	ID             int64           `json:"id"`
-	TenantID       int64           `json:"tenantId"`
-	ZoneID         int64           `json:"zoneId"`
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenantId"`
+	// ZoneID is the facility; a report link carries ReportID (and its
+	// report's facility, or none for a workspace-wide report).
+	ZoneID         int64           `json:"zoneId,omitempty"`
+	ReportID       int64           `json:"reportId,omitempty"`
 	Token          string          `json:"token"`
 	Label          string          `json:"label"`
 	Settings       json.RawMessage `json:"settings"`
@@ -120,7 +123,8 @@ func buildShareLinkResponse(row db.ShareLink) ShareLinkResponse {
 	resp := ShareLinkResponse{
 		ID:        row.ID,
 		TenantID:  row.TenantID,
-		ZoneID:    row.ZoneID,
+		ZoneID:    row.ZoneID.Int64,
+		ReportID:  row.ReportID.Int64,
 		Token:     row.Token,
 		Label:     row.Label,
 		Settings:  defaultJSONObject(row.Settings),
@@ -203,7 +207,7 @@ func parseExpiry(expiresAt *string, expirySeconds *int64) (pgtype.Timestamptz, e
 // never has to send zoneID in the body; we always trust the URL param.
 func ListShareLinksHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin, RoleEditor) {
+		if !api.RequirePermission(w, r, api.PermReportsShare) {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
@@ -225,7 +229,7 @@ func ListShareLinksHandler(q *db.Queries) http.HandlerFunc {
 		}
 		rows, err := q.ListShareLinksByZone(r.Context(), db.ListShareLinksByZoneParams{
 			TenantID: tenantID,
-			ZoneID:   zoneID,
+			ZoneID:   pgtype.Int8{Int64: zoneID, Valid: true},
 		})
 		if err != nil {
 			api.InternalError(w, r, err)
@@ -243,7 +247,7 @@ func ListShareLinksHandler(q *db.Queries) http.HandlerFunc {
 // The token is minted server-side — the client can never pick its own token.
 func CreateShareLinkHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin, RoleEditor) {
+		if !api.RequirePermission(w, r, api.PermReportsShare) {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
@@ -287,7 +291,7 @@ func CreateShareLinkHandler(q *db.Queries) http.HandlerFunc {
 		}
 		row, err := q.CreateShareLink(r.Context(), db.CreateShareLinkParams{
 			TenantID:  tenantID,
-			ZoneID:    zoneID,
+			ZoneID:    pgtype.Int8{Int64: zoneID, Valid: true},
 			Token:     token,
 			Label:     strings.TrimSpace(req.Label),
 			Settings:  defaultJSONObject(req.Settings),
@@ -309,7 +313,7 @@ func CreateShareLinkHandler(q *db.Queries) http.HandlerFunc {
 // but the update does NOT un-revoke it — use a fresh create for that.
 func UpdateShareLinkHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin, RoleEditor) {
+		if !api.RequirePermission(w, r, api.PermReportsShare) {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
@@ -357,7 +361,7 @@ func UpdateShareLinkHandler(q *db.Queries) http.HandlerFunc {
 // the handler responds 404 rather than resurrecting the row.
 func RevokeShareLinkHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin, RoleEditor) {
+		if !api.RequirePermission(w, r, api.PermReportsShare) {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
@@ -393,7 +397,7 @@ func RevokeShareLinkHandler(q *db.Queries) http.HandlerFunc {
 // to owners to keep this from being a foot-gun.
 func DeleteShareLinkHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermWorkspaceManage) {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
@@ -434,7 +438,7 @@ func PublicShareHandler(q *db.Queries) http.HandlerFunc {
 			api.InternalError(w, r, err)
 			return
 		}
-		zoneRow, err := q.GetZoneByID(r.Context(), link.ZoneID)
+		zoneRow, err := q.GetZoneByID(r.Context(), link.ZoneID.Int64)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				api.NotFound(w, "share link not found")
@@ -473,22 +477,9 @@ func PublicShareHandler(q *db.Queries) http.HandlerFunc {
 			return
 		}
 
-		publicLink := PublicShareLink{
-			Label:     link.Label,
-			Settings:  defaultJSONObject(link.Settings),
-			ViewCount: link.ViewCount + 1, // reflect the increment we just did
-			IssuedAt:  api.FormatTime(link.CreatedAt),
-		}
-		if link.ExpiresAt.Valid {
-			publicLink.ExpiresAt = link.ExpiresAt.Time.Format(time.RFC3339)
-		}
-		if link.MaxViews.Valid {
-			v := link.MaxViews.Int64
-			publicLink.MaxViews = &v
-		}
-
 		api.JSON(w, http.StatusOK, PublicShareResponse{
-			Link:      publicLink,
+			// Reflect the increment we just did.
+			Link:      toPublicShareLink(link, link.ViewCount+1),
 			Warehouse: view,
 		})
 	}

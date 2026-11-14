@@ -2,8 +2,11 @@ import { Boxes, Clock, Layers, MapPin, Package, Search as SearchIcon, X } from '
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { Button } from '@/components/ui/button'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { Bin, Grid } from '@/lib/db'
 import type { MarkerShape, ModelShape } from '@/lib/shapes'
+import { cn } from '@/lib/utils'
 
 type ResultKind = 'rack' | 'bin' | 'marker' | 'model'
 
@@ -27,14 +30,16 @@ export type SearchResult = RackResult | BinResult | MarkerResult | ModelResult
 type CategoryFilter = 'all' | ResultKind
 
 interface ViewSearchProps {
-  grids: Grid[]
-  bins: Bin[]
-  markers: MarkerShape[]
-  models: ModelShape[]
+  grids: readonly Grid[]
+  bins: readonly Bin[]
+  markers: readonly MarkerShape[]
+  models: readonly ModelShape[]
   onPick: (result: SearchResult) => void
   /** Used as a localStorage namespace for the recents list so each
    * warehouse keeps its own history. Omit to disable recents. */
   warehouseId?: string
+  /** Extra classes for the trigger pill. */
+  className?: string
 }
 
 /** Stripped-down record we serialize per recent. We never store the
@@ -125,7 +130,8 @@ function CategoryButton({
     <button
       type="button"
       onClick={onClick}
-      className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium border transition-colors ${
+      aria-pressed={active}
+      className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
         active
           ? 'bg-primary text-primary-foreground border-primary'
           : 'bg-card border-border text-muted-foreground hover:bg-muted'
@@ -140,27 +146,45 @@ function CategoryButton({
 function ResultIcon({ kind }: { kind: ResultKind }) {
   const cls = 'w-3.5 h-3.5 flex-shrink-0'
   switch (kind) {
-    case 'rack':   return <Layers   className={`${cls} text-sky-500`} />
-    case 'bin':    return <Package  className={`${cls} text-blue-500`} />
-    case 'marker': return <MapPin   className={`${cls} text-red-500`} />
-    case 'model':  return <Boxes    className={`${cls} text-indigo-500`} />
+    case 'rack':   return <Layers   className={`${cls} text-primary`} />
+    case 'bin':    return <Package  className={`${cls} text-info`} />
+    case 'marker': return <MapPin   className={`${cls} text-success`} />
+    case 'model':  return <Boxes    className={`${cls} text-warning`} />
   }
 }
 
-export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }: ViewSearchProps) {
+/**
+ * Viewer search — racks, bins, markers and 3D models by name / SKU.
+ *
+ * A compact glass pill in the viewer's top-end control stack; the panel
+ * opens in a Radix popover anchored to it. The popover matters beyond
+ * looks: the viewer's detail drawer is non-modal but still runs Radix's
+ * focus scope, and a popover's own scope pauses it — a plain floating
+ * panel would have its input focus pulled back into the drawer. It also
+ * makes Esc layer correctly (Esc clears the query, then closes the
+ * panel, and never reaches the drawer underneath).
+ *
+ * `/` opens it anywhere outside a text field; Cmd/Ctrl+K does too when
+ * nothing else claimed the shortcut (the app shell's command palette
+ * handles it first on signed-in routes).
+ */
+export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId, className }: ViewSearchProps) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<CategoryFilter>('all')
   const [cursor, setCursor] = useState(0)
-  const [recents, setRecents] = useState<RecentEntry[]>(() => loadRecents(warehouseId))
+  // Recents are tagged with the warehouse they were loaded for, so a
+  // route change re-reads storage without an effect.
+  const [recentStore, setRecentStore] = useState<{ wid: string | undefined; entries: RecentEntry[] }>(() => ({
+    wid: warehouseId,
+    entries: loadRecents(warehouseId),
+  }))
+  const recents = useMemo(
+    () => (recentStore.wid === warehouseId ? recentStore.entries : loadRecents(warehouseId)),
+    [recentStore, warehouseId],
+  )
   const inputRef = useRef<HTMLInputElement | null>(null)
-
-  // Re-hydrate recents when the warehouse changes (route nav).
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setRecents(loadRecents(warehouseId))
-  }, [warehouseId])
 
   // Re-resolve each recent against the live data so a renamed entity
   // shows its current label and a deleted entity drops off the list.
@@ -208,32 +232,28 @@ export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }
       .filter((x): x is { entry: RecentEntry; result: SearchResult } => x.result !== null)
   }, [recents, grids, bins, markers, models])
 
-  // Cmd/Ctrl+K and `/` open the search. Esc closes it.
+  // `/` and Cmd/Ctrl+K open the search. Read on `window` in the bubble
+  // phase, so a shortcut someone else already handled (the command
+  // palette's Cmd+K, a dialog's own keys) is left alone.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return
       const target = e.target as HTMLElement | null
-      const inField = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')
-      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      const inField =
+        !!target &&
+        (target.isContentEditable ||
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT')
+      const modK = (e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')
+      if (modK || (!inField && e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey)) {
         e.preventDefault()
         setOpen(true)
-        queueMicrotask(() => inputRef.current?.focus())
-        return
-      }
-      if (!inField && e.key === '/') {
-        e.preventDefault()
-        setOpen(true)
-        queueMicrotask(() => inputRef.current?.focus())
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
-
-  // Reset cursor when the result set changes (query / filter).
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setCursor(0)
-  }, [query, filter])
 
   // Index bins by their parent grid so bin rows can show a useful subtitle
   // ("in Rack A1") without the host having to thread the grid map through.
@@ -356,6 +376,15 @@ export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }
     return { rack, bin, marker, model, all: rack + bin + marker + model }
   }, [query, grids, bins, markers, models])
 
+  const changeQuery = (next: string) => {
+    setQuery(next)
+    setCursor(0)
+  }
+  const changeFilter = (next: CategoryFilter) => {
+    setFilter(next)
+    setCursor(0)
+  }
+
   const handlePick = (r: SearchResult) => {
     // Push into recents — dedupe by `${kind}:${ref}` then cap to 8.
     const ref = entryRefFor(r)
@@ -369,26 +398,20 @@ export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }
       }
       const dedup = recents.filter((x) => !(x.kind === entry.kind && x.ref === entry.ref))
       const next = [entry, ...dedup].slice(0, RECENT_LIMIT)
-      setRecents(next)
+      setRecentStore({ wid: warehouseId, entries: next })
       saveRecents(warehouseId, next)
     }
-    onPick(r)
     setOpen(false)
-    setQuery('')
+    changeQuery('')
+    onPick(r)
   }
 
   const handleClearRecents = () => {
-    setRecents([])
+    setRecentStore({ wid: warehouseId, entries: [] })
     saveRecents(warehouseId, [])
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Escape') {
-      e.preventDefault()
-      if (query) setQuery('')
-      else setOpen(false)
-      return
-    }
     if (e.key === 'ArrowDown') {
       e.preventDefault()
       setCursor((c) => Math.min(c + 1, Math.max(0, results.length - 1)))
@@ -405,121 +428,175 @@ export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }
     }
   }
 
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => {
-          setOpen(true)
-          queueMicrotask(() => inputRef.current?.focus())
-        }}
-        aria-label={t('view.search.open', { defaultValue: 'Search' })}
-        className="fixed top-12 start-3 z-20 flex items-center gap-1.5 h-9 px-2.5 rounded-md border bg-card/95 backdrop-blur shadow-sm hover:bg-muted/60 text-xs text-muted-foreground"
-      >
-        <SearchIcon className="w-3.5 h-3.5" />
-        <span>{t('view.search.placeholder', { defaultValue: 'Search…' })}</span>
-        <kbd className="font-mono text-[9px] px-1 py-0.5 rounded border bg-muted ms-1">⌘K</kbd>
-      </button>
-    )
-  }
-
   const showResults = query.trim().length >= MIN_QUERY_LENGTH
   const noMatches = showResults && results.length === 0
 
   return (
-    <div className="fixed top-12 start-3 z-30 w-80 max-w-[calc(100vw-1.5rem)] bg-card/95 backdrop-blur border rounded-md shadow-md">
-      <div className="flex items-center gap-1.5 px-2 py-1.5 border-b">
-        <SearchIcon className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
-        <input
-          ref={inputRef}
-          type="text"
-          autoFocus
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={t('view.search.placeholder', { defaultValue: 'Search racks, bins, markers…' })}
-          className="flex-1 bg-transparent text-sm focus:outline-none placeholder:text-muted-foreground"
-        />
-        <button
-          type="button"
-          onClick={() => setOpen(false)}
-          aria-label={t('view.search.close', { defaultValue: 'Close search' })}
-          className="text-muted-foreground hover:text-foreground"
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          aria-label={t('view.search.open', { defaultValue: 'Search' })}
+          className={cn(
+            'h-9 gap-2 rounded-full border-border/60 bg-background/70 pl-3 pr-2.5 shadow-lg shadow-black/5 backdrop-blur-xl hover:bg-background/90',
+            className,
+          )}
         >
-          <X className="w-3.5 h-3.5" />
-        </button>
-      </div>
-
-      <div className="flex items-center gap-1 px-2 py-1 border-b overflow-x-auto">
-        <CategoryButton
-          label={t('view.search.all', { defaultValue: 'All' })}
-          active={filter === 'all'}
-          count={counts.all}
-          onClick={() => setFilter('all')}
-        />
-        <CategoryButton
-          label={t('view.search.racks', { defaultValue: 'Racks' })}
-          active={filter === 'rack'}
-          count={counts.rack}
-          onClick={() => setFilter('rack')}
-        />
-        <CategoryButton
-          label={t('view.search.bins', { defaultValue: 'Bins' })}
-          active={filter === 'bin'}
-          count={counts.bin}
-          onClick={() => setFilter('bin')}
-        />
-        <CategoryButton
-          label={t('view.search.markers', { defaultValue: 'Markers' })}
-          active={filter === 'marker'}
-          count={counts.marker}
-          onClick={() => setFilter('marker')}
-        />
-        <CategoryButton
-          label={t('view.search.models', { defaultValue: 'Models' })}
-          active={filter === 'model'}
-          count={counts.model}
-          onClick={() => setFilter('model')}
-        />
-      </div>
-
-      {!showResults && resolvedRecents.length === 0 && (
-        <div className="px-3 py-3 text-[11px] text-muted-foreground">
-          {t('view.search.hint', {
-            defaultValue: 'Type at least 2 characters to search. Use arrow keys to navigate, Enter to jump.',
-          })}
+          <SearchIcon className="h-3.5 w-3.5 text-primary" aria-hidden />
+          <span className="text-xs font-medium">{t('view.search.open', { defaultValue: 'Search' })}</span>
+          <kbd
+            className="hidden sm:inline-flex h-4 min-w-4 items-center justify-center rounded border border-border/60 bg-muted px-1 font-mono text-[10px] leading-none text-muted-foreground"
+            aria-hidden
+          >
+            /
+          </kbd>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        sideOffset={6}
+        className="w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border-border/60 bg-popover/95 p-0 shadow-xl backdrop-blur-xl"
+        // Esc clears a typed query first, and only then closes the panel.
+        onEscapeKeyDown={(e) => {
+          if (query) {
+            e.preventDefault()
+            changeQuery('')
+          }
+        }}
+        onOpenAutoFocus={(e) => {
+          e.preventDefault()
+          inputRef.current?.focus()
+        }}
+      >
+        <div className="flex items-center gap-1.5 px-2.5 py-2 border-b border-border/60">
+          <SearchIcon className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" aria-hidden />
+          <input
+            ref={inputRef}
+            type="text"
+            value={query}
+            onChange={(e) => changeQuery(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={t('view.search.inputPlaceholder', { defaultValue: 'Search racks, bins, markers…' })}
+            aria-label={t('view.search.open', { defaultValue: 'Search' })}
+            className="flex-1 min-w-0 bg-transparent text-sm focus:outline-none placeholder:text-muted-foreground"
+          />
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            aria-label={t('view.search.close', { defaultValue: 'Close search' })}
+            title={t('view.search.close', { defaultValue: 'Close search' })}
+            className="grid h-6 w-6 flex-shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <X className="w-3.5 h-3.5" aria-hidden />
+          </button>
         </div>
-      )}
 
-      {!showResults && resolvedRecents.length > 0 && (
-        <div className="py-1">
-          <div className="flex items-center justify-between px-2.5 pt-1 pb-0.5">
-            <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
-              <Clock className="w-3 h-3" />
-              {t('view.search.recent', { defaultValue: 'Recent' })}
-            </span>
-            <button
-              type="button"
-              onClick={handleClearRecents}
-              className="text-[10px] text-muted-foreground hover:text-foreground"
-            >
-              {t('view.search.clear', { defaultValue: 'Clear' })}
-            </button>
+        <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border/60 overflow-x-auto">
+          <CategoryButton
+            label={t('view.search.all', { defaultValue: 'All' })}
+            active={filter === 'all'}
+            count={counts.all}
+            onClick={() => changeFilter('all')}
+          />
+          <CategoryButton
+            label={t('view.search.racks', { defaultValue: 'Racks' })}
+            active={filter === 'rack'}
+            count={counts.rack}
+            onClick={() => changeFilter('rack')}
+          />
+          <CategoryButton
+            label={t('view.search.bins', { defaultValue: 'Bins' })}
+            active={filter === 'bin'}
+            count={counts.bin}
+            onClick={() => changeFilter('bin')}
+          />
+          <CategoryButton
+            label={t('view.search.markers', { defaultValue: 'Markers' })}
+            active={filter === 'marker'}
+            count={counts.marker}
+            onClick={() => changeFilter('marker')}
+          />
+          <CategoryButton
+            label={t('view.search.models', { defaultValue: 'Models' })}
+            active={filter === 'model'}
+            count={counts.model}
+            onClick={() => changeFilter('model')}
+          />
+        </div>
+
+        {!showResults && resolvedRecents.length === 0 && (
+          <div className="px-3 py-3 text-[11px] text-muted-foreground">
+            {t('view.search.hint', {
+              defaultValue: 'Type at least 2 characters to search. Use arrow keys to navigate, Enter to jump.',
+            })}
           </div>
-          <ul className="max-h-[40dvh] overflow-y-auto">
-            {resolvedRecents.map(({ result }) => (
-              <li key={result.key}>
+        )}
+
+        {!showResults && resolvedRecents.length > 0 && (
+          <div className="py-1">
+            <div className="flex items-center justify-between px-2.5 pt-1 pb-0.5">
+              <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                <Clock className="w-3 h-3" aria-hidden />
+                {t('view.search.recent', { defaultValue: 'Recent' })}
+              </span>
+              <button
+                type="button"
+                onClick={handleClearRecents}
+                className="rounded text-[10px] text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {t('view.search.clear', { defaultValue: 'Clear' })}
+              </button>
+            </div>
+            <ul className="max-h-[40dvh] overflow-y-auto">
+              {resolvedRecents.map(({ result }) => (
+                <li key={result.key}>
+                  <button
+                    type="button"
+                    onClick={() => handlePick(result)}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 text-start text-xs hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:outline-none"
+                  >
+                    <ResultIcon kind={result.kind} />
+                    <span className="flex flex-col min-w-0">
+                      <span className="truncate font-medium">{result.name}</span>
+                      {result.subtitle && (
+                        <span className="truncate text-[10px] text-muted-foreground">
+                          {result.subtitle}
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {noMatches && (
+          <div className="px-3 py-3 text-[11px] text-muted-foreground">
+            {t('view.search.empty', { defaultValue: 'No matches.' })}
+          </div>
+        )}
+
+        {showResults && results.length > 0 && (
+          <ul className="max-h-[40dvh] overflow-y-auto py-1">
+            {results.map((r, i) => (
+              <li key={r.key}>
                 <button
                   type="button"
-                  onClick={() => handlePick(result)}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted/60"
+                  onClick={() => handlePick(r)}
+                  onMouseEnter={() => setCursor(i)}
+                  className={cn(
+                    'w-full flex items-center gap-2 px-2.5 py-1.5 text-start text-xs focus-visible:outline-none',
+                    i === cursor ? 'bg-accent/70' : 'hover:bg-accent/60 focus-visible:bg-accent/60',
+                  )}
                 >
-                  <ResultIcon kind={result.kind} />
+                  <ResultIcon kind={r.kind} />
                   <span className="flex flex-col min-w-0">
-                    <span className="truncate font-medium">{result.name}</span>
-                    {result.subtitle && (
+                    <span className="truncate font-medium">{r.name}</span>
+                    {r.subtitle && (
                       <span className="truncate text-[10px] text-muted-foreground">
-                        {result.subtitle}
+                        {r.subtitle}
                       </span>
                     )}
                   </span>
@@ -527,41 +604,8 @@ export function ViewSearch({ grids, bins, markers, models, onPick, warehouseId }
               </li>
             ))}
           </ul>
-        </div>
-      )}
-
-      {noMatches && (
-        <div className="px-3 py-3 text-[11px] text-muted-foreground">
-          {t('view.search.empty', { defaultValue: 'No matches.' })}
-        </div>
-      )}
-
-      {showResults && results.length > 0 && (
-        <ul className="max-h-[40dvh] overflow-y-auto py-1">
-          {results.map((r, i) => (
-            <li key={r.key}>
-              <button
-                type="button"
-                onClick={() => handlePick(r)}
-                onMouseEnter={() => setCursor(i)}
-                className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-xs ${
-                  i === cursor ? 'bg-muted/70' : 'hover:bg-muted/60'
-                }`}
-              >
-                <ResultIcon kind={r.kind} />
-                <span className="flex flex-col min-w-0">
-                  <span className="truncate font-medium">{r.name}</span>
-                  {r.subtitle && (
-                    <span className="truncate text-[10px] text-muted-foreground">
-                      {r.subtitle}
-                    </span>
-                  )}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+        )}
+      </PopoverContent>
+    </Popover>
   )
 }

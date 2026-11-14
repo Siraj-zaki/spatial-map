@@ -302,11 +302,29 @@ export function UploadDropzone({
 }
 
 /** Library ↔ Upload switch used where both live in one narrow panel. */
-export function LibrarySourceTabs({ value, onChange }: { value: 'library' | 'upload'; onChange: (v: 'library' | 'upload') => void }) {
+type LibrarySource = 'library' | 'upload' | 'blank'
+
+/** Source switch. `blank` (a plain sheet, see blank-floor-picker) is only
+ *  offered where a caller lists it — the floor-plan tool does. */
+export function LibrarySourceTabs<S extends LibrarySource>({
+  value,
+  onChange,
+  tabs = ['library', 'upload'] as S[],
+}: {
+  value: S
+  onChange: (v: S) => void
+  tabs?: readonly S[]
+}) {
   const { t } = useTranslation()
+  const label = (id: LibrarySource) =>
+    id === 'library'
+      ? t('library.fromLibrary', { defaultValue: 'From library' })
+      : id === 'upload'
+        ? t('library.uploadNew', { defaultValue: 'Upload new' })
+        : t('library.blank', { defaultValue: 'Blank' })
   return (
-    <div role="tablist" className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1">
-      {(['library', 'upload'] as const).map((id) => (
+    <div role="tablist" className={cn('grid gap-1 rounded-lg bg-muted p-1', tabs.length === 3 ? 'grid-cols-3' : 'grid-cols-2')}>
+      {tabs.map((id) => (
         <button
           key={id}
           type="button"
@@ -318,7 +336,7 @@ export function LibrarySourceTabs({ value, onChange }: { value: 'library' | 'upl
             value === id ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
           )}
         >
-          {id === 'library' ? t('library.fromLibrary', { defaultValue: 'From library' }) : t('library.uploadNew', { defaultValue: 'Upload new' })}
+          {label(id)}
         </button>
       ))}
     </div>

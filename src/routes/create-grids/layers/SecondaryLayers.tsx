@@ -1,4 +1,4 @@
-import { type Dispatch, type SetStateAction } from 'react'
+import { type Dispatch, type SetStateAction, useMemo } from 'react'
 
 import type { Map as MapboxMapInstance } from 'mapbox-gl'
 
@@ -14,9 +14,10 @@ import { MapMarkerOverlay, type MarkerStyleOverride } from '@/components/map-mar
 import { MapShapeTooltip } from '@/components/map-shape-tooltip'
 import { MapTextLabelOverlay } from '@/components/map-text-label-overlay'
 import type { LayerVisibility } from '@/components/map-toolbar'
-import type { Bin, DataLinkConfig, Grid } from '@/lib/db'
+import type { Bin, DataLinkConfig } from '@/lib/db'
 import type { DoorConfig, DoorShape } from '@/lib/door/types'
 import type { Tool } from '@/lib/keyboard-shortcuts'
+import type { OccluderInput } from '@/lib/marker-occlusion'
 import type {
   CircleShape,
   ImagePlaneShape,
@@ -26,7 +27,6 @@ import type {
   MarkerShapeConfig,
   ModelShape,
   PolygonShape,
-  StairShape,
   TextLabelConfig,
   TextLabelShape,
 } from '@/lib/shapes'
@@ -118,8 +118,7 @@ export function SecondaryLayers({
   savedCircles,
   savedLines,
   savedModels,
-  savedStairs,
-  savedGrids,
+  occluders,
   savedStyleRules,
   savedImages,
   // ---- Sibling clears (used by inline door / image-plane click lambdas) ----
@@ -206,10 +205,14 @@ export function SecondaryLayers({
   savedCircles: CircleShape[]
   savedLines: LineShape[]
   savedModels: ModelShape[]
-  /** Marker-occlusion only — stairs render from OverlayStack. */
-  savedStairs: StairShape[]
-  /** Rack grids — used as OCCLUDERS for door/marker/text labels. */
-  savedGrids: Grid[]
+  /**
+   * What door labels, markers and text labels hide behind: floor plates,
+   * polygons, circles, walls, stairs and racks, each kind already gated on
+   * its own layer toggle (hidden geometry paints nothing, so it occludes
+   * nothing). Memoised by the host, which builds focus mode's blocker
+   * prisms from the same bag — same arrays, one shared prism list.
+   */
+  occluders: OccluderInput
   savedStyleRules: ReadonlyArray<StyleRule>
   savedImages: ImageShape[]
   // Sibling clears
@@ -222,6 +225,57 @@ export function SecondaryLayers({
   setSelectedModelIds: Dispatch<SetStateAction<Set<number>>>
   setSelectedStairIds: Dispatch<SetStateAction<Set<number>>>
 }) {
+  // Data-link overlay inputs, memoised: built inline they were new arrays
+  // on every editor render — every drag / marquee / transform frame — and
+  // each one re-ran every live-data layer's filter and source push.
+  //
+  // `configs` is filtered by the layer toggles so a tint / marker / gauge
+  // whose base shape kind is hidden also disappears (before this filter,
+  // hiding "Racks" left the tinted bin fills painted by config 26 still
+  // on-screen because the data-link overlay renders its OWN Mapbox layer,
+  // independent of MapGridOverlay's committedVisible toggle).
+  const {
+    grid: gridVisible,
+    polygon: polygonVisible,
+    circle: circleVisible,
+    line: lineVisible,
+    marker: markerVisible,
+    stair: stairVisible,
+    text: textVisible,
+  } = layerVisibility
+  const dataLinkConfigs = useMemo(
+    () =>
+      savedDataLinks.filter((c) => {
+        switch (c.targetKind) {
+          case 'grid-cell': return gridVisible
+          case 'polygon':   return polygonVisible
+          case 'circle':    return circleVisible
+          case 'line':      return lineVisible
+          case 'marker':    return markerVisible
+          case 'stair':     return stairVisible
+          case 'text-label':return textVisible
+          default:          return true
+        }
+      }),
+    [
+      savedDataLinks,
+      gridVisible,
+      polygonVisible,
+      circleVisible,
+      lineVisible,
+      markerVisible,
+      stairVisible,
+      textVisible,
+    ],
+  )
+  const liveFloorPlanIds = useMemo(
+    () =>
+      savedImages
+        .map((img) => img.id)
+        .filter((id): id is number => id !== undefined),
+    [savedImages],
+  )
+
   return (
     <>
       {/*
@@ -292,14 +346,7 @@ export function SecondaryLayers({
         // v5.5 — door labels fade behind floor plates and walls same
         // as markers + text-labels. Same gating: hidden layers occlude
         // nothing.
-        occluders={{
-          images: layerVisibility.image ? savedImages : undefined,
-          polygons: layerVisibility.polygon ? savedPolygons : undefined,
-          circles: layerVisibility.circle ? savedCircles : undefined,
-          lines: layerVisibility.line ? savedLines : undefined,
-          stairs: layerVisibility.stair ? savedStairs : undefined,
-          grids: layerVisibility.grid ? savedGrids : undefined,
-        }}
+        occluders={occluders}
         onDoorClick={(id, e) => {
           const additive = e.shiftKey || e.metaKey || e.ctrlKey
           setSelectedDoorIds((prev) => {
@@ -363,14 +410,7 @@ export function SecondaryLayers({
         // Slabs, walls and staircases hide the markers standing behind
         // them. Each kind is gated on its own layer toggle — geometry the
         // user hid paints nothing and so must occlude nothing.
-        occluders={{
-          images: layerVisibility.image ? savedImages : undefined,
-          polygons: layerVisibility.polygon ? savedPolygons : undefined,
-          circles: layerVisibility.circle ? savedCircles : undefined,
-          lines: layerVisibility.line ? savedLines : undefined,
-          stairs: layerVisibility.stair ? savedStairs : undefined,
-          grids: layerVisibility.grid ? savedGrids : undefined,
-        }}
+        occluders={occluders}
       />
 
       {/*
@@ -411,14 +451,7 @@ export function SecondaryLayers({
         // of the room it belongs to" so a room's own polygon doesn't
         // hide its own label. Each kind still gates on its own layer
         // toggle — hidden geometry can't paint or occlude.
-        occluders={{
-          images: layerVisibility.image ? savedImages : undefined,
-          polygons: layerVisibility.polygon ? savedPolygons : undefined,
-          circles: layerVisibility.circle ? savedCircles : undefined,
-          lines: layerVisibility.line ? savedLines : undefined,
-          stairs: layerVisibility.stair ? savedStairs : undefined,
-          grids: layerVisibility.grid ? savedGrids : undefined,
-        }}
+        occluders={occluders}
         onLabelClick={(id, e) => {
           const additive = e.shiftKey || e.metaKey || e.ctrlKey
           setSelectedTextLabelIds((prev) => {
@@ -477,28 +510,13 @@ export function SecondaryLayers({
        * them.
        */}
       {/*
-       * Data-link overlay. `configs` is filtered by the layer toggles so
-       * a tint / marker / gauge whose base shape kind is hidden also
-       * disappears (before this filter, hiding "Racks" left the tinted
-       * bin fills painted by config 26 still on-screen because the
-       * data-link overlay renders its OWN Mapbox layer, independent of
-       * MapGridOverlay's committedVisible toggle).
+       * Data-link overlay. `configs` is filtered by the layer toggles —
+       * see `dataLinkConfigs` above.
        */}
       <MapDataLinkedOverlay
         map={overlayMap}
         activeZoneId={activeWarehouseId ?? null}
-        configs={savedDataLinks.filter((c) => {
-          switch (c.targetKind) {
-            case 'grid-cell': return layerVisibility.grid
-            case 'polygon':   return layerVisibility.polygon
-            case 'circle':    return layerVisibility.circle
-            case 'line':      return layerVisibility.line
-            case 'marker':    return layerVisibility.marker
-            case 'stair':     return layerVisibility.stair
-            case 'text-label':return layerVisibility.text
-            default:          return true
-          }
-        })}
+        configs={dataLinkConfigs}
         enabled={preview}
         polygons={savedPolygons}
         circles={savedCircles}
@@ -506,9 +524,7 @@ export function SecondaryLayers({
         lines={savedLines}
         models={savedModels}
         styleRules={savedStyleRules}
-        liveFloorPlanIds={savedImages
-          .map((img) => img.id)
-          .filter((id): id is number => id !== undefined)}
+        liveFloorPlanIds={liveFloorPlanIds}
       />
     </>
   )

@@ -22,6 +22,7 @@ import ProfilePage from '@/routes/profile'
 import ReportBuilderPage from '@/routes/report-builder'
 import ReportDetailPage from '@/routes/report-detail'
 import ReportsPage from '@/routes/reports'
+import SharedReportPage from '@/routes/shared-report'
 import SignupPage from '@/routes/signup'
 import SolutionPage from '@/routes/solution'
 import { SolutionScopeBar } from '@/components/solutions/solution-scope-bar'
@@ -133,7 +134,7 @@ function AppContent() {
             <main> (PageContainer fills it and owns its own scroll). */}
         <main
           ref={mainRef}
-          className={isMapRoute ? 'relative min-h-0 flex-1 overflow-auto' : 'relative min-h-0 flex-1 overflow-y-auto'}
+          className={isMapRoute ? 'relative min-h-0 flex-1 overflow-hidden' : 'relative min-h-0 flex-1 overflow-y-auto'}
         >
           {isCreateGrids ? (
             <CreateGrids
@@ -200,6 +201,9 @@ function App() {
             (theme picker, workspace switcher, nav) — users hit
             Preview from the editor and expect the same chrome. */}
         <Route path="/share/:token" element={<View mode="token" />} />
+        {/* A public link to one report — same idea as /share/:token, for
+            a report (its widgets, live map and history), no account. */}
+        <Route path="/r/:token" element={<SharedReportPage />} />
         {/* Auth screens. Public; AuthGuard does not wrap these. GuestOnly
             sends an already-signed-in user on to the app; the reset flow
             stays reachable signed-in (it's also how you change a password). */}

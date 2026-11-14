@@ -18,7 +18,7 @@ import {
 } from '@/lib/export'
 import { fitBoundsIfOffscreen } from './fitToShapeOnSelect'
 import { DRAW_GRID_MODE_NAME } from '@/lib/grid-draw-mode'
-import { type GridConfig } from '@/lib/grid-generators'
+import { pathGridDrawnVertices, type GridConfig } from '@/lib/grid-generators'
 import { gridHistory } from '@/lib/grid-history'
 import { queryCache } from '@/lib/useApiQuery'
 
@@ -204,21 +204,29 @@ export function useGridHandlers({
     (id: number) => {
       const orig = savedGrids.find((g) => g.id === id)
       if (!orig) return
+      // A path grid continues from its existing points (Backspace walks
+      // back through them); the draw mode fires the anchor events itself.
+      const vertices = pathGridDrawnVertices(orig.start, orig.current, orig.config)
+      const pathRedraw = vertices.length >= 2
       setRedrawingGridId(id)
       setConfig(orig.config)
-      setLiveStart(orig.start)
-      setLiveCurrent(orig.current)
-      setHasAnchor(true)
+      if (!pathRedraw) {
+        setLiveStart(orig.start)
+        setLiveCurrent(orig.current)
+        setHasAnchor(true)
+      }
       setDrawMode(true)
       setSelectedGridIds(new Set())
       // Defer the mode change so the state is committed first.
       queueMicrotask(() => {
         const draw = drawRef.current
-        if (draw)
-          draw.changeMode(DRAW_GRID_MODE_NAME, {
-            config: orig.config,
-            start: orig.start,
-          })
+        if (!draw) return
+        draw.changeMode(
+          DRAW_GRID_MODE_NAME,
+          pathRedraw
+            ? { config: { ...orig.config, rotation: 0 }, vertices }
+            : { config: orig.config, start: orig.start },
+        )
       })
     },
     [

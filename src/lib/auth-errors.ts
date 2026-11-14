@@ -53,8 +53,14 @@ export function describeAuthError(err: unknown): AuthErrorInfo {
       return { key: 'auth.passwordRequirementsNotMet', field: 'password', code }
     case 'email_taken':
       return { key: 'auth.errors.emailTaken', code }
+    case 'email_disposable':
+      return { key: 'auth.errors.emailDisposable', code }
     case 'verification_expired':
       return { key: 'auth.verificationExpired', code }
+    case 'client_suspended':
+      return { key: 'auth.errors.clientSuspended', code }
+    case 'licence_expired':
+      return { key: 'auth.errors.licenceExpired', code }
     case 'session_revoked':
       return { key: 'auth.notices.sessionRevoked', code }
   }

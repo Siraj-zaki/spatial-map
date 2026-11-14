@@ -57,6 +57,12 @@ const ELEVATOR_CAR_H_M = 2.4
 /** Shaft headroom above the top stop (car height + overrun). */
 const ELEVATOR_HEADROOM_M = 3.4
 
+/** `config.liftScale` clamped to the range the panel offers (0.4–1). */
+export function liftScaleOf(config: Pick<StairShapeConfig, 'liftScale'>): number {
+  const k = config.liftScale
+  return typeof k === 'number' && Number.isFinite(k) ? Math.max(0.4, Math.min(1, k)) : 1
+}
+
 // Part colours that aren't user-configurable. They're shape materials
 // (steel, rubber, glass), stored as data like the default shape colours
 // in shapes.ts — not UI theme colours.
@@ -349,7 +355,7 @@ export function buildElevatorParts(
   const st = styleOf(config, shapeId)
   const { W, D } = elevatorSize(config, frontWidth)
   const { stops } = levels
-  const top = stops[stops.length - 1] + ELEVATOR_HEADROOM_M
+  const top = stops[stops.length - 1] + ELEVATOR_HEADROOM_M * liftScaleOf(config)
   return [
     makeRect(toLngLat, 0, W, 0, D, stops[0], top, {
       ...part(st, st.body, { part: 'hit', borderWidth: 0 }),
@@ -386,7 +392,9 @@ export function buildElevatorMesh(
   const oos = config.status === 'out-of-service'
   const { stops } = levels
   const bottom = stops[0]
-  const top = stops[stops.length - 1] + ELEVATOR_HEADROOM_M
+  // Vertical size factor: car, doors, fittings and headroom (not plan sizes).
+  const k = liftScaleOf(config)
+  const top = stops[stops.length - 1] + ELEVATOR_HEADROOM_M * k
   const solid = new MeshBuilder()
   const glass = new MeshBuilder()
   const frameC = config.color
@@ -441,9 +449,9 @@ export function buildElevatorMesh(
   const d0 = (W - doorW) / 2
   const d1 = (W + doorW) / 2
   const jamb = 0.1
-  const headerH = 0.28
+  const headerH = 0.28 * k
   const proud = 0.07
-  const doorH = ELEVATOR_DOOR_H_M
+  const doorH = ELEVATOR_DOOR_H_M * k
   // Front glass either side of the door column, per storey.
   for (let i = 0; i < bandTops.length; i++) {
     panel(inset + r, d0 - jamb, 0.07, 0.1, bandBases[i], bandTops[i])
@@ -459,7 +467,7 @@ export function buildElevatorMesh(
     solid.box(d1, d1 + jamb, -proud, 0.12, z, z + doorH + headerH)
     solid.box(d0 - jamb, d1 + jamb, -proud, 0.12, z + doorH, z + doorH + headerH)
     // Floor indicator display in the header.
-    solid.color('#0f172a').mark('display').box((d0 + d1) / 2 - 0.18, (d0 + d1) / 2 + 0.18, -proud - 0.012, -proud, z + doorH + 0.08, z + doorH + 0.2)
+    solid.color('#0f172a').mark('display').box((d0 + d1) / 2 - 0.18, (d0 + d1) / 2 + 0.18, -proud - 0.012, -proud, z + doorH + 0.08 * k, z + doorH + 0.2 * k)
     // Two brushed leaves with a centre split, recessed in the frame.
     const mid = (d0 + d1) / 2
     solid.color(stainless).mark('door')
@@ -468,10 +476,10 @@ export function buildElevatorMesh(
     // Sill plate and the call station with up / down buttons.
     solid.color('#9ca3af').mark('sill').box(d0 - 0.05, d1 + 0.05, -0.18, 0.05, z, z + 0.015)
     const cf = d1 + jamb + 0.13
-    solid.color(stainless).mark('call').box(cf - 0.06, cf + 0.06, -0.025, 0.0, z + 0.98, z + 1.3)
+    solid.color(stainless).mark('call').box(cf - 0.06, cf + 0.06, -0.025, 0.0, z + 0.98 * k, z + 1.3 * k)
     solid.color(oos ? OUT_OF_SERVICE : '#e5e7eb')
-    solid.cylS(cf, z + 1.19, 0.022, -0.04, -0.025)
-    solid.cylS(cf, z + 1.09, 0.022, -0.04, -0.025)
+    solid.cylS(cf, z + 1.19 * k, 0.022, -0.04, -0.025)
+    solid.cylS(cf, z + 1.09 * k, 0.022, -0.04, -0.025)
     colFrom = z + doorH + headerH
   }
   if (capZ - beamH - colFrom > 0.05) panel(d0 - jamb, d1 + jamb, 0.07, 0.1, colFrom, capZ - beamH)
@@ -484,15 +492,15 @@ export function buildElevatorMesh(
   const y0 = 0.22
   const y1 = D - 0.42 // room behind the car for the counterweight
   const ym = (y0 + y1) / 2
-  const cabinH = ELEVATOR_CAR_H_M
+  const cabinH = ELEVATOR_CAR_H_M * k
   // Guide rails either side of the car.
   solid.color(dark).mark('rail')
   solid.box(x0 - 0.1, x0 - 0.06, ym - 0.04, ym + 0.04, bottom, capZ)
   solid.mark('rail').box(x1 + 0.06, x1 + 0.1, ym - 0.04, ym + 0.04, bottom, capZ)
   // Counterweight on its own rails, riding opposite the car.
-  const cwH = 1.4
+  const cwH = 1.4 * k
   const travel = stops[stops.length - 1] - bottom
-  const cwZ = Math.min(capZ - 1.2 - cwH, bottom + 0.3 + (travel - (c - bottom)))
+  const cwZ = Math.min(capZ - 1.2 * k - cwH, bottom + 0.3 * k + (travel - (c - bottom)))
   const cw0 = W / 2 - 0.35
   const cw1 = W / 2 + 0.35
   solid.color(dark).mark('cw-rail')
@@ -500,19 +508,20 @@ export function buildElevatorMesh(
   solid.box(cw1 + 0.03, cw1 + 0.06, D - 0.3, D - 0.25, bottom, capZ)
   solid.color('#4b5563').mark('counterweight').box(cw0, cw1, D - 0.34, D - 0.2, cwZ, cwZ + cwH)
   // Drive machine under the cap, ropes down to the car and counterweight.
-  solid.color(dark).mark('machine').box(W / 2 - 0.4, W / 2 + 0.4, ym, D - 0.15, capZ - 0.55, capZ - 0.05)
+  const machineH = 0.55 * k
+  solid.color(dark).mark('machine').box(W / 2 - 0.4, W / 2 + 0.4, ym, D - 0.15, capZ - machineH, capZ - 0.05)
   solid.color('#111827')
   for (const df of [-0.09, -0.03, 0.03, 0.09]) {
-    solid.mark('rope').cylZ(W / 2 + df, ym, 0.008, c + cabinH + 0.35, capZ - 0.55, 6)
-    solid.cylZ(W / 2 + df, D - 0.27, 0.008, cwZ + cwH, capZ - 0.55, 6)
+    solid.mark('rope').cylZ(W / 2 + df, ym, 0.008, c + cabinH + 0.35 * k, capZ - machineH, 6)
+    solid.cylZ(W / 2 + df, D - 0.27, 0.008, cwZ + cwH, capZ - machineH, 6)
   }
 
   // ---- Cabin -------------------------------------------------------------------
   // Car sling: stiles up the sides, crosshead over the top, plank below.
   solid.color(dark).mark('sling')
-  solid.box(x0 - 0.06, x0 - 0.01, ym - 0.06, ym + 0.06, c - 0.25, c + cabinH + 0.35)
-  solid.box(x1 + 0.01, x1 + 0.06, ym - 0.06, ym + 0.06, c - 0.25, c + cabinH + 0.35)
-  solid.box(x0 - 0.06, x1 + 0.06, ym - 0.08, ym + 0.08, c + cabinH + 0.2, c + cabinH + 0.35)
+  solid.box(x0 - 0.06, x0 - 0.01, ym - 0.06, ym + 0.06, c - 0.25, c + cabinH + 0.35 * k)
+  solid.box(x1 + 0.01, x1 + 0.06, ym - 0.06, ym + 0.06, c - 0.25, c + cabinH + 0.35 * k)
+  solid.box(x0 - 0.06, x1 + 0.06, ym - 0.08, ym + 0.08, c + cabinH + 0.2 * k, c + cabinH + 0.35 * k)
   solid.box(x0 - 0.06, x1 + 0.06, ym - 0.1, ym + 0.1, c - 0.25, c - 0.15)
   // Platform: the car floor is flush with the stop.
   solid.color('#374151').mark('car').box(x0, x1, y0, y1, c - 0.15, c)
@@ -544,8 +553,8 @@ export function buildElevatorMesh(
   solid.box(cd1, x1, y0, y0 + 0.03, c, c + cabinH)
   solid.box(cd0, cd1, y0, y0 + 0.03, c + doorH, c + cabinH)
   // Handrail on brackets along the back wall.
-  solid.color('#d1d5db').mark('handrail').cylF(x0 + 0.15, x1 - 0.15, y1 - 0.07, c + 0.92, 0.02)
-  for (const bf of [x0 + 0.25, x1 - 0.25]) solid.box(bf - 0.015, bf + 0.015, y1 - 0.07, y1 - 0.02, c + 0.9, c + 0.94)
+  solid.color('#d1d5db').mark('handrail').cylF(x0 + 0.15, x1 - 0.15, y1 - 0.07, c + 0.92 * k, 0.02)
+  for (const bf of [x0 + 0.25, x1 - 0.25]) solid.box(bf - 0.015, bf + 0.015, y1 - 0.07, y1 - 0.02, c + 0.9 * k, c + 0.94 * k)
 
   return { solid: solid.mesh, glass: glass.mesh, parts: { ...solid.parts, ...glass.parts }, carBase: c, top }
 }

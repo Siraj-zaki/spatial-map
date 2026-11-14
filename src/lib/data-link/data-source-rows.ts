@@ -14,6 +14,7 @@
  */
 
 import { apiGet, apiDelete } from '@/lib/api-client'
+import { sourceShareActive, sourceShareGet } from '@/lib/reports/report-share'
 
 /** One record produced by a DataSource. Shape mirrors EntityState. */
 export interface DataSourceRow {
@@ -42,7 +43,10 @@ interface ListResponse {
  * `listEntityStatesForStream()` for non-streaming DataLinkConfigs.
  */
 export async function listRowsForSource(sourceId: number): Promise<DataSourceRow[]> {
-  const body = await apiGet<ListResponse>(`/data-sources/${sourceId}/rows`)
+  const body =
+    sourceShareActive()
+      ? await sourceShareGet<ListResponse>(`/sources/${sourceId}/rows`)
+      : await apiGet<ListResponse>(`/data-sources/${sourceId}/rows`)
   return body.rows.map((r) => ({
     id: r.id,
     sourceId: r.sourceId,

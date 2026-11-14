@@ -1,10 +1,9 @@
 /**
  * Start-side brand panel of the auth split screen (≥lg only).
  *
- * Full-bleed footage of the real product (captured frame by frame from the
- * viewer — the warehouse is the demo workspace's Acme Warehouse), one
- * seamless 32 s loop that covers the whole platform rather than one camera
- * move:
+ * Full-bleed footage of the real product (captured from the app — the
+ * `~/Documents/claude-motion` footage), one seamless 32 s loop that covers
+ * the whole platform rather than one camera move:
  *   0–13.5 s   the full warehouse orbit — racks, docks, bins, safety markers
  *              and live worker positions, every layer on
  *   13.5–24.5  the full supermarket orbit — aisles, zones, carts, safety
@@ -18,8 +17,8 @@
  * +faststart, ~8 MB) + `.jpg` posters. The supermarket was only captured
  * in light mode; the dark loop uses it through `negate,hue=h=180`, which
  * reproduces the dark map style closely (labels come out light). Recipe
- * (light shown; dark = the warehouse orbit captured with the dark map style,
- * the negate filter on inputs 1–2, and fadeblack):
+ * (light shown; dark = warehouse-footage/rotate-full.mp4, the negate filter
+ * on inputs 1–2, and fadeblack):
  *   ffmpeg -i warehouse-footage-light/videos/rotate-full.mp4
  *     -i supermarket-footage-light/videos/sm-rotate-full.mp4
  *     -i supermarket-footage-light/videos/sm-dolly-staff.mp4 -filter_complex

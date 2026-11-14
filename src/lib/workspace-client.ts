@@ -1,8 +1,8 @@
 /**
  * Workspace client. Wraps the backend /tenants routes with the semantics
  * the UI actually needs: create, rename, delete, leave, and switch — plus
- * keeping `useAuthStore.tenants` in sync so the workspace switcher and
- * role gates all see the update without a full page reload.
+ * keeping `useAuthStore.tenants` in sync so the trial banner, workspace
+ * switcher, and role gates all see the update without a full page reload.
  *
  * Note: in the code + DB the entity is still called `tenant`. Only the
  * user-facing copy says "workspace". Keeping the code name stable avoids
@@ -20,10 +20,10 @@ export interface WorkspaceInput {
 
 /**
  * Fetch the current user's workspaces from the backend. Also replaces
- * `useAuthStore.tenants` so any subscriber (switcher, role gates, etc.)
+ * `useAuthStore.tenants` so any subscriber (trial banner, switcher, etc.)
  * re-renders. Useful after operations the store can't be locally patched
- * for — e.g. leaving a workspace where the list needs a full
- * re-fetch.
+ * for — e.g. leaving a workspace where the plan projection needs a
+ * full re-fetch.
  */
 export async function refreshWorkspaces(): Promise<AuthTenant[]> {
   const list = await apiGet<AuthTenant[]>('/tenants')
@@ -32,8 +32,9 @@ export async function refreshWorkspaces(): Promise<AuthTenant[]> {
 }
 
 /**
- * Create a new workspace. The backend adds the caller as owner. Returns
- * the newly-created AuthTenant.
+ * Create a new workspace. The backend stamps a fresh 7-day trial and adds
+ * the caller as owner. Returns the newly-created AuthTenant with its plan
+ * projection filled in.
  */
 export async function createWorkspace(input: WorkspaceInput): Promise<AuthTenant> {
   const created = await apiPost<AuthTenant>('/tenants', {

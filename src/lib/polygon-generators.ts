@@ -25,6 +25,17 @@ import type {
   Polygon,
 } from 'geojson'
 import type { PolygonShape, FillShapeConfig } from './shapes'
+import { fillTapers } from './sloped-mesh'
+
+/**
+ * Slab floors map-polygon-overlay draws with (and slabTopM mirrors). A shape
+ * with a height sits on an 11 cm base; 3D models placed on solids use it
+ * (docs/pitfalls-frontend.md). A 0-height area is drawn paper-thin right on
+ * the floor instead, so it never looks raised — 1 cm clears the floor plan.
+ */
+export const POLYGON_MIN_BASE_M = 0.11
+export const FLAT_SLAB_BASE_M = 0.01
+export const FLAT_SLAB_THICKNESS_M = 0.01
 
 export interface PolygonProps {
   id: string
@@ -54,6 +65,13 @@ export interface PolygonProps {
    * face drops to a low emissive so shadows visibly darken it.
    */
   receiveShadows: boolean
+  /**
+   * config.solid, but only with a height. The overlay drops
+   * emissive-strength to 0 for solid shapes so they're sun-lit and shade
+   * like walls — on a 0-height area that lights the thin slab it is drawn
+   * as (POLYGON_MIN_BASE_M) and its edge reads as a raised platform.
+   */
+  solid: boolean
   showLabels: boolean
   label?: string
   labelSize?: number
@@ -66,6 +84,11 @@ export interface PolygonProps {
    */
   labelFlat?: boolean
   /** Marks live-preview polygons (no polygonId yet). */
+  /**
+   * Tapered / dome solid (sloped-mesh.ts): the overlay draws it as a mesh,
+   * and this feature sits in the zero-opacity bucket as its click target.
+   */
+  meshed?: boolean
   preview?: boolean
 }
 
@@ -107,6 +130,7 @@ function propsFor(
     elevation: cfg.elevation,
     height: cfg.height,
     receiveShadows: cfg.receiveShadows ?? true,
+    solid: (cfg.solid ?? false) && cfg.height > 0,
     showLabels: cfg.showLabels,
     label: labelText,
     labelSize: cfg.labelSize,
@@ -237,13 +261,22 @@ export function buildPolygonFeatureCollection(
     const f = buildPolygonFeature(s)
     if (!f) continue
     const override = s.id !== undefined ? extras?.get(s.id) : undefined
-    features.push(override ? applyPolygonOverride(f, override) : f)
+    features.push(meshedHitTarget(override ? applyPolygonOverride(f, override) : f, s.config))
   }
   if (livePreview) {
     const f = buildPolygonFeature(livePreview, { preview: true })
     if (f) features.push(f)
   }
   return { type: 'FeatureCollection', features }
+}
+
+/**
+ * A tapered / dome solid is drawn as a mesh by the overlay: its feature
+ * moves to the zero-opacity bucket and stays as the click / hover target.
+ */
+function meshedHitTarget(f: PolygonFeature, cfg: FillShapeConfig): PolygonFeature {
+  if (!fillTapers(cfg, f.properties.height)) return f
+  return { ...f, properties: { ...f.properties, meshed: true, opacityBucket: 0 } }
 }
 
 /**

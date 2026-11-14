@@ -22,3 +22,17 @@ export type {
 } from './types'
 
 export { buildRoutingScene, type BuildSceneInput } from './scene-adapter'
+
+export {
+  floorsOf,
+  isStepFree,
+  planRoutes,
+  portalsOf,
+  stepsOf,
+  type FacilityRoutingInput,
+  type Floor,
+  type PlanResult,
+  type Portal,
+  type RouteOption,
+  type Step,
+} from './floors'

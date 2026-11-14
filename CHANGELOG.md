@@ -6,6 +6,64 @@ All notable changes to Spatial Map are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
+### Added
+
+- **Focus mode** — click an item and only what blocks the view of it (and
+  what sits right around it) fades; big shapes in the way are cut away
+  locally. Works in the viewer, share links, report maps and the editor;
+  `?focus=` links open straight onto an item, and a chip follows a moving one.
+- **Measure and drafting** — a Measure tool (`U`) for distances and areas
+  that leaves guides, live dimension labels while drawing walls and areas,
+  typed lengths for every vertex tool (`3.5`, `350cm`, `12'6` then Enter),
+  an angle lock, and floor-plan **calibration** from a known length.
+- **Wall joins** — walls and aisles meet cleanly at corners and T-joints,
+  door openings cut every wall they cross.
+- **Leaning and sloped walls** — walls can lean (curved or straight
+  profile, either side).
+- **Path-layout grids** — racks and seat rows bent along a drawn line
+  (U, L, S, arcs).
+- **Routing v2** — routes follow the building's axes, pass through door
+  centres, and run across floors.
+- **Heatmap** on viewer and report maps — one or several layers at once,
+  heat spreads along open floor and through open doors, never through walls,
+  racks or closed doors, and hides behind walls when the map is tilted.
+- **Point clustering** on viewer and report maps.
+- **Viewer Live data panel** — counts and a searchable list of what the
+  map's data layers show, plus a Live / Cluster / Heatmap control.
+- **Master report** — one live report per facility, generated from a setup
+  dialog (map layers, counts, status charts, filters).
+- **Report share links** — a public link to a single report at `/r/:token`
+  (its widgets, live map and history; no account). Migration
+  `0049_report_share_links`.
+- **Facility share links read their data** — signed-out visitors of a
+  `/share/:token` link see the facility's data layers (rows, history).
+- **History playback time range**, and a camera live view in the item
+  drawer (HLS, MP4/WebM, MJPEG).
+- **Place search** — Mapbox and OpenStreetMap results, typed coordinates,
+  Google Maps / OSM links.
+- **Blank floor sheet** in the floor-plan tool, **bulk select and edit** in
+  every saved-shapes list (plus a Saved routes list), per-floor "hide
+  shapes" reference views, and **export** to GeoJSON, JSON, XLSX, CSV and
+  3D `.glb`.
+- `GET /api/v1/zones/{id}/view` — a whole facility (shapes, floors, bins) in
+  one call.
+
+### Security
+
+- **Viewers are read-only on the API, not just in the UI.** Every change a
+  signed-in member makes now needs the permission its area requires for their
+  role (`api.WritePermissionMiddleware`, `internal/api/permissions.go`);
+  before, a viewer could write through the API directly. Owners, admins and
+  editors keep exactly the access they had.
+
+### Changed
+
+- Faster maps on large facilities: per-frame tile bookkeeping cuts,
+  diff-only GeoJSON updates, an exact occlusion index, stable row identity
+  across refetches.
+
 ## [0.1.1] - 2026-11-14
 
 ### Security
@@ -67,6 +125,7 @@ First open-source release of Spatial Map, the self-hosted edition of
 - Six languages (English, German, Spanish, French, Arabic with RTL, Chinese),
   light/dark themes and 46 colour palettes.
 
-[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Siraj-zaki/spatial-map/releases/tag/v0.1.0

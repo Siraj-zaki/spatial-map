@@ -57,6 +57,7 @@ export function OverlayStack({
   // ---- Images ----
   imagesForOverlay,
   imageWallLines,
+  imageAlignment,
   imageLivePreview,
   selectedImageIds,
   imageTransform,
@@ -64,6 +65,7 @@ export function OverlayStack({
   onImageTransformChange,
   // ---- Grids ----
   liveLine,
+  livePreviewConfig,
   committedLines,
   panelMode,
   selectedGrid,
@@ -98,7 +100,6 @@ export function OverlayStack({
   lineDraftCursor,
   lineConfig,
   lineDraftSnap,
-  drawingUnit,
   selectedLineIds,
   lineTransform,
   onLineClick,
@@ -145,6 +146,8 @@ export function OverlayStack({
   imagesForOverlay: ImageShape[]
   /** Every wall in the warehouse (any floor visibility) — floor-plan "hide outside walls" mask. */
   imageWallLines?: ReadonlyArray<LineShape>
+  /** Floor-plan alignment view — see `MapImageOverlay` `alignment`. */
+  imageAlignment?: { activeImageId: number | null } | null
   imageLivePreview: ImageShape | null
   selectedImageIds: Set<number>
   imageTransform: unknown
@@ -156,6 +159,8 @@ export function OverlayStack({
   }, commit: boolean) => void
   // ---- Grids ----
   liveLine: { start: [number, number]; current: [number, number] } | null
+  /** Grid config for the live preview while a path-layout grid is being drawn. */
+  livePreviewConfig?: GridConfig | null
   committedLines: CommittedLine[]
   panelMode: string
   selectedGrid: Grid | null
@@ -218,7 +223,6 @@ export function OverlayStack({
   lineDraftCursor: [number, number] | null
   lineConfig: LineShapeConfig
   lineDraftSnap: LineSnap | null
-  drawingUnit: import('@/lib/units').LengthUnit
   selectedLineIds: Set<number>
   lineTransform: unknown
   onLineClick: (id: number, e: MouseEvent) => void
@@ -295,6 +299,7 @@ export function OverlayStack({
                   transformState={imageTransform as never}
                   onTransformChange={onImageTransformChange}
                   wallLines={imageWallLines}
+                  alignment={imageAlignment}
                 />
               </Fragment>
             )
@@ -306,7 +311,7 @@ export function OverlayStack({
                 bbox={null}
                 line={liveLine}
                 committedLines={committedLines}
-                config={panelMode === 'grid-selected' && selectedGrid ? selectedGrid.config : gridConfig}
+                config={livePreviewConfig ?? (panelMode === 'grid-selected' && selectedGrid ? selectedGrid.config : gridConfig)}
                 showBbox={liveLine !== null}
                 selectedGridIds={selectedGridIds}
                 onCellClick={onCellClick}
@@ -397,7 +402,6 @@ export function OverlayStack({
                 liveCursor={activeTool === 'create-line' ? lineDraftCursor : null}
                 liveConfig={lineConfig}
                 liveSnap={activeTool === 'create-line' ? lineDraftSnap : null}
-                liveUnit={drawingUnit}
                 selectedLineIds={selectedLineIds}
                 onLineClick={onLineClick}
                 onMapClickEmpty={onMapClickEmpty}

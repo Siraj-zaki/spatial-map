@@ -20,6 +20,14 @@
  * inbound (lng/lat → metres) when the scene is compiled, and once
  * outbound (metres → lng/lat) when the path is emitted. No downstream
  * consumer needs to know the projection exists.
+ *
+ * **Building axis.** The frame can be turned so its x axis runs along the
+ * building's main wall direction (`axisDeg`, maths degrees: 0 = east,
+ * counter-clockwise). The occupancy grid is laid out in this frame, so on
+ * a building rotated 33° on the map the grid rows still run parallel to
+ * its walls — 4-connected A* then produces real left / right turns
+ * instead of a staircase that has to be cut into diagonals.
+ * `dominantAxisDeg` finds the angle from the walls themselves.
  */
 
 const R_EARTH_M = 6378137
@@ -33,6 +41,11 @@ export interface LocalFrame {
   lng0: number
   /** Precomputed metres per degree of longitude at `lat0`. */
   metersPerDegLng: number
+  /** Building axis in maths degrees (0 = east, counter-clockwise). */
+  axisDeg: number
+  /** cos / sin of `axisDeg`, precomputed. */
+  cosA: number
+  sinA: number
 }
 
 /**
@@ -41,12 +54,16 @@ export interface LocalFrame {
  * fine; the further points are from the anchor the more the tiny
  * cosine approximation error grows, but at 250 m it's <0.1 cm.
  */
-export function makeLocalFrame(anchor: [number, number]): LocalFrame {
+export function makeLocalFrame(anchor: [number, number], axisDeg = 0): LocalFrame {
   const [lng0, lat0] = anchor
+  const a = (axisDeg * Math.PI) / 180
   return {
     lat0,
     lng0,
     metersPerDegLng: DEG_TO_M * Math.cos((lat0 * Math.PI) / 180),
+    axisDeg,
+    cosA: Math.cos(a),
+    sinA: Math.sin(a),
   }
 }
 
@@ -70,14 +87,50 @@ export function pickAnchor(samples: ReadonlyArray<[number, number]>): [number, n
   return [(minLng + maxLng) / 2, (minLat + maxLat) / 2]
 }
 
-/** Convert a lng/lat point to local East/North metres. */
+/** Convert a lng/lat point to local metres along / across the building axis
+ *  (East / North when the axis is 0). */
 export function toLocal(frame: LocalFrame, ll: [number, number]): [number, number] {
   const [lng, lat] = ll
-  return [(lng - frame.lng0) * frame.metersPerDegLng, (lat - frame.lat0) * DEG_TO_M]
+  const e = (lng - frame.lng0) * frame.metersPerDegLng
+  const n = (lat - frame.lat0) * DEG_TO_M
+  return [e * frame.cosA + n * frame.sinA, -e * frame.sinA + n * frame.cosA]
 }
 
-/** Convert local East/North metres back to lng/lat. */
+/** Convert local metres back to lng/lat. */
 export function fromLocal(frame: LocalFrame, xy: [number, number]): [number, number] {
   const [x, y] = xy
-  return [frame.lng0 + x / frame.metersPerDegLng, frame.lat0 + y / DEG_TO_M]
+  const e = x * frame.cosA - y * frame.sinA
+  const n = x * frame.sinA + y * frame.cosA
+  return [frame.lng0 + e / frame.metersPerDegLng, frame.lat0 + n / DEG_TO_M]
+}
+
+/**
+ * The building's main wall direction, in maths degrees within [-45, 45),
+ * from segments in lng/lat. Orthogonal buildings have walls at θ and
+ * θ + 90°, so each segment votes with 4θ (which folds both onto one
+ * angle), weighted by its length. Returns 0 when the walls don't agree on
+ * a direction (round or irregular buildings) — the grid then stays
+ * north-up, as before.
+ */
+export function dominantAxisDeg(
+  segments: ReadonlyArray<{ a: [number, number]; b: [number, number]; weight?: number }>,
+  anchor: [number, number],
+): number {
+  const frame = makeLocalFrame(anchor)
+  let sx = 0
+  let sy = 0
+  let total = 0
+  for (const { a, b, weight = 1 } of segments) {
+    const [ax, ay] = toLocal(frame, a)
+    const [bx, by] = toLocal(frame, b)
+    const len = Math.hypot(bx - ax, by - ay)
+    if (len < 0.5) continue
+    const t = 4 * Math.atan2(by - ay, bx - ax)
+    sx += Math.cos(t) * len * weight
+    sy += Math.sin(t) * len * weight
+    total += len * weight
+  }
+  if (total === 0 || Math.hypot(sx, sy) / total < 0.3) return 0
+  const deg = (Math.atan2(sy, sx) * 180) / Math.PI / 4
+  return Math.abs(deg) < 0.5 ? 0 : deg
 }

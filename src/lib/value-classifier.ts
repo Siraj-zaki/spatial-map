@@ -1287,7 +1287,10 @@ function classifyString(
 
   // ── date / time ───────────────────────────────────────────────────
   if (RE.iso.test(s) || hint?.kind === 'date' || hint?.kind === 'datetime') {
-    const d = new Date(s)
+    // A zone-less date-time ("2026-11-03 15:40:00", how devices and seeders write it) is UTC — the
+    // reports read it that way (Postgres) — not the browser's zone, which `new Date(s)` would assume.
+    const zoneless = RE.iso.test(s) && /[T ]\d{2}:\d{2}/.test(s) && !/(?:Z|[+-]\d{2}:?\d{2})$/.test(s)
+    const d = new Date(zoneless ? `${s.replace(' ', 'T')}Z` : s)
     if (!isNaN(d.getTime())) {
       const hasTime = /[T ]\d{2}:\d{2}/.test(s)
       return {

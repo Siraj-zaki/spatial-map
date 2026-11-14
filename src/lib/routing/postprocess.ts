@@ -1,6 +1,9 @@
 /**
- * Path post-processing — collapses the raw A* cell chain into the
- * "mall map" polyline the caller wants.
+ * Path post-processing helpers. The default route shape now comes from
+ * `orthogonal.ts` (right angles along the building, door centres,
+ * corridor middles); the passes below are the `pathStyle: 'any-angle'`
+ * pipeline and shared helpers (`lineOfSight`, `collapseCollinear`, the
+ * lng/lat conversions).
  *
  * The A* output has one waypoint per grid cell along the route — for
  * a 20 m walk at 25 cm resolution that's 80 vertices. Two passes clean
@@ -44,7 +47,7 @@ import { cellToLl, isBlocked } from './occupancy-grid.ts'
  * visually enters is checked, so a shortcut can never sneak the
  * path through an obstacle.
  */
-function lineOfSight(
+export function lineOfSight(
   grid: CompiledGrid,
   ax: number,
   ay: number,

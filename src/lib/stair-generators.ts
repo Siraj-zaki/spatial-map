@@ -25,9 +25,9 @@
  */
 
 import type { Feature, FeatureCollection, Point, Polygon } from 'geojson'
-import { polygon as turfPolygon, transformRotate } from '@turf/turf'
+import { point as turfPoint, polygon as turfPolygon, transformRotate } from '@turf/turf'
 import { isLiftType, type StairShape, type StairShapeConfig, type StairType } from './shapes'
-import { placeMesh, type LiftMeshData } from './lift-mesh-layer'
+import { placeMesh, type LiftMeshData } from './lift-mesh'
 import { buildStairMesh, type StairMeshPlan } from './stair-mesh'
 import {
   type LiftPart,
@@ -614,6 +614,67 @@ export function stairToFeatureCollection(
 ): FeatureCollection<Polygon, StairFeatureProps> {
   const fc = buildStairFeatures(shape.vertices, shape.config, shape.id, options)
   return rotateStairFeatures(fc, shape.rotation ?? 0, liftPivot(shape))
+}
+
+/** One straight piece of a walk up a stair, at one height. */
+export interface StairWalkRun {
+  coordinates: [number, number][]
+  /** Metres above sea level: the tread / landing top it lies on. */
+  z: number
+}
+
+/**
+ * The line a person walks up a straight / L / U stair, as one piece per
+ * tread at that tread's top (base + (k + 1) × riser — the same sawtooth
+ * the steps are drawn with) plus the walk across the landing, from the
+ * foot of the first flight to the top of the last. Down the middle of
+ * each flight; turned with the stair like its steps. A route drawn from
+ * these climbs the steps instead of jumping between floors. Empty for
+ * lifts / escalators or fewer than 2 vertices.
+ */
+export function stairWalkRuns(shape: StairShape): StairWalkRun[] {
+  const config = shape.config
+  if (isLiftType(asStairType(config.stairType))) return []
+  const layout = stairLayout(shape.vertices, config)
+  if (!layout) return []
+  const at = (fr: FlightFrame, fwd: number, side: number): [number, number] => [
+    fr.start[0] + metersToLngDelta(fwd * fr.ux + side * fr.px, fr.midLat),
+    fr.start[1] + metersToLatDelta(fwd * fr.uy + side * fr.py),
+  ]
+  /** A point in a frame's own (forward, side) metres. */
+  const inFrame = (fr: FlightFrame, p: [number, number]): [number, number] => {
+    const e = (p[0] - fr.start[0]) / metersToLngDelta(1, fr.midLat)
+    const n = (p[1] - fr.start[1]) / metersToLatDelta(1)
+    return [e * fr.ux + n * fr.uy, e * fr.px + n * fr.py]
+  }
+  const runs: StairWalkRun[] = []
+  let prevEnd: [number, number] | null = null
+  layout.flights.forEach((fl, i) => {
+    const start = at(fl.frame, 0, 0)
+    if (i > 0 && prevEnd && layout.landing) {
+      // Across the landing: into its middle, along it, onto the next flight.
+      const L = layout.landing
+      const mid = (L.f[0] + L.f[1]) / 2
+      const a = inFrame(L.frame, prevEnd)
+      const b = inFrame(L.frame, start)
+      runs.push({ coordinates: [prevEnd, at(L.frame, mid, a[1]), at(L.frame, mid, b[1]), start], z: L.top })
+    }
+    for (let k = 0; k < fl.steps; k++) {
+      runs.push({
+        coordinates: [at(fl.frame, k * fl.tread, 0), at(fl.frame, (k + 1) * fl.tread, 0)],
+        z: fl.base + (k + 1) * layout.riser,
+      })
+    }
+    prevEnd = at(fl.frame, fl.steps * fl.tread, 0)
+  })
+  const deg = shape.rotation ?? 0
+  if (Math.abs(deg) < 1e-6) return runs
+  // Same pivot the drawn steps turn about.
+  const pivot = liftPivot(shape) ?? stairCentroid(buildStairFeatures(shape.vertices, config, shape.id))
+  if (!pivot) return runs
+  const turn = (c: [number, number]): [number, number] =>
+    transformRotate(turfPoint(c), deg, { pivot }).geometry.coordinates as [number, number]
+  return runs.map((r) => ({ ...r, coordinates: r.coordinates.map(turn) }))
 }
 
 export interface LiftIconProps {

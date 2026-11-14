@@ -34,6 +34,8 @@ import {
 } from '@/lib/input-limits'
 import { BulkSliderRow, SliderRow } from '@/components/ui/slider-row'
 import { Switch } from '@/components/ui/switch'
+import { isPathGrid, pathGridDimensions } from '@/lib/grid-path'
+import { isClosedLoop } from '@/lib/sloped-mesh'
 import { TextField } from '@/components/ui/text-field'
 import { VirtualList } from '@/components/ui/virtual-list'
 import { useSpatialBins } from '@/hooks/useSpatialShapes'
@@ -53,9 +55,16 @@ import {
   scaleImageBbox,
 } from '@/lib/image-generators'
 import { urlForImage, rewriteFilesUrlSameOrigin } from '@/lib/binary-store'
+import { ImageCenterInputs } from '@/components/measure/calibrate-panel'
+import { recenterImageBbox } from '@/lib/measure/calibration'
 import { lineLengthMeters } from '@/lib/line-generators'
 import { useModelAssets } from '@/lib/model-assets'
-import { DEFAULT_RAILING_COLOR, ROUTE_TYPE_COLORS, isLiftType } from '@/lib/shapes'
+import {
+  DEFAULT_RAILING_COLOR,
+  ROUTE_TYPE_COLORS,
+  isLiftType,
+  solidConfigPatch,
+} from '@/lib/shapes'
 import { MarkerIconGlyph } from '@/lib/marker-icons'
 import { MarkerIconPicker } from '@/components/marker-icon-picker'
 import type {
@@ -115,6 +124,8 @@ import {
   Download,
   Eye,
   EyeOff,
+  Shapes,
+  SquareDashed,
   FileText,
   Footprints,
   Frame,
@@ -149,6 +160,7 @@ import {
   Settings2,
   Sparkles,
   Spline,
+  RectangleHorizontal,
   Tag,
   Trash2,
   Triangle,
@@ -161,6 +173,7 @@ import {
   X,
 } from 'lucide-react'
 import { ImageLibraryDialog, ImageLibraryPicker, LibrarySourceTabs, UploadDropzone } from '@/components/upload-library'
+import { BlankFloorPicker } from '@/components/blank-floor-picker'
 import { useImageLibrary, type LibraryImage } from '@/lib/upload-library'
 import {
   createContext,
@@ -253,6 +266,19 @@ export type SidePanelMode =
   | 'magic-wall'
   | 'ai-map'
   | 'cross-kind-bulk'
+
+/** Kinds whose saved list has the bulk hide / delete toolbar. */
+export type SavedListKind =
+  | 'grid'
+  | 'marker'
+  | 'circle'
+  | 'polygon'
+  | 'line'
+  | 'route'
+  | 'model'
+  | 'imagePlane'
+  | 'stair'
+  | 'textLabel'
 
 export interface SidePanelActions {
   onRedraw?: (id: number) => void
@@ -401,6 +427,8 @@ export interface SidePanelActions {
   onSelectRoute?: (id: number, additive: boolean) => void
   onFitToRouteById?: (id: number) => void
   onDeleteRouteById?: (id: number) => void
+  /** Hide / show many shapes of one kind at once (the saved lists' bulk toolbar). */
+  onBulkSetVisible?: (kind: SavedListKind, ids: number[], visible: boolean) => void
   onRenameRoute?: (id: number, name: string) => void
   onExitRoutePlacement?: () => void
   onCancelLineTransform?: () => void
@@ -467,6 +495,8 @@ export interface SidePanelActions {
   onStartMoveImage?: (id: number) => void
   onStartRotateImage?: (id: number) => void
   onStartScaleImage?: (id: number) => void
+  /** Enter the calibrate-scale tool for this image (marks rooms / lengths). */
+  onStartCalibrateImage?: (id: number) => void
   onCancelImageTransform?: () => void
   imageTransformActive?: boolean
   imageTransformKind?: 'move' | 'rotate' | 'scale' | null
@@ -488,6 +518,12 @@ export interface SidePanelActions {
    * floor while drawing on a higher floor without removing data.
    */
   onToggleImageVisible?: (id: number, visible: boolean) => void
+  /**
+   * Floors whose shapes are switched off while the floor-plan image stays
+   * visible (session only) — for using a floor as a clean reference.
+   */
+  floorShapesHiddenIds?: ReadonlySet<number>
+  onToggleFloorShapesVisible?: (id: number, visible: boolean) => void
   /**
    * Persist a new floor-plan order (top → bottom). The first entry
    * becomes the "default" floor plan the viewer opens on when no
@@ -1156,6 +1192,7 @@ export function SidePanel({
   onLineConfigChange,
   onLinePatch,
   lineDraftVertexCount = 0,
+  routes,
   selectedRoute,
   selectedRouteIds,
   routeConfig,
@@ -1485,7 +1522,9 @@ export function SidePanel({
     )
     headerSubtitle = (
       <span className="text-xs leading-tight text-muted-foreground">
-        {hasDrawLine ? t('sidePanel.drawHintCommit') : t('sidePanel.drawHint')}
+        {config.type === 'square' && config.layout === 'path'
+          ? t('sidePanel.drawHintPath')
+          : hasDrawLine ? t('sidePanel.drawHintCommit') : t('sidePanel.drawHint')}
       </span>
     )
   } else if (mode === 'grid-selected' && selectedGrid) {
@@ -2329,6 +2368,11 @@ export function SidePanel({
                 selectedLineIds={selectedLineIds}
                 actions={actions}
               />
+              <SavedRoutesContent
+                routes={routes}
+                selectedRouteIds={selectedRouteIds}
+                actions={actions}
+              />
               <SavedImagesContent
                 images={images}
                 selectedImageIds={selectedImageIds}
@@ -2978,7 +3022,9 @@ function cellCountLabel(grid: Grid): string {
  *
  * Marker occlusion is the odd one out: it defaults to ON and costs
  * nothing on the GPU. It's here because it's the other knob that changes
- * how the 3D scene reads.
+ * how the 3D scene reads. Occlusion ghosts (focus mode, default OFF) is
+ * its companion: occluded markers / labels / live-data symbols stay at
+ * ~25 % and clickable instead of vanishing.
  */
 function GraphicsSection() {
   const { t } = useTranslation()
@@ -2988,6 +3034,8 @@ function GraphicsSection() {
   const setShadows = useGraphicsSettings((s) => s.setShadows)
   const setAmbientOcclusion = useGraphicsSettings((s) => s.setAmbientOcclusion)
   const setMarkerOcclusion = useGraphicsSettings((s) => s.setMarkerOcclusion)
+  const occlusionGhosts = useGraphicsSettings((s) => s.occlusionGhosts)
+  const setOcclusionGhosts = useGraphicsSettings((s) => s.setOcclusionGhosts)
   const liftIcons = useGraphicsSettings((s) => s.liftIcons)
   const setLiftIcons = useGraphicsSettings((s) => s.setLiftIcons)
   const floorBase = useGraphicsSettings((s) => s.floorBase)
@@ -3051,6 +3099,28 @@ function GraphicsSection() {
             onCheckedChange={setMarkerOcclusion}
             aria-label={t('sidePanel.graphicsMarkerOcclusion', {
               defaultValue: 'Hide markers under floors',
+            })}
+          />
+        </div>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="text-xs font-medium">
+              {t('sidePanel.graphicsOcclusionGhosts', {
+                defaultValue: 'Show hidden items as faint ghosts',
+              })}
+            </div>
+            <div className="text-[10px] text-muted-foreground leading-tight">
+              {t('sidePanel.graphicsOcclusionGhostsHint', {
+                defaultValue:
+                  'Markers, labels and live data hidden behind floors or walls stay faintly visible. Click one to show it.',
+              })}
+            </div>
+          </div>
+          <Switch
+            checked={occlusionGhosts}
+            onCheckedChange={setOcclusionGhosts}
+            aria-label={t('sidePanel.graphicsOcclusionGhosts', {
+              defaultValue: 'Show hidden items as faint ghosts',
             })}
           />
         </div>
@@ -3230,6 +3300,130 @@ function LayersSection({
  * the pencil icon can fade in on row hover.
  */
 /**
+ * Checked rows of a saved list. Local to the list: a map selection would
+ * switch the sidebar to that shape's editor and hide the list itself.
+ */
+function useCheckedIds() {
+  const [checked, setChecked] = useState<ReadonlySet<number>>(() => new Set())
+  const toggle = useCallback((id: number) => {
+    setChecked((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+  return { checked, setChecked, toggle }
+}
+
+/** Per-row checkbox of a saved list. */
+function RowCheck({ checked, onChange }: { checked: boolean; onChange: () => void }) {
+  const { t } = useTranslation()
+  return (
+    <input
+      type="checkbox"
+      checked={checked}
+      onChange={onChange}
+      onClick={(e) => e.stopPropagation()}
+      className="w-3.5 h-3.5 flex-shrink-0 cursor-pointer accent-primary"
+      aria-label={t('sidePanel.bulkSelectRow', { defaultValue: 'Select' })}
+    />
+  )
+}
+
+/**
+ * Bulk bar above a saved list: select all, hide / show and delete — for the
+ * checked rows, or for the whole list while none is checked. Hiding and
+ * deleting reuse each kind's own callbacks, so cascades and undo behave as
+ * for a single row.
+ */
+function SavedListToolbar({
+  items,
+  checked,
+  setChecked,
+  onSetVisible,
+  onDelete,
+}: {
+  items: ReadonlyArray<{ id: number; visible: boolean }>
+  checked: ReadonlySet<number>
+  setChecked: (next: ReadonlySet<number>) => void
+  onSetVisible: (ids: number[], visible: boolean) => void
+  onDelete: (ids: number[]) => void
+}) {
+  const { t } = useTranslation()
+  // The count the delete was armed for: changing the selection disarms it.
+  const [armedFor, setArmedFor] = useState<number | null>(null)
+  const picked = items.filter((i) => checked.has(i.id))
+  const confirm = armedFor !== null && armedFor === picked.length
+  useEffect(() => {
+    if (armedFor === null) return
+    const timer = setTimeout(() => setArmedFor(null), 3000)
+    return () => clearTimeout(timer)
+  }, [armedFor])
+  if (items.length < 2) return null
+  const hasPick = picked.length > 0
+  const targets = hasPick ? picked : items
+  const hide = targets.some((i) => i.visible)
+  const allChecked = picked.length === items.length
+  const eyeLabel = hasPick
+    ? hide
+      ? t('sidePanel.bulkHideSelected', { defaultValue: 'Hide selected' })
+      : t('sidePanel.bulkShowSelected', { defaultValue: 'Show selected' })
+    : hide
+      ? t('sidePanel.bulkHideAll', { defaultValue: 'Hide all' })
+      : t('sidePanel.bulkShowAll', { defaultValue: 'Show all' })
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded border border-border/60 bg-muted/30 px-2 py-1">
+      <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground cursor-pointer select-none">
+        <input
+          type="checkbox"
+          className="w-3.5 h-3.5 cursor-pointer accent-primary"
+          checked={allChecked}
+          ref={(el) => {
+            if (el) el.indeterminate = hasPick && !allChecked
+          }}
+          onChange={() => setChecked(allChecked ? new Set() : new Set(items.map((i) => i.id)))}
+          aria-label={t('sidePanel.bulkSelectAll', { defaultValue: 'Select all' })}
+        />
+        {hasPick
+          ? t('sidePanel.bulkSelected', { defaultValue: '{{count}} selected', count: picked.length })
+          : t('sidePanel.bulkItems', { defaultValue: '{{count}} items', count: items.length })}
+      </label>
+      <span className="flex-1" />
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 px-1.5 text-[11px]"
+        onClick={() => onSetVisible(targets.map((i) => i.id), !hide)}
+        title={eyeLabel}
+      >
+        {hide ? <EyeOff className="w-3 h-3 me-1" /> : <Eye className="w-3 h-3 me-1" />}
+        {eyeLabel}
+      </Button>
+      {hasPick && (
+        <Button
+          variant={confirm ? 'destructive' : 'ghost'}
+          size="sm"
+          className="h-6 px-1.5 text-[11px]"
+          onClick={() => {
+            if (!confirm) return setArmedFor(picked.length)
+            onDelete(picked.map((i) => i.id))
+            setChecked(new Set())
+            setArmedFor(null)
+          }}
+          title={t('sidePanel.delete')}
+        >
+          <Trash2 className="w-3 h-3 me-1" />
+          {confirm
+            ? t('sidePanel.bulkDeleteConfirm', { defaultValue: 'Confirm: delete {{count}}', count: picked.length })
+            : t('sidePanel.bulkDelete', { defaultValue: 'Delete {{count}}', count: picked.length })}
+        </Button>
+      )}
+    </div>
+  )
+}
+
+/**
  * Eye-icon button used by every per-shape row to flip the row's
  * `visible` flag. Shared so the saved-polygons / -circles / -lines /
  * -stairs / -markers / -models / -text-labels lists all render the
@@ -3378,6 +3572,7 @@ function SavedGridsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (grids ?? []).filter((g) => matchesWorkspaceQuery(g.name, query))
   // Hide the whole section when the active query matches no items —
   // mirrors the original "empty list → return null" behaviour but
@@ -3391,6 +3586,13 @@ function SavedGridsContent({
   }
   return (
     <Section title={t('sidePanel.savedGridsTitle')} icon={Grid3X3}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('grid', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteGridById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(g) => g.id!}
@@ -3405,6 +3607,7 @@ function SavedGridsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <span
                 className="flex-shrink-0 w-3 h-3 border rounded"
                 style={{ backgroundColor: g.config.color }}
@@ -3474,6 +3677,7 @@ function SavedMarkersContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (markers ?? []).filter((m) => matchesWorkspaceQuery(m.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -3481,6 +3685,13 @@ function SavedMarkersContent({
   }
   return (
     <Section title={t('sidePanel.savedMarkersTitle')} icon={MapPin}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('marker', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteMarkerById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(m) => m.id!}
@@ -3495,6 +3706,7 @@ function SavedMarkersContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <MarkerIconGlyph
                 icon={m.config.icon}
                 className="w-3.5 h-3.5 flex-shrink-0"
@@ -3968,6 +4180,7 @@ function SavedCirclesContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (circles ?? []).filter((c) => matchesWorkspaceQuery(c.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -3975,6 +4188,13 @@ function SavedCirclesContent({
   }
   return (
     <Section title={t('sidePanel.savedCirclesTitle')} icon={Circle}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('circle', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteCircleById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(c) => c.id!}
@@ -3997,6 +4217,7 @@ function SavedCirclesContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <span
                 className="flex-shrink-0 w-3 h-3 border-2 rounded-full"
                 style={{
@@ -4168,22 +4389,40 @@ function CirclePropertiesForm({
               step={0.1}
             />
           </div>
+          {config.height > 0 && <TopShapeControls config={config} onChange={onChange} />}
           <div className="flex items-center justify-between gap-2 pt-1 border-t">
             <div className="min-w-0">
-              <Label className="text-xs">
-                {t('sidePanel.receiveShadows', { defaultValue: 'Receive shadows' })}
-              </Label>
+              <Label className="text-xs">{t('sidePanel.solidObject')}</Label>
               <p className="text-[10px] text-muted-foreground leading-tight">
-                {t('sidePanel.receiveShadowsHint', {
-                  defaultValue: 'Let shadows from taller shapes darken this surface. Enable on floor slabs. May darken at low zoom.',
-                })}
+                {t('sidePanel.solidObjectHint')}
               </p>
             </div>
             <Switch
-              checked={config.receiveShadows ?? true}
-              onCheckedChange={(v) => update('receiveShadows', v)}
+              checked={config.solid ?? false}
+              onCheckedChange={(v) => onChange({ ...config, ...solidConfigPatch(config, v) })}
+              aria-label={t('sidePanel.solidObject')}
             />
           </div>
+          {/* A solid is sun-lit, so it always takes shadows — the toggle
+              only means something for zones. */}
+          {!config.solid && (
+            <div className="flex items-center justify-between gap-2 pt-1 border-t">
+              <div className="min-w-0">
+                <Label className="text-xs">
+                  {t('sidePanel.receiveShadows', { defaultValue: 'Receive shadows' })}
+                </Label>
+                <p className="text-[10px] text-muted-foreground leading-tight">
+                  {t('sidePanel.receiveShadowsHint', {
+                    defaultValue: 'Let shadows from taller shapes darken this surface. Enable on floor slabs. May darken at low zoom.',
+                  })}
+                </p>
+              </div>
+              <Switch
+                checked={config.receiveShadows ?? true}
+                onCheckedChange={(v) => update('receiveShadows', v)}
+              />
+            </div>
+          )}
         </div>
       </Section>
 
@@ -4638,6 +4877,7 @@ function SavedPolygonsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (polygons ?? []).filter((p) => matchesWorkspaceQuery(p.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -4645,6 +4885,13 @@ function SavedPolygonsContent({
   }
   return (
     <Section title={t('sidePanel.savedPolygonsTitle')} icon={Pentagon}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('polygon', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeletePolygonById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(p) => p.id!}
@@ -4659,6 +4906,7 @@ function SavedPolygonsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <span
                 className="flex-shrink-0 w-3 h-3 border-2 rounded-sm"
                 style={{
@@ -5291,6 +5539,7 @@ function SavedLinesContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (lines ?? []).filter((l) => matchesWorkspaceQuery(l.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -5298,6 +5547,13 @@ function SavedLinesContent({
   }
   return (
     <Section title={t('sidePanel.savedLinesTitle')} icon={Spline}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('line', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteLineById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(ln) => ln.id!}
@@ -5314,6 +5570,7 @@ function SavedLinesContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <span
                 className="w-4 h-1.5 rounded-sm flex-shrink-0"
                 style={{ backgroundColor: ln.config.color }}
@@ -5378,16 +5635,159 @@ function SavedLinesContent({
   )
 }
 
+// ---- Small segmented choice (sloped walls / tapered tops) -----------------
+
+function ChoiceButtons<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+}: {
+  value: T
+  options: ReadonlyArray<{ value: T; label: string }>
+  onChange: (next: T) => void
+  label: string
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-xs">{label}</Label>
+      <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}>
+        {options.map((o) => (
+          <button
+            key={o.value}
+            type="button"
+            aria-pressed={value === o.value}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              'py-1.5 rounded-md border text-xs transition-colors',
+              value === o.value
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-border hover:bg-accent'
+            )}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Lean controls for a wall (sloped-mesh.ts). `closedLoop` switches the side
+ * choice to Inward / Outward.
+ */
+function WallLeanControls({
+  config,
+  unit,
+  closedLoop,
+  onChange,
+}: {
+  config: LineShapeConfig
+  unit: LengthUnit
+  closedLoop: boolean
+  onChange: (next: LineShapeConfig) => void
+}) {
+  const { t } = useTranslation()
+  const lean = config.lean ?? 0
+  const rawSide = config.leanSide ?? (closedLoop ? 'in' : 'left')
+  // On an open line, in / out read as left / right (sloped-mesh.ts leanSign).
+  const side = closedLoop ? rawSide : rawSide === 'in' ? 'left' : rawSide === 'out' ? 'right' : rawSide
+  const sides: Array<'left' | 'right' | 'in' | 'out'> = closedLoop ? ['in', 'out', 'left', 'right'] : ['left', 'right']
+  return (
+    <div className="space-y-3 pt-1 border-t">
+      <div className="space-y-1.5">
+        <Label className="flex items-center justify-between text-xs">
+          <span>{t('sidePanel.wallLean')}</span>
+          <span className="font-mono text-muted-foreground">
+            {lean === 0 ? t('sidePanel.wallLeanNone') : formatLength(lean, unit)}
+          </span>
+        </Label>
+        <NumberInput
+          value={lean}
+          unit={unit}
+          min={0}
+          max={LIMIT_ELEVATION_M}
+          onChange={(meters) => onChange({ ...config, lean: Math.max(0, meters) })}
+          ariaLabel={t('sidePanel.wallLean')}
+        />
+        <StretchSlider
+          value={lean}
+          onValueChange={(v) => onChange({ ...config, lean: Math.max(0, v) })}
+          min={0}
+          max={30}
+          limitMax={LIMIT_ELEVATION_M}
+          step={0.1}
+        />
+        <p className="text-[10px] text-muted-foreground leading-tight">{t('sidePanel.wallLeanHint')}</p>
+      </div>
+      {lean > 0 && (
+        <>
+          <ChoiceButtons
+            label={t('sidePanel.wallLeanProfile')}
+            value={config.leanProfile ?? 'curved'}
+            options={(['curved', 'straight'] as const).map((v) => ({ value: v, label: t(`sidePanel.wallLeanProfile_${v}`) }))}
+            onChange={(v) => onChange({ ...config, leanProfile: v })}
+          />
+          <ChoiceButtons
+            label={t('sidePanel.wallLeanSide')}
+            value={side}
+            options={sides.map((v) => ({ value: v, label: t(`sidePanel.wallLeanSide_${v}`) }))}
+            onChange={(v) => onChange({ ...config, leanSide: v })}
+          />
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Top-shape controls for an area / circle (sloped-mesh.ts). */
+function TopShapeControls({
+  config,
+  onChange,
+}: {
+  config: FillShapeConfig
+  onChange: (next: FillShapeConfig) => void
+}) {
+  const { t } = useTranslation()
+  const top = config.topShape ?? 'flat'
+  return (
+    <div className="space-y-3 pt-1 border-t">
+      <ChoiceButtons
+        label={t('sidePanel.topShape')}
+        value={top}
+        options={(['flat', 'taper', 'dome'] as const).map((v) => ({ value: v, label: t(`sidePanel.topShape_${v}`) }))}
+        onChange={(v) => onChange({ ...config, topShape: v })}
+      />
+      {top !== 'flat' && (
+        <SliderRow
+          label={t('sidePanel.topScale')}
+          value={config.topScale ?? 0}
+          onChange={(v) => onChange({ ...config, topScale: Math.max(0, Math.min(100, v)) })}
+          min={0}
+          max={100}
+          step={1}
+          suffix="%"
+        />
+      )}
+      <p className="text-[10px] text-muted-foreground leading-tight">{t('sidePanel.topShapeHint')}</p>
+    </div>
+  )
+}
+
 // ---- Line properties form (shared between placement + selected) ----------
 
 function LinePropertiesForm({
   config,
   unit,
   onChange,
+  closedLoop = false,
 }: {
   config: LineShapeConfig
   unit: LengthUnit
   onChange: (next: LineShapeConfig) => void
+  /** The line's ends meet — lean side reads Inward / Outward. */
+  closedLoop?: boolean
 }) {
   const { t } = useTranslation()
   const update = <K extends keyof LineShapeConfig>(
@@ -5546,6 +5946,9 @@ function LinePropertiesForm({
                 step={0.05}
               />
             </div>
+          )}
+          {config.height > 0 && (
+            <WallLeanControls config={config} unit={unit} closedLoop={closedLoop} onChange={onChange} />
           )}
         </div>
       </Section>
@@ -6511,6 +6914,7 @@ function LineSelectedContent({
         config={line.config}
         unit={line.unit}
         onChange={onConfigChange}
+        closedLoop={isClosedLoop(line.vertices)}
       />
     </>
   )
@@ -6942,6 +7346,31 @@ function SavedImagesContent({
                   <Eye className="w-3 h-3" />
                 )}
               </Button>
+              {/*
+                Shapes toggle: hides everything drawn on this floor but keeps
+                the floor-plan image, so it can serve as a clean reference
+                (aligning another floor, tracing). View-only, not saved.
+              */}
+              {(() => {
+                const shapesHidden = actions?.floorShapesHiddenIds?.has(id) ?? false
+                const label = shapesHidden
+                  ? t('sidePanel.floorShapesShow', { defaultValue: 'Show shapes on this floor' })
+                  : t('sidePanel.floorShapesHide', { defaultValue: 'Hide shapes on this floor (keep the plan)' })
+                return (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn('h-6 w-6', shapesHidden && 'text-primary bg-primary/10')}
+                    disabled={img.visible === false}
+                    onClick={() => actions?.onToggleFloorShapesVisible?.(id, shapesHidden)}
+                    title={label}
+                    aria-label={label}
+                    aria-pressed={shapesHidden}
+                  >
+                    {shapesHidden ? <SquareDashed className="w-3 h-3" /> : <Shapes className="w-3 h-3" />}
+                  </Button>
+                )
+              })()}
               <Button
                 variant="ghost"
                 size="icon"
@@ -7016,6 +7445,7 @@ function SavedModelsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (models ?? []).filter((m) => matchesWorkspaceQuery(m.name, query))
   const assets = useModelAssets()
   const assetLabelById = useMemo(() => {
@@ -7032,6 +7462,13 @@ function SavedModelsContent({
       title={t('sidePanel.savedModelsTitle', { defaultValue: '3D models' })}
       icon={Box}
     >
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('model', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteModelById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(m) => m.id!}
@@ -7048,6 +7485,7 @@ function SavedModelsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <Box
                 className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground"
                 aria-hidden="true"
@@ -7132,6 +7570,7 @@ function SavedImagePlanesContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (imagePlanes ?? []).filter((p) => matchesWorkspaceQuery(p.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -7142,6 +7581,13 @@ function SavedImagePlanesContent({
       title={t('sidePanel.savedImagePlanesTitle', { defaultValue: 'Image planes' })}
       icon={Frame}
     >
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('imagePlane', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteImagePlaneById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(p) => p.id!}
@@ -7156,6 +7602,7 @@ function SavedImagePlanesContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30'
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               {p.imageUrl ? (
                 <img
                   src={p.imageUrl}
@@ -7248,6 +7695,7 @@ function SavedStairsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (stairs ?? []).filter((s) => matchesWorkspaceQuery(s.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -7258,6 +7706,13 @@ function SavedStairsContent({
       title={t('sidePanel.savedStairsTitle', { defaultValue: 'Stairs' })}
       icon={Footprints}
     >
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('stair', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteStairById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(s) => s.id!}
@@ -7273,6 +7728,7 @@ function SavedStairsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30',
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <Footprints
                 className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground"
                 aria-hidden="true"
@@ -7918,6 +8374,7 @@ function SavedDoorsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (doors ?? []).filter((d) => matchesWorkspaceQuery(d.name, query))
   if (list.length === 0) return null
   const onSelect = (id: number, e: React.MouseEvent) => {
@@ -7928,6 +8385,13 @@ function SavedDoorsContent({
       title={t('sidePanel.savedDoorsTitle', { defaultValue: 'Doors' })}
       icon={DoorOpen}
     >
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => ids.forEach((id) => actions?.onSetDoorVisible?.(id, next))}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteDoorById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(d) => d.id}
@@ -7956,6 +8420,7 @@ function SavedDoorsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30',
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               <DoorOpen
                 className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground"
                 aria-hidden="true"
@@ -8342,7 +8807,8 @@ function ImageUploadBox({
   const { t } = useTranslation()
   const library = useImageLibrary()
   // Open on the library once the workspace has uploads to reuse.
-  const [source, setSource] = useState<'library' | 'upload' | null>(null)
+  // `blank` places a plain sheet for a floor that has no drawing.
+  const [source, setSource] = useState<'library' | 'upload' | 'blank' | null>(null)
   const resolvedSource = source ?? ((library.data?.length ?? 0) > 0 ? 'library' : 'upload')
   return (
     <div className="space-y-2">
@@ -8422,8 +8888,10 @@ function ImageUploadBox({
         </div>
       ) : (
         <>
-          <LibrarySourceTabs value={resolvedSource} onChange={setSource} />
-          {resolvedSource === 'library' ? (
+          <LibrarySourceTabs value={resolvedSource} onChange={setSource} tabs={['library', 'upload', 'blank']} />
+          {resolvedSource === 'blank' ? (
+            <BlankFloorPicker onPick={onPickFile} />
+          ) : resolvedSource === 'library' ? (
             <ImageLibraryPicker
               zoneId={zoneId}
               selectedKey={null}
@@ -8633,6 +9101,18 @@ function ImageSelectedContent({
               {t('sidePanel.fit')}
             </Button>
           </div>
+          {actions?.onStartCalibrateImage && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => actions.onStartCalibrateImage?.(image.id!)}
+              title={t('measure.cal.startTitle')}
+            >
+              <Ruler className="w-3.5 h-3.5 me-1.5" />
+              {t('measure.cal.start')}
+            </Button>
+          )}
           {(isMoving || isRotating || isScaling) && (
             <p className="text-[11px] text-muted-foreground px-1">
               {isMoving
@@ -8805,24 +9285,11 @@ function ImageSelectedContent({
       {center && (
         <Section title={t('sidePanel.imagePosition')} icon={MapPin}>
           <div className="p-3 space-y-2 border border-border/60 rounded-lg bg-card/50 backdrop-blur-sm shadow-sm">
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                  {t('sidePanel.imageLat')}
-                </Label>
-                <div className="mt-1 font-mono text-xs">
-                  {center[1].toFixed(6)}
-                </div>
-              </div>
-              <div>
-                <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                  {t('sidePanel.imageLng')}
-                </Label>
-                <div className="mt-1 font-mono text-xs">
-                  {center[0].toFixed(6)}
-                </div>
-              </div>
-            </div>
+            <ImageCenterInputs
+              center={center}
+              onChange={(c) => onPatch?.(recenterImageBbox(image, c))}
+            />
+            <p className="text-[10px] text-muted-foreground">{t('measure.cal.centerHint')}</p>
           </div>
         </Section>
       )}
@@ -8874,6 +9341,7 @@ function BulkFillShapeContent({
   const elevation = sharedValue(shapes, (s) => s.config.elevation)
   const height = sharedValue(shapes, (s) => s.config.height)
   const receiveShadows = sharedValue(shapes, (s) => s.config.receiveShadows ?? true)
+  const solid = sharedValue(shapes, (s) => s.config.solid ?? false)
   const showLabels = sharedValue(shapes, (s) => s.config.showLabels)
   return (
     <>
@@ -8964,6 +9432,19 @@ function BulkFillShapeContent({
             step={0.1}
             suffix="m"
             onChange={(v) => onPatchAll?.({ height: v })}
+          />
+          {/* One patch for the whole selection: solidConfigPatch's
+              height default only applies when every shape is flat —
+              a mixed selection keeps its heights. */}
+          <BulkToggleRow
+            label={t('sidePanel.solidObject')}
+            value={solid.value ?? false}
+            isMixed={solid.isMixed}
+            onChange={(v) => {
+              const patch = solidConfigPatch({ height: height.value ?? 0 }, v)
+              if (height.isMixed) delete patch.height
+              onPatchAll?.(patch)
+            }}
           />
           <BulkToggleRow
             label={t('sidePanel.receiveShadows', { defaultValue: 'Receive shadows' })}
@@ -10305,6 +10786,120 @@ function ThreeDControls({
  * first time the user enables stacking, matching the existing UX where
  * height > 0 auto-lifts labels.
  */
+/**
+ * Path-layout controls for square grids (see grid-path.ts): the Rectangle /
+ * Along-a-path switch (draw-time form only), rows across, which side of the
+ * path the rows sit on, and the smooth-curve toggle. `dims` (selected grid
+ * only) shows the path length and the resulting cell counts.
+ */
+function PathLayoutControls({
+  config,
+  update,
+  showLayoutToggle,
+  dims,
+}: {
+  config: GridConfig
+  update: <K extends keyof GridConfig>(key: K, value: GridConfig[K]) => void
+  showLayoutToggle: boolean
+  dims?: { rows: number; cols: number; lengthM: number } | null
+}) {
+  const { t } = useTranslation()
+  const isPath = config.layout === 'path'
+  const rows = Math.max(1, Math.floor(config.pathRows ?? 1))
+  return (
+    <>
+      {showLayoutToggle && (
+        <div className="space-y-1.5">
+          <Label className="text-xs">{t('sidePanel.gridLayout')}</Label>
+          <div className="grid grid-cols-2 gap-1.5">
+            {([
+              ['bbox', RectangleHorizontal, 'sidePanel.gridLayoutRect'],
+              ['path', Spline, 'sidePanel.gridLayoutPath'],
+            ] as const).map(([id, Icon, key]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => update('layout', id)}
+                className={cn(
+                  'flex items-center justify-center gap-1.5 py-1.5 rounded-md border text-xs transition-colors',
+                  (config.layout ?? 'bbox') === id
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-border hover:bg-accent'
+                )}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {t(key)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {isPath && (
+        <>
+          <p className="text-[11px] text-muted-foreground">{t('sidePanel.pathHint')}</p>
+          {dims && (
+            <p className="text-[11px] font-mono text-muted-foreground">
+              {t('sidePanel.pathInfo', { length: formatLength(dims.lengthM, config.unit), cols: dims.cols, rows: dims.rows })}
+            </p>
+          )}
+          <SliderRow
+            label={t('sidePanel.pathRows')}
+            value={rows}
+            onChange={(v) => update('pathRows', Math.max(1, Math.min(50, Math.floor(v))))}
+            min={1}
+            max={20}
+            limitMax={50}
+            step={0.1}
+            decimals={0}
+          />
+          <SliderRow
+            label={t('sidePanel.pathRowRise')}
+            value={config.pathRowRise ?? 0}
+            onChange={(v) => update('pathRowRise', Math.max(0, Math.min(2, v)))}
+            min={0}
+            max={1}
+            limitMax={2}
+            step={0.01}
+            decimals={2}
+          />
+          <p className="text-[10px] text-muted-foreground -mt-1">{t('sidePanel.pathRowRiseHint')}</p>
+          <div className="space-y-1.5">
+            <Label className="text-xs">{t('sidePanel.pathSide')}</Label>
+            <div className="grid grid-cols-3 gap-1.5">
+              {([
+                ['left', 'sidePanel.pathSideLeft'],
+                ['center', 'sidePanel.pathSideCenter'],
+                ['right', 'sidePanel.pathSideRight'],
+              ] as const).map(([id, key]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => update('pathAlign', id)}
+                  className={cn(
+                    'py-1.5 rounded-md border text-xs transition-colors',
+                    (config.pathAlign ?? 'center') === id
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-border hover:bg-accent'
+                  )}
+                >
+                  {t(key)}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-start justify-between gap-3">
+            <div className="space-y-0.5">
+              <Label className="text-xs">{t('sidePanel.pathSmooth')}</Label>
+              <p className="text-[10px] text-muted-foreground">{t('sidePanel.pathSmoothHint')}</p>
+            </div>
+            <Switch checked={!!config.pathSmooth} onCheckedChange={(v) => update('pathSmooth', v)} aria-label={t('sidePanel.pathSmooth')} />
+          </div>
+        </>
+      )}
+    </>
+  )
+}
+
 function VerticalControls({
   config,
   update,
@@ -10476,7 +11071,9 @@ function DefaultConfigContent({
           </Button>
           {drawMode ? (
             <p className="text-[11px] text-muted-foreground">
-              {hasDrawLine ? t('sidePanel.drawHintCommit') : t('sidePanel.drawHint')}
+              {config.type === 'square' && config.layout === 'path'
+                ? t('sidePanel.drawHintPath')
+                : hasDrawLine ? t('sidePanel.drawHintCommit') : t('sidePanel.drawHint')}
             </p>
           ) : (
             <p className="text-[11px] text-muted-foreground">
@@ -10509,6 +11106,9 @@ function DefaultConfigContent({
               )
             })}
           </div>
+          {config.type === 'square' && (
+            <PathLayoutControls config={config} update={update} showLayoutToggle />
+          )}
           {config.type === 'hexagon' && (
             <div className="grid grid-cols-2 gap-1.5">
               {(['pointy', 'flat'] as HexOrientation[]).map((o) => (
@@ -10582,6 +11182,7 @@ function DefaultConfigContent({
               ariaLabel={t('sidePanel.cellGap')}
             />
           </div>
+          {!(config.type === 'square' && config.layout === 'path') && (
           <div className="space-y-2">
             <SliderRow
               label={
@@ -10613,6 +11214,7 @@ function DefaultConfigContent({
               <span>+180°</span>
             </div>
           </div>
+          )}
         </div>
       </Section>
 
@@ -11165,6 +11767,19 @@ function SelectedGridContent({
         </div>
       </Section>
 
+      {config.type === 'square' && isPathGrid(config) && (
+        <Section title={t('sidePanel.sectionPath')} icon={Spline}>
+          <div className="p-3 space-y-3 border border-border/60 rounded-lg bg-card/50 backdrop-blur-sm shadow-sm">
+            <PathLayoutControls
+              config={config}
+              update={update}
+              showLayoutToggle={false}
+              dims={pathGridDimensions(grid.start, grid.current, config)}
+            />
+          </div>
+        </Section>
+      )}
+
       <Section title={t('sidePanel.section3D')} icon={Box}>
         <div className="p-3 space-y-3 border border-border/60 rounded-lg bg-card/50 backdrop-blur-sm shadow-sm">
           <ThreeDControls config={config} update={update} t={t} />
@@ -11405,6 +12020,7 @@ function SavedTextLabelsContent({
   const { t } = useTranslation()
   const query = useWorkspaceQuery()
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
   const list = (textLabels ?? []).filter((l) =>
     matchesWorkspaceQuery(l.name, query),
   )
@@ -11414,6 +12030,13 @@ function SavedTextLabelsContent({
   }
   return (
     <Section title={t('sidePanel.savedTextLabelsTitle', { defaultValue: 'Saved text labels' })} icon={Type}>
+      <SavedListToolbar
+        items={list.map((x) => ({ id: x.id!, visible: x.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('textLabel', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteTextLabelById?.(id))}
+      />
       <VirtualList
         items={list}
         keyFor={(l) => l.id!}
@@ -11432,6 +12055,7 @@ function SavedTextLabelsContent({
                 isSelected && 'ring-1 ring-primary bg-accent/30',
               )}
             >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
               {/* A small letter swatch tinted with the label's color —
                   parallel to the colored circle the SavedCirclesContent
                   uses, but more legible for text shapes. */}
@@ -12446,5 +13070,108 @@ function ImagePlaneSliderField({
         }}
       />
     </div>
+  )
+}
+
+/**
+ * List of every saved route — drawn routes used to be selectable only by
+ * clicking them on the map. Same row shape as the other saved lists: select
+ * + fit, rename, eye, delete, plus the bulk toolbar.
+ */
+function SavedRoutesContent({
+  routes,
+  selectedRouteIds,
+  actions,
+}: {
+  routes?: ReadonlyArray<RouteShape>
+  selectedRouteIds?: ReadonlySet<number>
+  actions?: SidePanelActions
+}) {
+  const { t } = useTranslation()
+  const query = useWorkspaceQuery()
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const { checked, setChecked, toggle: toggleChecked } = useCheckedIds()
+  const list = (routes ?? []).filter((r) => matchesWorkspaceQuery(r.name, query))
+  if (list.length === 0) return null
+  return (
+    <Section title={t('sidePanel.savedRoutesTitle', { defaultValue: 'Saved routes' })} icon={Route}>
+      <SavedListToolbar
+        items={list.map((r) => ({ id: r.id!, visible: r.visible !== false }))}
+        checked={checked}
+        setChecked={setChecked}
+        onSetVisible={(ids, next) => actions?.onBulkSetVisible?.('route', ids, next)}
+        onDelete={(ids) => ids.forEach((id) => actions?.onDeleteRouteById?.(id))}
+      />
+      <VirtualList
+        items={list}
+        keyFor={(r) => r.id!}
+        renderItem={(r) => {
+          const id = r.id!
+          const isSelected = selectedRouteIds?.has(id) ?? false
+          const showConfirm = confirmDeleteId === id
+          return (
+            <div
+              className={cn(
+                'group flex items-center gap-2 px-2 py-1.5 rounded border bg-background/40 hover:bg-accent/40 transition-colors',
+                isSelected && 'ring-1 ring-primary bg-accent/30',
+              )}
+            >
+              <RowCheck checked={checked.has(id)} onChange={() => toggleChecked(id)} />
+              <span
+                className="flex-shrink-0 w-3 h-3 rounded-full border"
+                style={{ backgroundColor: r.config.color ?? ROUTE_TYPE_COLORS[r.config.type] }}
+                aria-hidden="true"
+              />
+              <InlineNameCell
+                name={r.name}
+                subtitle={
+                  <>
+                    #{id} · {t('sidePanel.routePoints', { defaultValue: '{{count}} points', count: r.vertices.length })}
+                  </>
+                }
+                onSelect={(e) => actions?.onSelectRoute?.(id, e.shiftKey || e.metaKey || e.ctrlKey)}
+                onCommit={(next) => actions?.onRenameRoute?.(id, next)}
+                titleAttr={`#${id} ${r.name}`}
+              />
+              <EyeToggleButton
+                visible={r.visible}
+                onToggle={(next) => actions?.onBulkSetVisible?.('route', [id], next)}
+              />
+              <Button
+                variant="ghost"
+                size="icon"
+                className="w-6 h-6"
+                onClick={() => actions?.onFitToRouteById?.(id)}
+                title={t('sidePanel.fit')}
+                aria-label={t('sidePanel.fit')}
+              >
+                <Maximize2 className="w-3 h-3" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  'h-6 w-6',
+                  showConfirm && 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
+                )}
+                onClick={() => {
+                  if (showConfirm) {
+                    actions?.onDeleteRouteById?.(id)
+                    setConfirmDeleteId(null)
+                  } else {
+                    setConfirmDeleteId(id)
+                    setTimeout(() => setConfirmDeleteId((v) => (v === id ? null : v)), 3000)
+                  }
+                }}
+                title={showConfirm ? t('sidePanel.confirmDelete') : t('sidePanel.delete')}
+                aria-label={showConfirm ? t('sidePanel.confirmDelete') : t('sidePanel.delete')}
+              >
+                <Trash2 className="w-3 h-3" />
+              </Button>
+            </div>
+          )
+        }}
+      />
+    </Section>
   )
 }

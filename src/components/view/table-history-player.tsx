@@ -16,7 +16,7 @@
  * an ordinary live map should not see a dead playback bar.
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Clock,
@@ -28,27 +28,33 @@ import {
 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
+import { HistoryRangePicker, rangeBounds, type PlayerRange } from '@/components/view/history-range-picker'
 import { listTableEvents } from '@/lib/data-link/table-events-client'
 import {
   tablePlayback,
   useTablePlaybackState,
 } from '@/lib/data-link/table-playback-store'
 import type { DataLinkConfig } from '@/lib/db'
+import { cn } from '@/lib/utils'
 
 export interface TableHistoryPlayerProps {
   configs: ReadonlyArray<DataLinkConfig>
+  /** Position override for the bar's wrapper (a report map keeps it clear
+   *  of its floating panels); default: centred 16 px above the bottom. */
+  style?: CSSProperties
 }
 
-const WINDOW_OPTIONS: Array<{ sec: number; labelKey: string; fallback: string }> = [
-  { sec: 3600, labelKey: 'view.playerWindowHour', fallback: '1h' },
-  { sec: 86_400, labelKey: 'view.playerWindowDay', fallback: '24h' },
-  { sec: 7 * 86_400, labelKey: 'view.playerWindow7d', fallback: '7d' },
-  { sec: 30 * 86_400, labelKey: 'view.playerWindow30d', fallback: '30d' },
-]
+const SPEED_OPTIONS = [1, 5, 15, 60, 300, 1800] as const
+/** The server returns at most this many events per load. */
+const EVENT_LIMIT = 5000
 
-const SPEED_OPTIONS = [15, 60, 300, 1800] as const
+/** A speed that plays the whole range in about two minutes. */
+function speedFor(spanMs: number): number {
+  const ideal = spanMs / 1000 / 120
+  return SPEED_OPTIONS.reduce((best, s) => (Math.abs(Math.log(s / ideal)) < Math.abs(Math.log(best / ideal)) ? s : best))
+}
 
-export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
+export function TableHistoryPlayer({ configs, style }: TableHistoryPlayerProps) {
   const { t, i18n } = useTranslation()
   const playback = useTablePlaybackState()
 
@@ -70,7 +76,7 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
   // back to the first eligible layer so the bar just works on first
   // mount without the viewer touching the picker.
   const [chosenSourceId, setChosenSourceId] = useState<number | null>(null)
-  const [windowSec, setWindowSec] = useState<number>(86_400)
+  const [range, setRange] = useState<PlayerRange>({ kind: 'last', sec: 86_400 })
   const [loading, setLoading] = useState(false)
 
   const pickedSourceId: number | null =
@@ -79,31 +85,32 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
       ? chosenSourceId
       : historyLayers[0]?.sourceId ?? null
 
-  // Auto-load whenever the picked layer / window changes AND the store
-  // isn't already loaded for that (source, window). Aborts in flight
+  // Auto-load whenever the picked layer / range changes AND the store
+  // isn't already loaded for that (source, range). Aborts in flight
   // if the picker moves before the fetch resolves.
   useEffect(() => {
     if (pickedSourceId === null) return
+    const want = rangeBounds(range)
     if (
       playback.activeSourceId === pickedSourceId &&
-      // Same window: the store's endMs≈now-ish; if the user leaves the
-      // page open all day the window slides, so we refetch when the
-      // discrepancy exceeds one poll cycle (~30s).
-      Math.abs(playback.endMs - Date.now()) < 30_000 &&
-      Math.abs(
-        playback.startMs - (playback.endMs - windowSec * 1000),
-      ) < 30_000
+      // Same range. A "last N" range slides with the clock, so it is
+      // stale once its ends drift past one poll cycle (~30s).
+      Math.abs(playback.endMs - want.endMs) < 30_000 &&
+      Math.abs(playback.startMs - want.startMs) < 30_000
     ) {
       return
     }
     let cancelled = false
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
-    listTableEvents(pickedSourceId, { windowSec, limit: 5000 })
+    const query =
+      range.kind === 'last'
+        ? { windowSec: range.sec, limit: EVENT_LIMIT }
+        : { from: range.from, to: range.to, limit: EVENT_LIMIT }
+    listTableEvents(pickedSourceId, query)
       .then((events) => {
         if (cancelled) return
-        const endMs = Date.now()
-        const startMs = endMs - windowSec * 1000
+        const { startMs, endMs } = rangeBounds(range)
         tablePlayback.start({
           sourceId: pickedSourceId,
           events,
@@ -126,7 +133,13 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
     // playback.activeSourceId is intentionally read but not a dep — we
     // only want a reload on user-driven changes, not on every store tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pickedSourceId, windowSec])
+  }, [pickedSourceId, range])
+
+  const changeRange = (next: PlayerRange) => {
+    const { startMs, endMs } = rangeBounds(next)
+    tablePlayback.setSpeed(speedFor(endMs - startMs))
+    setRange(next)
+  }
 
   // Stop playback when the last history-movement layer is removed
   // (e.g. the viewer hid it via the layers panel). Keeps the map
@@ -137,6 +150,10 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
       tablePlayback.stop()
     }
   }, [historyLayers.length, playback.activeSourceId])
+
+  // The playback store is app-wide: leaving the page (the viewer, a report)
+  // must not leave its reconstructed rows playing on the next map.
+  useEffect(() => () => tablePlayback.stop(), [])
 
   if (historyLayers.length === 0) return null
 
@@ -151,9 +168,10 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
       : '—'
 
   const percent = Math.round((scrubberValue / scrubberMax) * 100)
+  const capped = playback.events.length >= EVENT_LIMIT
 
   return (
-    <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex justify-center">
+    <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex justify-center" style={style}>
       <div
         className="
           pointer-events-auto w-full max-w-4xl
@@ -167,9 +185,13 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
       >
         {/* Top row: title + layer picker + window + count + loading */}
         <div className="flex items-center gap-2 min-w-0">
-          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-foreground shrink-0">
+          <span
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-foreground shrink-0"
+            title={t('view.playerTitle', { defaultValue: 'History player' }) as string}
+          >
             <Clock size={13} className="text-primary" />
-            {t('view.playerTitle', { defaultValue: 'History player' })}
+            {/* Phones keep the room for the layer and range pickers. */}
+            <span className="hidden sm:inline">{t('view.playerTitle', { defaultValue: 'History player' })}</span>
           </span>
 
           <select
@@ -185,27 +207,25 @@ export function TableHistoryPlayer({ configs }: TableHistoryPlayerProps) {
             ))}
           </select>
 
-          <select
-            value={windowSec}
-            onChange={(e) => setWindowSec(Number(e.target.value))}
-            aria-label={t('view.playerWindow', { defaultValue: 'Window' }) as string}
-            className="h-7 rounded-md border bg-background/70 px-2 text-[11px]"
-          >
-            {WINDOW_OPTIONS.map((opt) => (
-              <option key={opt.sec} value={opt.sec}>
-                {t(opt.labelKey, { defaultValue: opt.fallback })}
-              </option>
-            ))}
-          </select>
+          <HistoryRangePicker value={range} onChange={changeRange} />
 
           <div className="flex-1" />
 
           {loading && (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
           )}
-          <span className="text-[10px] tabular-nums text-muted-foreground shrink-0">
-            {playback.events.length.toLocaleString()}{' '}
-            {t('view.playerEvents', { defaultValue: 'evts' })}
+          <span
+            className={cn('text-[10px] tabular-nums shrink-0', capped ? 'text-warning' : 'text-muted-foreground')}
+            title={capped ? (t('view.playerCapped', { count: EVENT_LIMIT, defaultValue: 'Showing the first {{count}} events — pick a shorter range to see the rest.' }) as string) : undefined}
+          >
+            {!loading && playback.activeSourceId !== null && playback.events.length === 0 ? (
+              t('view.playerNoEvents', { defaultValue: 'No events in this range' })
+            ) : (
+              <>
+                {playback.events.length.toLocaleString(i18n.language)}{capped ? '+' : ''}{' '}
+                {t('view.playerEvents', { defaultValue: 'evts' })}
+              </>
+            )}
           </span>
           {playback.error && (
             <span

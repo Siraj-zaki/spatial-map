@@ -28,8 +28,8 @@ export { getCurrentTenantId, getCurrentTenantIdSync, setCurrentTenantId }
 // setTenantColor/deleteTenant) that previously wrapped `apiDb.tenants`
 // were retired alongside the Integrations page's "Tenants" tab. All
 // workspace mutations now flow through `@/lib/workspace-client`, which
-// hits the JWT-aware backend endpoints (owner/admin gates,
-// file reclamation on delete). The `useCurrentTenant()`
+// hits the JWT-aware backend endpoints (owner/admin gates, trial
+// stamping, file reclamation on delete). The `useCurrentTenant()`
 // composite hook was also retired — the only remaining consumer needs
 // just the active id, exposed as `useCurrentTenantId()` below.
 

@@ -2,12 +2,34 @@ import {
   buildPolygonChainFeature,
   buildPolygonFeature,
   buildPolygonFeatureCollection,
+  FLAT_SLAB_BASE_M,
+  FLAT_SLAB_THICKNESS_M,
+  POLYGON_MIN_BASE_M,
   polygonCentroid,
   type PolygonProps,
 } from '@/lib/polygon-generators'
+import { taperedSolidMeshes } from '@/lib/sloped-mesh'
+import { useShapeMeshLayers } from '@/hooks/useShapeMeshLayers'
+import { sameClipFootprints, syncBasemapClipLayer, useBasemapClipNeeded } from '@/lib/basemap-clip'
 import { destination as turfDestination, point as turfPoint } from '@turf/turf'
 import { rotatePointAround } from '@/lib/image-generators'
 import { higherPriorityAt } from '@/lib/overlay-hit-priority'
+import {
+  hintLayerEmpty,
+  registerLayerFeaturePredicate,
+  type LayerFeaturePredicate,
+} from '@/lib/empty-layer-gate'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
+import { patchFeatureCollection } from '@/lib/focus/focus-fade'
+import { focusCutRegion, focusFadeCollection, meshCutAway, type FocusPiece } from '@/lib/focus/focus-cutaway'
+import {
+  blockerIdsOf,
+  blockerPierceOf,
+  focusFactor,
+  useFocusBlockers,
+  useFocusScene,
+} from '@/lib/focus/focus-scene'
+import { stableDerivedCollection } from '@/components/map-line-overlay'
 import type { PolygonShape } from '@/lib/shapes'
 import {
   TRANSFORM_ICON,
@@ -16,7 +38,12 @@ import {
   registerTransformHandleIcons,
   subscribeThemeChanges,
 } from '@/lib/map-transform-handles'
-import type { GeoJSONSource, Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import type {
+  ExpressionSpecification,
+  GeoJSONSource,
+  Map as MapboxMapInstance,
+  MapMouseEvent,
+} from 'mapbox-gl'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 interface MapPolygonOverlayProps {
@@ -75,16 +102,55 @@ const EXTRUDE_LAYER_BASE = 'polygon-extrude-layer'
 const EXTRUDE_LAYER_IDS = OPACITY_BUCKETS.map((b) => `${EXTRUDE_LAYER_BASE}-op${b}`)
 const extrudeLayerId = (bucket: number) => `${EXTRUDE_LAYER_BASE}-op${bucket}`
 
-// Minimum `fill-extrusion-base` for every polygon slab, so a "flat"
-// polygon (user elevation = 0, height = 0) still renders as a
-// paper-thin extrusion sitting above a ground-floor plan. The plan now
-// renders at its exact elevation (FloorPlanLayer, which also loses any
-// coplanar depth tie on purpose), so this is margin rather than a fix;
-// it dates from the old elevated raster, which sat at 0.1 m. 11 cm is
-// imperceptible at warehouse scale.
-const POLYGON_MIN_BASE_M = 0.11
+// Slab floors (constants in polygon-generators.ts). A shape with a height
+// sits on a POLYGON_MIN_BASE_M (11 cm) base; models placed on solids rely
+// on that (docs/pitfalls-frontend.md). A 0-height area is a floor marking,
+// not a block: FLAT_SLAB_BASE_M + FLAT_SLAB_THICKNESS_M keep it paper-thin
+// on the floor, so at close zoom its edge and shadow don't read as a step.
+// Every polygon still draws as a fill-extrusion (see the bucket layers).
+const SLAB_H: ExpressionSpecification = ['coalesce', ['to-number', ['get', 'height']], 0]
+const SLAB_ELEV: ExpressionSpecification = ['coalesce', ['to-number', ['get', 'elevation']], 0]
+const SLAB_BASE: ExpressionSpecification = [
+  'case',
+  ['>', SLAB_H, 0],
+  ['max', SLAB_ELEV, POLYGON_MIN_BASE_M],
+  ['max', SLAB_ELEV, FLAT_SLAB_BASE_M],
+]
+// Top: a real height floored at 5 cm (thinner slabs z-fight as pitch /
+// zoom shift depth precision); a flat area one FLAT_SLAB_THICKNESS_M.
+const SLAB_TOP: ExpressionSpecification = [
+  '+',
+  SLAB_BASE,
+  ['case', ['>', SLAB_H, 0], ['max', SLAB_H, 0.05], FLAT_SLAB_THICKNESS_M],
+]
+
+// Top-face emissive for the extrude layers (committed + in-flight).
+// Solid objects (`solid`) get 0 — sun-lit like walls, so each face
+// shades differently and the shape reads as a block. Zones stay
+// self-lit so the top face never goes near-black over the emissive
+// raster at zoom < ~20 top-down: 0.5 when `receiveShadows` is on (the
+// default) so shadows from taller shapes visibly darken it, full
+// emissive when it's off.
+const EXTRUDE_EMISSIVE_STRENGTH = [
+  'case',
+  ['coalesce', ['get', 'solid'], false],
+  0,
+  ['coalesce', ['get', 'receiveShadows'], true],
+  0.5,
+  1,
+] as ExpressionSpecification
 const SELECTION_LAYER = 'polygon-selection-line-layer'
 const SELECTION_TINT_LAYER = 'polygon-selection-tint-layer'
+// Tapered / dome solids are drawn as meshes (useShapeMeshLayers); their
+// extruded feature stays in the zero-opacity bucket as the click target, so
+// the roof outline and the extruded selection wash must skip it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const NOT_MESHED: any = ['!=', ['get', 'meshed'], true]
+// Focus mode (src/lib/focus): a faded polygon also carries its fade factor
+// as `focusFade`, so the border fades with the fill. No feature carries it
+// while nothing is focused, so the border draws at 1, its old default.
+const FOCUS_FADE_PROP = 'focusFade'
+const BORDER_OPACITY = ['coalesce', ['get', FOCUS_FADE_PROP], 1] as ExpressionSpecification
 const LABEL_SOURCE = 'polygon-label-source'
 // Billboard label — screen-space, always facing camera. Handles the
 // `labelFlat != true` case (the default).
@@ -127,6 +193,175 @@ const SELECTION_TINT_INFLIGHT_LAYER = 'polygon-selection-tint-inflight-layer'
 const LABEL_INFLIGHT_SOURCE = 'polygon-label-inflight-source'
 const LABEL_INFLIGHT_LAYER = 'polygon-label-inflight-layer'
 
+// ---- Empty-layer gate (src/lib/empty-layer-gate.ts) ----------------------
+// Most opacity buckets hold no polygon (stadium: op10…op80), yet Mapbox
+// re-evaluates every visible layer on every frame. Each bucket layer
+// registers a JS test mirroring its filter, `['==', ['get',
+// 'opacityBucket'], bucket]` (strict equality, like Mapbox's `==`), and the
+// gate hides it while no FILL_SOURCE feature passes. The `!= polygonId`
+// clause the exclusion effect adds during a transform is deliberately not
+// mirrored: there the test is a superset, which can keep a layer visible
+// but never hide a feature the filter draws.
+type BucketGateFeature = { properties?: { opacityBucket?: unknown } | null }
+const extrudeBucketTest =
+  (bucket: number) =>
+  (f: BucketGateFeature): boolean =>
+    f.properties?.opacityBucket === bucket
+const GATED_FILL_LAYERS: ReadonlyMap<string, (f: BucketGateFeature) => boolean> = new Map(
+  OPACITY_BUCKETS.map((b) => [extrudeLayerId(b), extrudeBucketTest(b)] as const),
+)
+// Filter-empty (`polygonId == -1`) while nothing is selected → hinted empty.
+const GATED_SELECTION_LAYERS = [SELECTION_LAYER, SELECTION_TINT_LAYER] as const
+
+/**
+ * Hide deferral for the gated layers. Showing is immediate (the gate does
+ * it inside `setData`), but hiding the instant a filter stops matching
+ * would open a gap: Mapbox keeps drawing the PREVIOUS tiles until the
+ * worker re-tiles, so a polygon moving from bucket 50 to 60 (opacity edit,
+ * live-data restyle) would be drawn by neither layer for that round-trip.
+ * A layer that may still be drawing is "held" visible until the first
+ * frame in which FILL_SOURCE is fully loaded again — the moment today's
+ * code stops drawing it — and hidden then.
+ */
+interface GateHold {
+  /** Gated fill layers whose filter matched ≥1 feature in the last FILL_SOURCE push. */
+  matched: Set<string>
+  /** Layers kept visible until FILL_SOURCE has re-tiled the change that emptied them. */
+  held: Set<string>
+  /** True while the selection layers may be drawing a highlight. */
+  selectionShown: boolean
+  /** Detaches the pending release listener, when one is armed. */
+  disarm: (() => void) | null
+}
+
+function gatePredicate(
+  hold: GateHold,
+  layerId: string,
+  test: (f: BucketGateFeature) => boolean,
+): LayerFeaturePredicate {
+  return (f) => hold.held.has(layerId) || test(f)
+}
+
+/**
+ * Shadows ON (Graphics → Shadows) pins the gated layers that cast shadows.
+ *
+ * Mapbox draws its ground-shadow pass (a multiply blend) right after the
+ * LAST layer in style order that is not hidden and whose `hasShadowPass()`
+ * is true. 2D layers drawn before that anchor are darkened inside shadows;
+ * layers drawn after it are not. A visible-but-empty caster draws nothing
+ * yet still anchors the pass, so hiding it moves the anchor, and every
+ * border, label and other 2D layer in between turns brighter or darker,
+ * e.g. on every select / deselect through the selection tint.
+ *
+ * So while the directional light casts shadows, a gated layer with a
+ * shadow pass gets no predicate and no empty hint, which leaves it under
+ * the plain source-count gate it had before it was gated here. Layers
+ * without a shadow pass (op0, the selection line) and the default
+ * Shadows-OFF path, where no ground-shadow pass exists, keep full gating.
+ * The store is the truth here: `applyLights` in `mapbox-map.tsx` writes
+ * its `shadows` flag into the directional light's `cast-shadows`.
+ */
+function pinnedShadowCaster(map: MapboxMapInstance, layerId: string): boolean {
+  return useGraphicsSettings.getState().shadows && layerHasShadowPass(map, layerId)
+}
+
+/**
+ * Mirrors Mapbox's per-type `hasShadowPass()`. Fill-extrusion reads
+ * `fill-extrusion-cast-shadows`, whose spec default (unset, so `undefined`
+ * here) is true; a fill has one only with a `fill-elevation-reference`
+ * other than 'none'; line and symbol layers never do. When unsure it
+ * answers true, which keeps a layer visible: that costs perf, never pixels.
+ */
+function layerHasShadowPass(map: MapboxMapInstance, layerId: string): boolean {
+  try {
+    const type = map.getLayer(layerId)?.type
+    if (type === 'fill-extrusion') {
+      return map.getPaintProperty(layerId, 'fill-extrusion-cast-shadows') !== false
+    }
+    if (type === 'fill') {
+      const ref = map.getLayoutProperty(layerId, 'fill-elevation-reference')
+      return ref !== undefined && ref !== 'none'
+    }
+    return type === 'model'
+  } catch {
+    return true
+  }
+}
+
+/** (Re-)register a gated fill layer's predicate, or none while it is a pinned shadow caster. */
+function applyFillGate(
+  map: MapboxMapInstance,
+  hold: GateHold,
+  layerId: string,
+  test: (f: BucketGateFeature) => boolean,
+): void {
+  registerLayerFeaturePredicate(
+    map,
+    layerId,
+    pinnedShadowCaster(map, layerId) ? null : gatePredicate(hold, layerId, test),
+  )
+}
+
+/** Hint a selection layer empty (nothing selected), unless it is a pinned shadow caster. */
+function hintSelectionEmpty(map: MapboxMapInstance, layerId: string): void {
+  hintLayerEmpty(map, layerId, !pinnedShadowCaster(map, layerId))
+}
+
+/** Graphics → Shadows flipped: re-apply the gated shadow casters under the new pin state. */
+function reapplyShadowPins(map: MapboxMapInstance, hold: GateHold): void {
+  // The pin only ever changes a layer that has a shadow pass. A layer
+  // missing mid style swap has none here; the setup pass registers it anew.
+  for (const [layerId, test] of GATED_FILL_LAYERS) {
+    if (layerHasShadowPass(map, layerId)) applyFillGate(map, hold, layerId, test)
+  }
+  // While a selection is shown (or held until its re-tile) the hints stay
+  // cleared; the release or the next selection change re-hints under the
+  // new state.
+  if (!hold.selectionShown) {
+    for (const id of GATED_SELECTION_LAYERS) {
+      if (layerHasShadowPass(map, id)) hintSelectionEmpty(map, id)
+    }
+  }
+}
+
+/** Un-hold every held layer: fill layers get re-counted, selection layers hinted empty. */
+function releaseGateHolds(map: MapboxMapInstance, hold: GateHold): void {
+  const ids = [...hold.held]
+  hold.held.clear()
+  for (const id of ids) {
+    const test = GATED_FILL_LAYERS.get(id)
+    if (test) {
+      applyFillGate(map, hold, id, test)
+    } else {
+      // Only held while nothing is selected (a selection un-holds them).
+      hold.selectionShown = false
+      hintSelectionEmpty(map, id)
+    }
+  }
+}
+
+/**
+ * Release the held layers on the first `render` in which FILL_SOURCE is
+ * loaded. `render` fires after `style.update` has applied any pending
+ * source reload, so "loaded" there means the tiles on screen were built
+ * from the latest `setData` / filter.
+ */
+function armGateRelease(map: MapboxMapInstance, hold: GateHold): void {
+  if (hold.disarm) return
+  const onRender = () => {
+    try {
+      if (!map.getSource(FILL_SOURCE) || !map.isSourceLoaded(FILL_SOURCE)) return
+    } catch {
+      return
+    }
+    map.off('render', onRender)
+    hold.disarm = null
+    releaseGateHolds(map, hold)
+  }
+  map.on('render', onRender)
+  hold.disarm = () => map.off('render', onRender)
+}
+
 /**
  * Polygon rendering — fill / extrusion / border / clip / labels, plus
  * a live-draw layer for the in-progress vertex chain and a transform
@@ -158,6 +393,15 @@ export function MapPolygonOverlay({
   // a swap leaves `styleLoaded` already true and the setup effect
   // never re-runs, so layers stay removed.
   const [styleGen, setStyleGen] = useState(0)
+  // Empty-layer gate bookkeeping (see GateHold). Survives style swaps on
+  // purpose: a stale `matched` / `selectionShown` can only over-hold, i.e.
+  // keep a layer visible one re-tile longer.
+  const gateHoldRef = useRef<GateHold>({
+    matched: new Set(),
+    held: new Set(),
+    selectionShown: false,
+    disarm: null,
+  })
 
   // ---- Style readiness ---------------------------------------------------
   useEffect(() => {
@@ -188,6 +432,11 @@ export function MapPolygonOverlay({
       map.off('load', setReady)
     }
   }, [map])
+
+  // Whether the current basemap has anything a clip layer can hide
+  // (`src/lib/basemap-clip.ts`). Classic styles don't, and a clip layer
+  // there is pure per-frame cost, so CLIP_LAYER only exists while true.
+  const basemapClip = useBasemapClipNeeded(map)
 
   // (Removed) The old URL-polling effect detected style swaps by
   // diffing `style.sprite`/`style.name` and flipped `styleLoaded` to
@@ -251,6 +500,115 @@ export function MapPolygonOverlay({
     () => buildPolygonFeatureCollection(polygons ?? [], livePreview, shapeStyleOverrides),
     [polygons, livePreview, shapeStyleOverrides]
   )
+
+  // ---- Focus mode (src/lib/focus) ----------------------------------------
+  // While an item is focused, only two kinds of polygon fade: the ones
+  // between the camera and the item (blockers, FOCUS_FACTOR.ghost) and the
+  // ones standing right next to it (the NEAR column, FOCUS_FACTOR.near).
+  // Every other polygon keeps its feature object. `fill-extrusion-opacity`
+  // is a per-layer constant, so a fade MOVES the polygon to a lower bucket
+  // layer: a copy-on-write post-pass over `fc` re-stamps `opacity` /
+  // `opacityBucket` (+ `focusFade` for the border). With nothing focused,
+  // or nothing to fade, `fc` ITSELF comes back, so the push and the meshes
+  // don't re-run. Kept out of the `fc` memo so a blocker change at camera
+  // settle never rebuilds the polygons' features. Clip footprints, labels
+  // and the selection / exclusion filters stay on `fc`.
+  //
+  // Local cut-away (focus-cutaway.ts): a near / blocker polygon much bigger
+  // than its region (a stand deck, a departures slab) fades only inside it
+  // — the item column, plus the discs where the line of sight pierces a
+  // blocker. It becomes two features with the SAME `polygonId` and feature
+  // id ('in' at the fade bucket, 'out' as drawn), so click / hover /
+  // selection, which resolve by `polygonId`, still find the shape. Pieces
+  // are never meshed: a dome / taper keeps its one hit target and its MESH
+  // is split per triangle instead (`meshCutAway`).
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  // Same Set / Map while the polygon blockers and their pierce discs are
+  // unchanged: other kinds' blocker changes don't re-push this source.
+  const polygonBlockers = blockerIdsOf(focusBlockers, 'polygons')
+  const polygonPierce = blockerPierceOf(focusBlockers, 'polygons')
+  /** Fade factor / cut region by polygon id, or null while nothing is focused. */
+  const polygonFocus = useMemo(() => {
+    if (!focusScene.active) return null
+    return {
+      factorOf: (id: number | undefined): number =>
+        id === undefined ? 1 : focusFactor(focusScene, focusBlockers, 'polygons', id),
+      regionOf: (id: number | undefined) =>
+        id === undefined ? null : focusCutRegion(focusScene, focusBlockers, 'polygons', id),
+    }
+    // `focusBlockers` is read only through its polygon set and pierce map.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusScene, polygonBlockers, polygonPierce])
+  const fadedFc = useMemo<
+    GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, PolygonProps & { focusPiece?: FocusPiece }>
+  >(() => {
+    if (!polygonFocus) return fc
+    // The live-draw preview has no id and is never faded.
+    const factorOf = (f: { properties: { polygonId?: number } }) => polygonFocus.factorOf(f.properties.polygonId)
+    // stableDerivedCollection: a scene change that leaves this overlay's
+    // fades as they were (the NEAR column of another kind, a data-link
+    // anchor arriving) hands back the previous object, so nothing re-pushes.
+    // `focusFade` (the border) goes on whole-faded features and 'in'
+    // pieces; an 'out' piece keeps the full border, cut arc included —
+    // that arc is the cut-away's edge.
+    return stableDerivedCollection(
+      fc as GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, PolygonProps & { focusPiece?: FocusPiece }>,
+      patchFeatureCollection(
+        focusFadeCollection(fc, factorOf, (f) => polygonFocus.regionOf(f.properties.polygonId)),
+        (f) => {
+          const factor = factorOf(f)
+          return factor === 1 || f.properties.focusPiece === 'out' ? null : String(factor)
+        },
+        (props, tag) => ({ ...props, [FOCUS_FADE_PROP]: Number(tag) }),
+      ),
+    )
+  }, [fc, polygonFocus])
+
+  // Tapered / dome solids (sloped-mesh.ts). The one being moved / rotated /
+  // edited shows as its in-flight extrusion until it's dropped. Built from
+  // `fc` (focus-independent), so leaving focus hands back the very same
+  // array. While focused they're built from `fadedFc` (a whole-faded solid
+  // carries its faded `opacity` and goes to the translucent mesh layer),
+  // then `meshCutAway` splits a big near / blocker solid (e.g. a carousel
+  // dome) per triangle: inside its region at the tier's alpha under
+  // `polygon:<id>#cut`, the rest as drawn. Meshed features are never split
+  // into pieces, so every meshed feature here is still a Polygon.
+  const baseSolidMeshes = useMemo(
+    () =>
+      taperedSolidMeshes('polygon', polygons ?? [], fc.features, {
+        selectedIds: selectedPolygonIds,
+        tint: primaryHex,
+        skipId: transformState?.polygonId ?? null,
+      }),
+    [polygons, fc, selectedPolygonIds, primaryHex, transformState],
+  )
+  const solidMeshes = useMemo(() => {
+    if (!polygonFocus) return baseSolidMeshes
+    const built =
+      fadedFc === fc
+        ? baseSolidMeshes
+        : taperedSolidMeshes(
+            'polygon',
+            polygons ?? [],
+            fadedFc.features.filter((f) => f.properties.meshed === true) as GeoJSON.Feature<GeoJSON.Polygon, PolygonProps>[],
+            {
+              selectedIds: selectedPolygonIds,
+              tint: primaryHex,
+              skipId: transformState?.polygonId ?? null,
+            },
+          )
+    const idOfKey = (key: string): number | undefined => {
+      const id = Number(key.slice(key.indexOf(':') + 1))
+      return Number.isInteger(id) ? id : undefined
+    }
+    return meshCutAway(
+      built,
+      (key) => polygonFocus.regionOf(idOfKey(key)),
+      (key) => polygonFocus.factorOf(idOfKey(key)),
+    )
+  }, [baseSolidMeshes, polygonFocus, fadedFc, fc, polygons, selectedPolygonIds, primaryHex, transformState])
+  useShapeMeshLayers(map, styleLoaded, styleGen, 'polygon', solidMeshes, committedVisible)
 
   const clipData = useMemo<GeoJSON.FeatureCollection<GeoJSON.Polygon> | null>(() => {
     if (fc.features.length === 0) return null
@@ -321,13 +679,14 @@ export function MapPolygonOverlay({
           colorRgba: '',
           elevation: s.config.elevation,
           height: s.config.height,
+          receiveShadows: s.config.receiveShadows ?? true,
+          solid: (s.config.solid ?? false) && s.config.height > 0,
           showLabels: true,
           label: labelText,
           labelSize: s.config.labelSize,
           labelColor: s.config.labelColor,
           labelAltitude: s.config.labelAltitude,
           labelFlat: s.config.labelFlat ?? false,
-          receiveShadows: s.config.receiveShadows ?? true,
         },
         geometry: { type: 'Point', coordinates: anchor },
       })
@@ -373,6 +732,7 @@ export function MapPolygonOverlay({
   // ---- Layer setup -------------------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
     try {
       if (!map.getSource(FILL_SOURCE)) {
         // `lineMetrics: true` — see the matching note in
@@ -429,8 +789,8 @@ export function MapPolygonOverlay({
       // paint-order battle against the alpha-blended floor raster below
       // ~zoom 20.5, so the interior of every room disappeared on zoom
       // out. Routing flat polygons through fill-extrusion with a base
-      // floored at POLYGON_MIN_BASE_M puts them 1 cm above the raster's
-      // own minimum elevation, so they always paint on top.
+      // floored at FLAT_SLAB_BASE_M (1 cm) lifts them just off the
+      // raster, so they always paint on top.
       for (const bucket of OPACITY_BUCKETS) {
         const layerId = extrudeLayerId(bucket)
         if (map.getLayer(layerId)) continue
@@ -446,24 +806,12 @@ export function MapPolygonOverlay({
               // Constant per layer. The "data-driven opacity" comes from
               // routing each feature to its matching bucket layer above.
               'fill-extrusion-opacity': bucket / 100,
-              // Base floored at POLYGON_MIN_BASE_M so flat polygons
-              // clear the raster; elevated polygons keep their user-set
-              // elevation.
-              'fill-extrusion-base': [
-                'max',
-                ['to-number', ['get', 'elevation']],
-                POLYGON_MIN_BASE_M,
-              ],
-              // Top floored at `base + 5 cm`. Zero-thickness slabs
-              // z-fight with themselves and with nearby extrusions /
-              // rasters, blinking in and out as pitch / zoom shift
-              // depth-buffer precision. 5 cm is invisible at warehouse
-              // scale but gives Mapbox a real volume to render.
-              'fill-extrusion-height': [
-                '+',
-                ['max', ['to-number', ['get', 'elevation']], POLYGON_MIN_BASE_M],
-                ['max', ['to-number', ['get', 'height']], 0.05],
-              ],
+              // Floored so flat polygons clear the raster; elevated
+              // polygons keep their user-set elevation (SLAB_BASE).
+              'fill-extrusion-base': SLAB_BASE,
+              // Never zero-thick: zero-thickness slabs z-fight with
+              // themselves and nearby extrusions / rasters (see SLAB_TOP).
+              'fill-extrusion-height': SLAB_TOP,
               // Vertical gradient darkens the extrusion at its base.
               // For a paper-thin (5 cm) elevated slab sitting on top
               // of a floor plan, the gradient collapses across a tiny
@@ -472,23 +820,12 @@ export function MapPolygonOverlay({
               // shadow blob against the raster and disappears.
               // Disabled so elevation-only polygons stay solid.
               'fill-extrusion-vertical-gradient': false,
-              // Full emissive by default so the polygon top face is
-              // immune to directional light + shadow occlusion (at
-              // zoom < ~20 in top-down view, otherwise the sun-vs-
-              // normal angle darkens the top to near-black and the
-              // polygon reads as vanished over the emissive raster).
-              // When `receiveShadows` is true (opt-in per shape) drop
-              // to 0.5 so shadows from taller shapes visibly darken
-              // this face — enable this on "floor slab" polygons that
-              // walls stand on.
-              'fill-extrusion-emissive-strength': [
-                'case',
-                ['coalesce', ['get', 'receiveShadows'], true],
-                0.5,
-                1,
-              ],
+              // Zone vs solid lighting — see EXTRUDE_EMISSIVE_STRENGTH.
+              'fill-extrusion-emissive-strength': EXTRUDE_EMISSIVE_STRENGTH,
+              // The 0% bucket is invisible (incl. tapered solids' hit
+              // targets) — it must not cast a box-shaped shadow.
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              ['fill-extrusion-cast-shadows' as any]: true,
+              ['fill-extrusion-cast-shadows' as any]: bucket > 0,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               ['fill-extrusion-ambient-occlusion-intensity' as any]: 0.35,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -499,15 +836,26 @@ export function MapPolygonOverlay({
           console.warn('[MapPolygonOverlay] failed to add extrude bucket', bucket, err)
         }
       }
+      // Gate the bucket layers on their filter (see GATED_FILL_LAYERS).
+      // The gate drops registrations with the layer, so every setup pass
+      // re-registers. Shadow casters are skipped while Shadows is on
+      // (pinnedShadowCaster).
+      for (const [layerId, test] of GATED_FILL_LAYERS) {
+        applyFillGate(map, gateHold, layerId, test)
+      }
+      if (gateHold.held.size > 0) armGateRelease(map, gateHold)
       if (!map.getLayer(LINE_LAYER)) {
         map.addLayer({
           id: LINE_LAYER,
           type: 'line',
           source: FILL_SOURCE,
+          filter: NOT_MESHED,
           paint: {
             'line-color': ['get', 'borderColor'],
             'line-width': ['to-number', ['get', 'borderWidth']],
             'line-emissive-strength': 1,
+            // Focus mode: fades with the fill (FOCUS_FADE_PROP).
+            'line-opacity': BORDER_OPACITY,
           },
           layout: {
             'line-elevation-reference': 'sea',
@@ -538,24 +886,8 @@ export function MapPolygonOverlay({
             // Same base/height floors as the bucket layers so the tint
             // on a flat polygon (elevation = 0, height = 0) sits above
             // the raster instead of vanishing into it at low zoom.
-            'fill-extrusion-base': [
-              'max',
-              ['coalesce', ['to-number', ['get', 'elevation']], 0],
-              POLYGON_MIN_BASE_M,
-            ],
-            'fill-extrusion-height': [
-              '+',
-              [
-                'max',
-                ['coalesce', ['to-number', ['get', 'elevation']], 0],
-                POLYGON_MIN_BASE_M,
-              ],
-              [
-                'max',
-                ['coalesce', ['to-number', ['get', 'height']], 0],
-                0.05,
-              ],
-            ],
+            'fill-extrusion-base': SLAB_BASE,
+            'fill-extrusion-height': SLAB_TOP,
             'fill-extrusion-vertical-gradient': false,
             'fill-extrusion-emissive-strength': 1,
           },
@@ -696,25 +1028,8 @@ export function MapPolygonOverlay({
           paint: labelPaint,
         })
       }
-      if (!map.getLayer(CLIP_LAYER)) {
-        try {
-          map.addLayer({
-            id: CLIP_LAYER,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            type: 'clip' as any,
-            source: CLIP_SOURCE,
-            layout: {
-              'clip-layer-types': ['symbol', 'model'],
-              'clip-layer-scope': ['basemap'],
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            } as any,
-          })
-        } catch (err) {
-          if (import.meta.env.DEV) {
-            console.debug('[MapPolygonOverlay] clip layer not supported', err)
-          }
-        }
-      }
+      // CLIP_LAYER sits here (before CHAIN_LINE_LAYER) — added by the
+      // basemap-clip effect below, only on styles where it clips anything.
       // Chain — dashed line for in-progress edges. Lifted to
       // `elevation + height` (roof of the would-be extrusion) via
       // `line-z-offset` so a polygon drawn on a floor plan at
@@ -997,26 +1312,12 @@ export function MapPolygonOverlay({
             // start using the moving polygon's config.opacity, matching
             // the bucket the committed extrude would land in.
             'fill-extrusion-opacity': 1,
-            'fill-extrusion-base': [
-              'max',
-              ['to-number', ['get', 'elevation']],
-              POLYGON_MIN_BASE_M,
-            ],
-            'fill-extrusion-height': [
-              '+',
-              ['max', ['to-number', ['get', 'elevation']], POLYGON_MIN_BASE_M],
-              ['max', ['to-number', ['get', 'height']], 0.05],
-            ],
+            'fill-extrusion-base': SLAB_BASE,
+            'fill-extrusion-height': SLAB_TOP,
             'fill-extrusion-vertical-gradient': false,
-            // Match the committed bucket layers — data-driven so a
-            // shape that opts into receiveShadows keeps that behaviour
-            // while it's being transformed.
-            'fill-extrusion-emissive-strength': [
-              'case',
-              ['coalesce', ['get', 'receiveShadows'], true],
-              0.5,
-              1,
-            ],
+            // Match the committed bucket layers so a solid / shadow-
+            // receiving shape keeps its lighting while it's transformed.
+            'fill-extrusion-emissive-strength': EXTRUDE_EMISSIVE_STRENGTH,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             ['fill-extrusion-cast-shadows' as any]: true,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1058,24 +1359,8 @@ export function MapPolygonOverlay({
           paint: {
             'fill-extrusion-color': '#facc15',
             'fill-extrusion-opacity': 0.18,
-            'fill-extrusion-base': [
-              'max',
-              ['coalesce', ['to-number', ['get', 'elevation']], 0],
-              POLYGON_MIN_BASE_M,
-            ],
-            'fill-extrusion-height': [
-              '+',
-              [
-                'max',
-                ['coalesce', ['to-number', ['get', 'elevation']], 0],
-                POLYGON_MIN_BASE_M,
-              ],
-              [
-                'max',
-                ['coalesce', ['to-number', ['get', 'height']], 0],
-                0.05,
-              ],
-            ],
+            'fill-extrusion-base': SLAB_BASE,
+            'fill-extrusion-height': SLAB_TOP,
             'fill-extrusion-vertical-gradient': false,
             'fill-extrusion-emissive-strength': 1,
           },
@@ -1143,6 +1428,8 @@ export function MapPolygonOverlay({
     }
 
     return () => {
+      gateHold.disarm?.()
+      gateHold.disarm = null
       for (const id of [
         MIDPOINT_LAYER,
         VERTEX_LAYER,
@@ -1192,30 +1479,84 @@ export function MapPolygonOverlay({
     // counter the effect never re-runs.
   }, [map, styleLoaded, styleGen])
 
+  // ---- Basemap clip layer ------------------------------------------------
+  // Erases basemap 3D buildings / landmarks / symbols inside every polygon.
+  // Runs right after the setup pass above (same commit on style.load), so
+  // CLIP_LAYER lands at its old slot before CHAIN_LINE_LAYER. The setup
+  // cleanup still removes it ahead of CLIP_SOURCE.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    syncBasemapClipLayer(map, {
+      layerId: CLIP_LAYER,
+      sourceId: CLIP_SOURCE,
+      needed: basemapClip,
+      beforeId: CHAIN_LINE_LAYER,
+      visible: committedVisible,
+      label: 'MapPolygonOverlay',
+    })
+  }, [map, styleLoaded, styleGen, basemapClip, committedVisible])
+
   // ---- Push data ---------------------------------------------------------
+  // FILL_SOURCE gets the focus-faded collection (`fadedFc`, which IS `fc`
+  // while nothing is focused). It has its own effect so a fade change
+  // (focus enter / exit, a blocker change at camera settle) pushes this
+  // source once and leaves the label / chain sources alone.
   useEffect(() => {
     if (!map || !styleLoaded) return
     const src = map.getSource(FILL_SOURCE) as GeoJSONSource | undefined
     if (src) {
-      src.setData(
-        fc as GeoJSON.FeatureCollection<GeoJSON.Polygon, PolygonProps>
-      )
+      // A bucket layer that matched the previous push but not this one may
+      // still be drawing the previous tiles: hold it visible until they're
+      // replaced (GateHold). Must happen before setData, where the gate
+      // re-counts. A focus fade moves polygons between buckets the same
+      // way, so it shows the new bucket now and hides the old one late.
+      const hold = gateHoldRef.current
+      const matched = new Set<string>()
+      for (const [layerId, test] of GATED_FILL_LAYERS) {
+        if (fadedFc.features.some(test)) matched.add(layerId)
+      }
+      for (const layerId of hold.matched) {
+        if (!matched.has(layerId)) hold.held.add(layerId)
+      }
+      hold.matched = matched
+      src.setData(fadedFc)
+      if (hold.held.size > 0) armGateRelease(map, hold)
     }
+  }, [map, styleLoaded, styleGen, fadedFc])
+
+  useEffect(() => {
+    if (!map || !styleLoaded) return
     const labelSrc = map.getSource(LABEL_SOURCE) as GeoJSONSource | undefined
     if (labelSrc) {
       labelSrc.setData(
         (labelPointData ?? { type: 'FeatureCollection', features: [] }) as GeoJSON.FeatureCollection
       )
     }
-    const clipSrc = map.getSource(CLIP_SOURCE) as GeoJSONSource | undefined
-    if (clipSrc) {
-      clipSrc.setData(clipData ?? { type: 'FeatureCollection', features: [] })
-    }
     const chainSrc = map.getSource(CHAIN_SOURCE) as GeoJSONSource | undefined
     if (chainSrc) {
       chainSrc.setData(chainData ?? { type: 'FeatureCollection', features: [] })
     }
-  }, [map, styleLoaded, styleGen, fc, labelPointData, clipData, chainData])
+  }, [map, styleLoaded, styleGen, labelPointData, chainData])
+
+  // Clip footprints get their own push. `fc` is rebuilt on every style-rule
+  // resolve (live-data ticks) and every edit, but the rings rarely move, so
+  // a push is skipped when the source already holds the same footprints
+  // (`lastClipPushRef` is keyed by the source object, which a style swap or
+  // re-mount replaces). Nothing reads the source while CLIP_LAYER is absent,
+  // so it isn't fed at all then.
+  const lastClipPushRef = useRef<{
+    source: GeoJSONSource
+    data: GeoJSON.FeatureCollection<GeoJSON.Polygon> | null
+  } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded || !basemapClip) return
+    const clipSrc = map.getSource(CLIP_SOURCE) as GeoJSONSource | undefined
+    if (!clipSrc) return
+    const last = lastClipPushRef.current
+    if (last && last.source === clipSrc && sameClipFootprints(last.data, clipData)) return
+    clipSrc.setData(clipData ?? { type: 'FeatureCollection', features: [] })
+    lastClipPushRef.current = { source: clipSrc, data: clipData }
+  }, [map, styleLoaded, styleGen, basemapClip, clipData])
 
   // Selection filter — mirrored to the whole-area tint layer so the
   // wash appears and disappears with the border in perfect sync.
@@ -1225,9 +1566,8 @@ export function MapPolygonOverlay({
   // source, so the highlight tracks the moving polygon at full quality.
   useEffect(() => {
     if (!map || !styleLoaded) return
-    const ids = selectedPolygonIds && selectedPolygonIds.size > 0
-      ? [...selectedPolygonIds]
-      : [-1]
+    const hasSelection = !!selectedPolygonIds && selectedPolygonIds.size > 0
+    const ids = hasSelection ? [...selectedPolygonIds] : [-1]
     const excludeId = transformState?.polygonId
     const idFilter = ['in', ['get', 'polygonId'], ['literal', ids]]
     const filter = excludeId != null
@@ -1242,11 +1582,41 @@ export function MapPolygonOverlay({
     } catch { /* ignore */ }
     try {
       if (map.getLayer(SELECTION_TINT_LAYER)) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        map.setFilter(SELECTION_TINT_LAYER, filter as any)
+        // A tapered solid shows its selection on the mesh instead.
+        map.setFilter(SELECTION_TINT_LAYER, ['all', filter, NOT_MESHED])
       }
     } catch { /* ignore */ }
+    // Empty-layer gate: with nothing selected both filters match no id, so
+    // the layers are hinted empty. A new selection un-hints them right here,
+    // alongside its setFilter, so the highlight can't lag. Clearing a shown
+    // selection defers the hint until FILL_SOURCE has re-tiled the cleared
+    // filter (GateHold) — the moment today's highlight disappears.
+    const hold = gateHoldRef.current
+    if (hasSelection) {
+      hold.selectionShown = true
+      for (const id of GATED_SELECTION_LAYERS) {
+        hold.held.delete(id)
+        hintLayerEmpty(map, id, false)
+      }
+    } else if (hold.selectionShown) {
+      for (const id of GATED_SELECTION_LAYERS) hold.held.add(id)
+      armGateRelease(map, hold)
+    } else {
+      for (const id of GATED_SELECTION_LAYERS) hintSelectionEmpty(map, id)
+    }
   }, [map, styleLoaded, styleGen, selectedPolygonIds, transformState])
+
+  // ---- Empty-layer gate × Shadows (see pinnedShadowCaster) --------------
+  // A store subscription rather than a React dep: it runs synchronously
+  // inside `setShadows`, in the same task as the `applyLights` that
+  // flips the light's `cast-shadows`, so no frame mixes the two states.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const hold = gateHoldRef.current
+    return useGraphicsSettings.subscribe((state, prev) => {
+      if (state.shadows !== prev.shadows) reapplyShadowPins(map, hold)
+    })
+  }, [map, styleLoaded])
 
   // ---- Exclusion filter (committed base layers) ------------------------
   // While a transform is active, hide the moving polygon from the
@@ -1274,11 +1644,10 @@ export function MapPolygonOverlay({
         map.setFilter(layerId, filter as any)
       } catch { /* ignore */ }
     }
-    // LINE_LAYER: no default filter → notMe alone.
+    // LINE_LAYER: skips meshed solids (their roof outline would float).
     try {
       if (map.getLayer(LINE_LAYER)) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        map.setFilter(LINE_LAYER, (notMe ?? null) as any)
+        map.setFilter(LINE_LAYER, notMe ? ['all', notMe, NOT_MESHED] : NOT_MESHED)
       }
     } catch { /* ignore */ }
     // LABEL_LAYER + LABEL_LAYER_FLAT: no default filter → notMe alone.

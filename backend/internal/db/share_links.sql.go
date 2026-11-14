@@ -12,15 +12,69 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createReportShareLink = `-- name: CreateReportShareLink :one
+INSERT INTO share_links (tenant_id, zone_id, report_id, token, label, settings, expires_at, max_views, created_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+`
+
+type CreateReportShareLinkParams struct {
+	TenantID  int64              `json:"tenant_id"`
+	ZoneID    pgtype.Int8        `json:"zone_id"`
+	ReportID  pgtype.Int8        `json:"report_id"`
+	Token     string             `json:"token"`
+	Label     string             `json:"label"`
+	Settings  json.RawMessage    `json:"settings"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	MaxViews  pgtype.Int8        `json:"max_views"`
+	CreatedBy pgtype.Int8        `json:"created_by"`
+}
+
+// A public link to one report. zone_id is the report's facility (NULL for
+// a workspace-wide report) — kept for the audit trail and the cascade.
+func (q *Queries) CreateReportShareLink(ctx context.Context, arg CreateReportShareLinkParams) (ShareLink, error) {
+	row := q.db.QueryRow(ctx, createReportShareLink,
+		arg.TenantID,
+		arg.ZoneID,
+		arg.ReportID,
+		arg.Token,
+		arg.Label,
+		arg.Settings,
+		arg.ExpiresAt,
+		arg.MaxViews,
+		arg.CreatedBy,
+	)
+	var i ShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ZoneID,
+		&i.Token,
+		&i.Label,
+		&i.Settings,
+		&i.ExpiresAt,
+		&i.MaxViews,
+		&i.ViewCount,
+		&i.LastAccessedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.RevokedBy,
+		&i.ReportID,
+	)
+	return i, err
+}
+
 const createShareLink = `-- name: CreateShareLink :one
 INSERT INTO share_links (tenant_id, zone_id, token, label, settings, expires_at, max_views, created_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 `
 
 type CreateShareLinkParams struct {
 	TenantID  int64              `json:"tenant_id"`
-	ZoneID    int64              `json:"zone_id"`
+	ZoneID    pgtype.Int8        `json:"zone_id"`
 	Token     string             `json:"token"`
 	Label     string             `json:"label"`
 	Settings  json.RawMessage    `json:"settings"`
@@ -57,6 +111,7 @@ func (q *Queries) CreateShareLink(ctx context.Context, arg CreateShareLinkParams
 		&i.UpdatedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.ReportID,
 	)
 	return i, err
 }
@@ -77,8 +132,83 @@ func (q *Queries) DeleteShareLink(ctx context.Context, arg DeleteShareLinkParams
 	return err
 }
 
+const getReportShareLinkByToken = `-- name: GetReportShareLinkByToken :one
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count < max_views)
+`
+
+// Public read for /public/report-share/{token}. Same gates as
+// GetShareLinkByToken (revoked, expired, view cap → no rows → 404), and
+// only report links answer.
+func (q *Queries) GetReportShareLinkByToken(ctx context.Context, token string) (ShareLink, error) {
+	row := q.db.QueryRow(ctx, getReportShareLinkByToken, token)
+	var i ShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ZoneID,
+		&i.Token,
+		&i.Label,
+		&i.Settings,
+		&i.ExpiresAt,
+		&i.MaxViews,
+		&i.ViewCount,
+		&i.LastAccessedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.RevokedBy,
+		&i.ReportID,
+	)
+	return i, err
+}
+
+const getReportShareLinkForData = `-- name: GetReportShareLinkForData :one
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count <= max_views)
+`
+
+// The data calls a shared report page makes after it opened (run, map
+// rows, history). The view cap counts page opens, so the open that used
+// the last view keeps working (view_count <= max_views); revoking or
+// expiry stop it at once.
+func (q *Queries) GetReportShareLinkForData(ctx context.Context, token string) (ShareLink, error) {
+	row := q.db.QueryRow(ctx, getReportShareLinkForData, token)
+	var i ShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ZoneID,
+		&i.Token,
+		&i.Label,
+		&i.Settings,
+		&i.ExpiresAt,
+		&i.MaxViews,
+		&i.ViewCount,
+		&i.LastAccessedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.RevokedBy,
+		&i.ReportID,
+	)
+	return i, err
+}
+
 const getShareLinkByID = `-- name: GetShareLinkByID :one
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
 WHERE id = $1 AND tenant_id = $2
 `
@@ -111,14 +241,16 @@ func (q *Queries) GetShareLinkByID(ctx context.Context, arg GetShareLinkByIDPara
 		&i.UpdatedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.ReportID,
 	)
 	return i, err
 }
 
 const getShareLinkByToken = `-- name: GetShareLinkByToken :one
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
 WHERE token = $1
+  AND report_id IS NULL
   AND revoked_at IS NULL
   AND (expires_at IS NULL OR expires_at > now())
   AND (max_views IS NULL OR view_count < max_views)
@@ -152,6 +284,44 @@ func (q *Queries) GetShareLinkByToken(ctx context.Context, token string) (ShareL
 		&i.UpdatedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.ReportID,
+	)
+	return i, err
+}
+
+const getShareLinkForData = `-- name: GetShareLinkForData :one
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count <= max_views)
+`
+
+// The data calls a shared facility page makes after it opened (layer
+// rows, history, live positions) — like GetReportShareLinkForData: the
+// open that used the last view keeps working.
+func (q *Queries) GetShareLinkForData(ctx context.Context, token string) (ShareLink, error) {
+	row := q.db.QueryRow(ctx, getShareLinkForData, token)
+	var i ShareLink
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.ZoneID,
+		&i.Token,
+		&i.Label,
+		&i.Settings,
+		&i.ExpiresAt,
+		&i.MaxViews,
+		&i.ViewCount,
+		&i.LastAccessedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RevokedAt,
+		&i.RevokedBy,
+		&i.ReportID,
 	)
 	return i, err
 }
@@ -174,16 +344,67 @@ func (q *Queries) IncrementShareLinkView(ctx context.Context, id int64) error {
 	return err
 }
 
-const listShareLinksByZone = `-- name: ListShareLinksByZone :many
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+const listShareLinksByReport = `-- name: ListShareLinksByReport :many
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
-WHERE tenant_id = $1 AND zone_id = $2
+WHERE tenant_id = $1 AND report_id = $2
+ORDER BY created_at DESC
+`
+
+type ListShareLinksByReportParams struct {
+	TenantID int64       `json:"tenant_id"`
+	ReportID pgtype.Int8 `json:"report_id"`
+}
+
+// The report's Share dialog: every link issued for it, newest first,
+// revoked ones included (shown greyed out).
+func (q *Queries) ListShareLinksByReport(ctx context.Context, arg ListShareLinksByReportParams) ([]ShareLink, error) {
+	rows, err := q.db.Query(ctx, listShareLinksByReport, arg.TenantID, arg.ReportID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ShareLink{}
+	for rows.Next() {
+		var i ShareLink
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.ZoneID,
+			&i.Token,
+			&i.Label,
+			&i.Settings,
+			&i.ExpiresAt,
+			&i.MaxViews,
+			&i.ViewCount,
+			&i.LastAccessedAt,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RevokedAt,
+			&i.RevokedBy,
+			&i.ReportID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listShareLinksByZone = `-- name: ListShareLinksByZone :many
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE tenant_id = $1 AND zone_id = $2 AND report_id IS NULL
 ORDER BY created_at DESC
 `
 
 type ListShareLinksByZoneParams struct {
-	TenantID int64 `json:"tenant_id"`
-	ZoneID   int64 `json:"zone_id"`
+	TenantID int64       `json:"tenant_id"`
+	ZoneID   pgtype.Int8 `json:"zone_id"`
 }
 
 // Tenant-scoped listing for the editor's "Manage share links" panel.
@@ -215,6 +436,7 @@ func (q *Queries) ListShareLinksByZone(ctx context.Context, arg ListShareLinksBy
 			&i.UpdatedAt,
 			&i.RevokedAt,
 			&i.RevokedBy,
+			&i.ReportID,
 		); err != nil {
 			return nil, err
 		}
@@ -230,7 +452,7 @@ const revokeShareLink = `-- name: RevokeShareLink :one
 UPDATE share_links
 SET revoked_at = now(), revoked_by = $3, updated_at = now()
 WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 `
 
 type RevokeShareLinkParams struct {
@@ -262,6 +484,7 @@ func (q *Queries) RevokeShareLink(ctx context.Context, arg RevokeShareLinkParams
 		&i.UpdatedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.ReportID,
 	)
 	return i, err
 }
@@ -270,7 +493,7 @@ const updateShareLink = `-- name: UpdateShareLink :one
 UPDATE share_links
 SET label = $3, settings = $4, expires_at = $5, max_views = $6, updated_at = now()
 WHERE id = $1 AND tenant_id = $2
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 `
 
 type UpdateShareLinkParams struct {
@@ -311,6 +534,7 @@ func (q *Queries) UpdateShareLink(ctx context.Context, arg UpdateShareLinkParams
 		&i.UpdatedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.ReportID,
 	)
 	return i, err
 }

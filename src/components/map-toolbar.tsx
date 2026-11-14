@@ -30,6 +30,7 @@ import {
   ListChecks,
   MousePointer2,
   Navigation,
+  Ruler,
   Pin,
   Route as RouteIcon,
   RotateCw,
@@ -73,6 +74,7 @@ export type LayerVisibilityKind =
   | 'text'
   | 'stair'
   | 'door'
+  | 'guides'
   | 'zones'
 
 export type LayerVisibility = Record<LayerVisibilityKind, boolean>
@@ -192,6 +194,7 @@ const LAYER_ROWS: ReadonlyArray<{
   { id: 'text', icon: Type, labelKey: 'toolbar.layerText', fallback: 'Text labels' },
   { id: 'stair', icon: Footprints, labelKey: 'toolbar.layerStair', fallback: 'Stairs' },
   { id: 'door', icon: DoorOpen, labelKey: 'toolbar.layerDoor', fallback: 'Doors' },
+  { id: 'guides', icon: Ruler, labelKey: 'toolbar.layerGuides', fallback: 'Guides / measurements' },
   { id: 'zones', icon: Warehouse, labelKey: 'toolbar.layerZones', fallback: 'Facilities' },
 ]
 
@@ -388,6 +391,9 @@ export const MapToolbar = memo(function MapToolbar({
     // mode row (not the draw flyout) because it's a viewing / query
     // tool, not a shape-creating one.
     { id: 'route-preview', icon: Navigation, labelKey: 'toolbar.toolRoutePreview' },
+    // Ruler — measures without creating shapes, so it sits with the
+    // viewing / query tools rather than in the Draw flyout.
+    { id: 'measure', icon: Ruler, labelKey: 'toolbar.toolMeasure' },
   ]
 
   // Creation tools — collapsed into a single Draw flyout button when

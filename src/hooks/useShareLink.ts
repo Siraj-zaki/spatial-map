@@ -20,9 +20,13 @@ import { fetchSharedWarehouse, type PublicSharedWarehouse } from '@/lib/share-li
  *                                      envelope
  *
  * The hook memoises per-token in a ref-backed cache so React StrictMode's
- * double-mount doesn't fire two requests.
+ * double-mount doesn't fire two requests. `fetcher` swaps the endpoint —
+ * the viewer passes one that also opens the link's table rows.
  */
-export function useShareLink(token: string | undefined) {
+export function useShareLink(
+  token: string | undefined,
+  fetcher: (token: string) => Promise<PublicSharedWarehouse | null> = fetchSharedWarehouse,
+) {
   const [data, setData] = useState<PublicSharedWarehouse | null>(null)
   const [loading, setLoading] = useState<boolean>(token !== undefined)
   const [error, setError] = useState<Error | null>(null)
@@ -55,7 +59,7 @@ export function useShareLink(token: string | undefined) {
     setLoading(true)
     setError(null)
     setNotFound(false)
-    fetchSharedWarehouse(token)
+    fetcher(token)
       .then((res) => {
         if (gen !== generation.current) return
         cache.current.set(token, res)
@@ -73,7 +77,7 @@ export function useShareLink(token: string | undefined) {
         if (gen !== generation.current) return
         setLoading(false)
       })
-  }, [token])
+  }, [token, fetcher])
 
   return { data, loading, error, notFound }
 }

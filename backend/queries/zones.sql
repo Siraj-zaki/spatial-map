@@ -34,5 +34,14 @@ WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, name, color, description, ST_X(center) AS center_lng, ST_Y(center) AS center_lat, address, default_view, share_token, is_public, created_at, updated_at;
 
 -- name: DeleteZone :exec
-DELETE FROM zones
-WHERE id = $1 AND tenant_id = $2;
+-- The facility's generated reports (the facility set and the data-link
+-- reports, `spec.origin.kind`) go with it, in the same statement. Left to the
+-- FK they'd become zone-less "Shared" reports, listed under every facility as
+-- duplicate Overview / Floors / … Reports a user made keep ON DELETE SET NULL.
+WITH generated AS (
+  DELETE FROM reports r
+  WHERE r.tenant_id = sqlc.arg(tenant_id) AND r.zone_id = sqlc.arg(id)
+    AND r.spec->'origin'->>'kind' IN ('facility-set', 'data-link')
+)
+DELETE FROM zones z
+WHERE z.id = sqlc.arg(id) AND z.tenant_id = sqlc.arg(tenant_id);

@@ -1,6 +1,7 @@
 import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 import type { TFunction } from 'i18next'
 
 import { apiDb } from '@/lib/api-db'
@@ -93,6 +94,12 @@ export function useCirclePlacementTool({
     }
     const map = mapInstance
     map.getCanvas().style.cursor = 'crosshair'
+    // Where the cursor touches the scene (at the circle tool's elevation) —
+    // not the ground under it, which is off by the floor's height at pitch.
+    const at = (e: MapMouseEvent): [number, number] => {
+      const p = unprojectOnScene(map, e.point, circleConfig.elevation ?? 0)
+      return [p.lng, p.lat]
+    }
 
     if (circleSubMode === 'single') {
       let dragging = false
@@ -102,8 +109,9 @@ export function useCirclePlacementTool({
         dragging = true
         e.preventDefault()
         map.dragPan.disable()
-        setCircleDragStart([e.lngLat.lng, e.lngLat.lat])
-        setCircleDragCursor([e.lngLat.lng, e.lngLat.lat])
+        const p0 = at(e)
+        setCircleDragStart(p0)
+        setCircleDragCursor(p0)
       }
       // RAF-coalesce mousemove — Mapbox fires mousemove at pointer rate
       // (120–500 Hz on modern hardware) but we only need one update per
@@ -121,7 +129,7 @@ export function useCirclePlacementTool({
       }
       const onMouseMove = (e: MapMouseEvent) => {
         if (!dragging) return
-        pendingLngLatSingle = [e.lngLat.lng, e.lngLat.lat]
+        pendingLngLatSingle = at(e)
         if (moveRafSingle === 0) moveRafSingle = requestAnimationFrame(flushMoveSingle)
       }
       const onMouseUp = (e: MapMouseEvent) => {
@@ -134,7 +142,7 @@ export function useCirclePlacementTool({
           setCircleDragCursor(null)
           return
         }
-        const end: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+        const end: [number, number] = at(e)
         const radius = distanceMeters(start, end)
         setCircleDragStart(null)
         setCircleDragCursor(null)
@@ -189,12 +197,12 @@ export function useCirclePlacementTool({
       setCircleGridCursor(c)
     }
     const onMouseMove = (e: MapMouseEvent) => {
-      pendingLngLatGrid = [e.lngLat.lng, e.lngLat.lat]
+      pendingLngLatGrid = at(e)
       if (moveRafGrid === 0) moveRafGrid = requestAnimationFrame(flushMoveGrid)
     }
     const onClick = (e: MapMouseEvent) => {
       if (e.defaultPrevented) return
-      const point: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+      const point: [number, number] = at(e)
       const start = circleGridStartLatest.current
       if (!start) {
         // First click — anchor.

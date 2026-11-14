@@ -1,4 +1,5 @@
 import {
+  Bell,
   Database,
   FileBarChart,
   FolderOpen,
@@ -29,6 +30,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { path: '/tables', key: 'nav.tables', fallback: 'Tables', icon: TableIcon },
   { path: '/data', key: 'nav.data', fallback: 'Data', icon: Database },
   { path: '/reports', key: 'nav.reports', fallback: 'Reports', icon: FileBarChart },
+  { path: '/alerts', key: 'nav.alerts', fallback: 'Alerts', icon: Bell },
 ]
 
 /** Platform-admin only (users with `isPlatformAdmin`). */

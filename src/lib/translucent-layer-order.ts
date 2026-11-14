@@ -28,8 +28,8 @@
 import type { Map as MapboxMapInstance } from 'mapbox-gl'
 
 const INSTALLED = Symbol.for('sgv.translucent-layer-order.installed')
-/** Bump when the ordering rules change (custom layers, dl- skip, …). */
-const ORDER_VERSION = 6
+/** Bump when the ordering rules change (custom layers, dl- skip, ordering pins, …). */
+const ORDER_VERSION = 7
 
 interface RootLayer {
   id: string
@@ -92,10 +92,63 @@ function rootLayersInOrder(map: MapboxMapInstance): RootLayer[] {
   return out
 }
 
+/**
+ * Ordering pins: per map, the opacity a layer is JUDGED by, whatever its
+ * live `fill-extrusion-opacity` says. Kept on the map object under a
+ * global symbol (like INSTALLED), so the map takes its pins with it and a
+ * hot-reloaded copy of this module reads the same table.
+ */
+const PINS = Symbol.for('sgv.translucent-layer-order.pins')
+
+function pinsOf(map: MapboxMapInstance): Map<string, number> | undefined {
+  return (map as unknown as { [PINS]?: Map<string, number> })[PINS]
+}
+
+/**
+ * Pin the opacity the translucent-order pass judges `layerId` by (null =
+ * unpin). A pinned value >= 1 counts as opaque, below 1 as that opacity.
+ *
+ * For a TEMPORARY dim of a layer (focus mode fading grid bucket / grid
+ * line layers to 40 %) that must not move it in the root order: a 100 %
+ * layer dimmed to 0.4 would otherwise be pulled after every opaque 3D
+ * layer, and restoring it would leave it there — exit would no longer be
+ * pixel-identical. Protocol:
+ *
+ *   1. `setOrderingOpacity(map, id, base)`         — pin the ORIGINAL constant
+ *   2. `map.setPaintProperty(id, 'fill-extrusion-opacity', dimmed)`
+ *   …
+ *   3. `map.setPaintProperty(id, 'fill-extrusion-opacity', base)` — restore exactly
+ *   4. `setOrderingOpacity(map, id, null)`         — unpin
+ *
+ * Pin BEFORE the dimming write and unpin AFTER the restoring write: the
+ * write is what schedules a pass (the wrapped `setPaintProperty`), and
+ * that pass must already see the pin. Pinning / unpinning schedules
+ * nothing by itself — with base == restored constant, the pinned and
+ * unpinned verdicts agree, so there is nothing to re-check.
+ */
+export function setOrderingOpacity(
+  map: MapboxMapInstance,
+  layerId: string,
+  opacity: number | null,
+): void {
+  let pins = pinsOf(map)
+  if (opacity === null || !Number.isFinite(opacity)) {
+    pins?.delete(layerId)
+    return
+  }
+  if (!pins) {
+    pins = new Map()
+    ;(map as unknown as { [PINS]?: Map<string, number> })[PINS] = pins
+  }
+  pins.set(layerId, opacity)
+}
+
 /** Constant opacity below 1, or null when opaque / not a fill-extrusion. */
 function translucentOpacity(map: MapboxMapInstance, layer: RootLayer): number | null {
   if (layer.type === 'custom') return layer.translucent ? CUSTOM_TRANSLUCENT_OPACITY : null
   if (layer.type !== 'fill-extrusion') return null
+  const pinned = pinsOf(map)?.get(layer.id)
+  if (pinned !== undefined) return pinned < 1 ? pinned : null
   let value: unknown
   try {
     value = map.getPaintProperty(layer.id, 'fill-extrusion-opacity')
@@ -124,10 +177,11 @@ export function orderTranslucentLayers(
   }
   // Only root layers outside slots: slotted layers belong to the basemap's
   // stack (and the floor-plan custom layer, which isn't listed here).
-  // Data-link layers (`dl-…`) are skipped: map-data-linked-overlay raises
-  // them to the top on every `styledata`, and our moves fire `styledata`
-  // — sorting them too would make the two policies chase each other
-  // forever (the map never went idle).
+  // Data-link layers (`dl-…`) are skipped: map-data-linked-overlay keeps
+  // them on top as one block (`raiseDataLinkLayers`, re-checked on
+  // `styledata`), and our moves fire `styledata` — sorting them too would
+  // pull the block down only for the raise to put it back, so the two
+  // policies would chase each other and the map would never go idle.
   const own = layers.filter((l) => !l.slot && !l.id.startsWith('dl-'))
   const translucent: { id: string; opacity: number; index: number }[] = []
   let lastOpaque3D = -1

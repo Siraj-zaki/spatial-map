@@ -21,6 +21,7 @@ import {
   ESCALATOR_STANDARD_ANGLE,
   escalatorGeometry,
   escalatorInclineIssue,
+  liftScaleOf,
   resolveLiftLevels,
 } from '@/lib/vertical-transport-generators'
 
@@ -530,6 +531,18 @@ export function ElevatorFields({
         max={6}
         onChange={(doorWidth) => set({ doorWidth })}
       />
+      <div className="space-y-1">
+        <SliderRow
+          label={t('sidePanel.lift.size')}
+          value={Math.round(liftScaleOf(config) * 100)}
+          onChange={(v) => set({ liftScale: Math.max(40, Math.min(100, v)) / 100 })}
+          min={40}
+          max={100}
+          step={5}
+          suffix="%"
+        />
+        <p className="text-[10px] text-muted-foreground">{t('sidePanel.lift.sizeHint')}</p>
+      </div>
       <StatusField config={config} onChange={(next) => set(next)} />
     </div>
   )

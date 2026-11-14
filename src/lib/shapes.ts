@@ -272,6 +272,23 @@ export interface FillShapeConfig {
    * won't darken at low zoom, but no shadows will land on it either.
    */
   receiveShadows?: boolean
+  /**
+   * Solid object (counter, plinth, partition, machine, tank…) instead of
+   * a zone tint. Areas render lit by the sun like walls (emissive 0, so
+   * each face shades differently) instead of self-lit. Turning it on
+   * through `solidConfigPatch` also makes the shape opaque and gives it
+   * a real height. Circles are already sun-lit, so for them the flag
+   * only carries those defaults.
+   */
+  solid?: boolean
+  /**
+   * Top of the 3D shape (sloped-mesh.ts): `flat` (default) extrudes
+   * straight up; `taper` shrinks linearly to the top (pyramid, cone);
+   * `dome` curves in like a quarter ellipse. Needs a height.
+   */
+  topShape?: 'flat' | 'taper' | 'dome'
+  /** Size of the top as a % of the footprint, 0 (a point) … 100. Default 0. */
+  topScale?: number
   showLabels: boolean
   /** Single label text — unlike grids, polygons/circles carry one label. */
   label: string
@@ -397,6 +414,18 @@ export interface LineShapeConfig {
    * sensible look without a migration.
    */
   wallThickness?: number
+  /**
+   * Sloped wall (sloped-mesh.ts): how far the top of the wall moves
+   * sideways, in METERS. 0 / undefined = an ordinary vertical wall.
+   */
+  lean?: number
+  /** `straight` = a flat slanted wall; `curved` (default) bends over near the top. */
+  leanProfile?: 'straight' | 'curved'
+  /**
+   * Which way the wall leans: `left` / `right` of the drawing direction,
+   * or `in` / `out` on a closed loop. Default: `in` on a loop, else `left`.
+   */
+  leanSide?: 'left' | 'right' | 'in' | 'out'
   showLabels: boolean
   label: string
   labelSize: number
@@ -572,6 +601,13 @@ export interface StairShapeConfig {
   depth?: number
   /** Elevator door opening width (m). */
   doorWidth?: number
+  /**
+   * Elevator: vertical size factor (0.4–1, default 1) for the car, doors
+   * and the shaft headroom above the top stop. For buildings drawn smaller
+   * than real size, where a real 2.4 m car and 3.4 m overrun would stand
+   * out of the roof.
+   */
+  liftScale?: number
   /** Lifts: out of service greys the treads / doors and marks the icon. */
   status?: 'operational' | 'out-of-service'
 
@@ -700,6 +736,27 @@ export interface ShapeRef {
 // ---------------------------------------------------------------------------
 // Default style configs (sensible starting values for new shapes)
 // ---------------------------------------------------------------------------
+
+/** Height given to a flat area/circle when it's switched to a solid object. */
+export const SOLID_DEFAULT_HEIGHT_M = 1
+
+/**
+ * Config patch for the "Solid object" switch. On: opaque, and a flat
+ * shape gets SOLID_DEFAULT_HEIGHT_M so the switch visibly does
+ * something. Off: only clears the flag — the user's height / opacity
+ * stay as they are.
+ */
+export function solidConfigPatch(
+  config: Pick<FillShapeConfig, 'height'>,
+  solid: boolean
+): Partial<FillShapeConfig> {
+  if (!solid) return { solid: false }
+  return {
+    solid: true,
+    opacity: 100,
+    height: config.height > 0 ? config.height : SOLID_DEFAULT_HEIGHT_M,
+  }
+}
 
 export const DEFAULT_FILL_CONFIG: FillShapeConfig = {
   color: '#6366f1',

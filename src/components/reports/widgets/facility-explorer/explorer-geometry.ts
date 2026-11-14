@@ -7,6 +7,8 @@
  * thumbnail keeps the shape's real proportions.
  */
 
+import { pathGridOutline } from '@/lib/grid-generators'
+import { isPathGrid, pathGridDimensions } from '@/lib/grid-path'
 import type { Grid } from '@/lib/db'
 import type { DoorShape } from '@/lib/door/types'
 import type {
@@ -106,6 +108,8 @@ export function shapeBounds(s: ExplorerShape): [number, number, number, number] 
 
 /** Rack rectangle, rotated about its start corner like the grid renderer. */
 function gridCorners(g: Grid): LngLat[] {
+  // Path-layout grid: the outline of its strip along the path.
+  if (isPathGrid(g.config)) return pathGridOutline(g.start, g.current, g.config)
   const [x0, y0] = g.start
   const [x1, y1] = g.current
   const rect: LngLat[] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
@@ -167,6 +171,10 @@ export function fitToBox(pts: readonly [number, number][], w: number, h: number,
 
 /** Grid cell counts, mirroring grid-generators' floor(span / cell). */
 export function gridCellCounts(g: Grid): { cols: number; rows: number } {
+  if (isPathGrid(g.config)) {
+    const { cols, rows } = pathGridDimensions(g.start, g.current, g.config)
+    return { cols, rows }
+  }
   const k = Math.cos((g.start[1] * Math.PI) / 180) * M_PER_DEG
   const w = Math.abs(g.current[0] - g.start[0]) * k
   const d = Math.abs(g.current[1] - g.start[1]) * M_PER_DEG

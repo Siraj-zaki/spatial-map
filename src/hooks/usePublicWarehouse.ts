@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { publicFetch, type ApiError } from '@/lib/api-client'
+import { openOnOwningSite } from '@/lib/site'
 import type { Bin, Grid, Zone, DataLinkConfig, StyleRuleRow } from '@/lib/db'
 import type {
   PolygonShape,
@@ -121,7 +122,9 @@ export function usePublicWarehouse(
     const gen = ++generation.current
     setLoading(true)
     setError(null)
-    publicFetch<WarehouseView>(endpoint)
+    const load = () => publicFetch<WarehouseView>(endpoint)
+    const request = token ? openOnOwningSite(`token:${idOrToken}`, load) : load()
+    request
       .then((raw) => {
         if (gen !== generation.current) return
         const parsed = parseAll(raw)

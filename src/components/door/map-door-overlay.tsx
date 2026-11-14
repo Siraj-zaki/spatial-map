@@ -30,6 +30,8 @@ import {
   rotateDoorVertices,
 } from '@/lib/door/generators'
 import { higherPriorityAt } from '@/lib/overlay-hit-priority'
+import type { LayerFeaturePredicate } from '@/lib/empty-layer-gate'
+import { GatedLayerHold, type GatedLayerSpec } from '@/components/map-line-overlay'
 import {
   TRANSFORM_ICON,
   readThemePrimaryForegroundHex,
@@ -40,9 +42,11 @@ import {
 import type { DoorConfig, DoorShape } from '@/lib/door/types'
 import {
   buildOccluders,
-  computeOccludedIds,
+  createOcclusionState,
+  updateOcclusion,
   type GridOccluderInput,
   type OccludableTarget,
+  type OcclusionState,
 } from '@/lib/marker-occlusion'
 import type {
   CircleShape,
@@ -51,6 +55,16 @@ import type {
   PolygonShape,
   StairShape,
 } from '@/lib/shapes'
+import { fadeMeshData, patchFeatureCollection } from '@/lib/focus/focus-fade'
+import {
+  GHOST_OCCLUDED_OPACITY,
+  NO_BLOCKERS,
+  focusFactor,
+  focusedIdOf,
+  useFocusScene,
+  type FocusScene,
+} from '@/lib/focus/focus-scene'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
 
 const POLY_SOURCE = 'door-tool-poly-source'
 const FILL_LAYER = 'door-tool-fill-layer'
@@ -94,9 +108,123 @@ const LABEL_INFLIGHT_LAYER = 'door-tool-label-inflight-layer'
 
 const EMPTY_FC = { type: 'FeatureCollection' as const, features: [] }
 
+/**
+ * Empty-layer gate predicate (lib/empty-layer-gate.ts) for SELECTION_LAYER —
+ * a JS transcription of the filter the selection effect sets: `== -1` with
+ * nothing selected (also the addLayer filter), `== id` for one door,
+ * `in [ids]` for several, AND `['!=', ['get', 'doorId'], excludeId]` while
+ * a transform is active. It lets the gate hide the layer while that filter
+ * passes no feature — with nothing selected Mapbox still re-evaluates it
+ * every frame. Mapbox `get` reads a missing property as null and `==` /
+ * `!=` / `in` are strict, so `?.` + `===` match it value for value.
+ */
+export function doorSelectionPredicate(ids: ReadonlyArray<number>, excludeId?: number | null): LayerFeaturePredicate {
+  let idTest: (id: unknown) => boolean
+  if (ids.length === 0) idTest = (id) => id === -1
+  else if (ids.length === 1) {
+    const only = ids[0]
+    idTest = (id) => id === only
+  } else {
+    const selected = new Set<unknown>(ids)
+    idTest = (id) => selected.has(id)
+  }
+  return (f) => {
+    const id = f.properties?.doorId
+    if (!idTest(id)) return false
+    return excludeId == null || id !== excludeId
+  }
+}
+
+/**
+ * The layers gated through GatedLayerHold (map-line-overlay.tsx): a
+ * cleared, excluded or deleted selection keeps SELECTION_LAYER visible
+ * until POLY_SOURCE re-tiles, the moment its outline leaves the screen
+ * anyway. A line layer, so it casts no shadow.
+ */
+const DOOR_GATED_LAYERS: ReadonlyMap<string, GatedLayerSpec> = new Map<string, GatedLayerSpec>([
+  [SELECTION_LAYER, { sourceId: POLY_SOURCE, castsShadows: false }],
+])
+
 // Built doors (door/mesh.ts). The glass layer holds revolving-door glass.
 const MESH_LAYER = 'door-tool-mesh-layer'
 const GLASS_MESH_LAYER = 'door-tool-glass-mesh-layer'
+/**
+ * Focus mode: solid meshes of doors in the focused item's NEAR column
+ * (alpha × FOCUS_FACTOR.near). A
+ * faded solid must not write depth like an opaque one, so it moves to this
+ * translucent, non-glass instance (kept after every opaque 3D layer by
+ * translucent-layer-order.ts, like useShapeMeshLayers' translucent layer).
+ * Faded glass stays in GLASS_MESH_LAYER. Empty outside focus mode.
+ */
+const FADED_MESH_LAYER = 'door-mesh-faded-layer'
+const NO_MESHES: LiftMeshData[] = []
+
+/**
+ * `text-opacity` of LABEL_LAYER:
+ *
+ *   focusScale × case(occluded → 0 | ghost, authored)
+ *
+ * `occluded` is the analytic pass's feature-state; with Graphics → "faint
+ * ghosts" on an occluded label keeps GHOST_OCCLUDED_OPACITY of its authored
+ * opacity instead of 0. `focusScale` (feature-state, unset → 1) is focus
+ * mode's near tier. With no feature-state and ghosts off it evaluates to
+ * exactly the pre-focus expression. It reads feature-state, which keeps
+ * LABEL_LAYER state-dependent — required for any symbol layer on a source
+ * that carries feature-state (see textFocusTwinOpacityExpr in
+ * map-text-label-overlay.tsx).
+ */
+export function doorLabelOpacityExpr(ghosts: boolean): unknown[] {
+  return [
+    '*',
+    ['coalesce', ['feature-state', 'focusScale'], 1],
+    [
+      'case',
+      ['boolean', ['feature-state', 'occluded'], false],
+      ghosts ? ['*', GHOST_OCCLUDED_OPACITY, ['to-number', ['get', 'opacity']]] : 0,
+      ['to-number', ['get', 'opacity']],
+    ],
+  ]
+}
+
+/**
+ * Focus factors that aren't 1, per door, as a value key (`id:factor,…`, ''
+ * when none). Doors never occlude, so blockers don't apply: the tier is
+ * focus / near / normal — a door whose opening midpoint lies in the focused
+ * item's NEAR column (`scene.near.doors`) fades to FOCUS_FACTOR.near, label
+ * and body; every other door keeps factor 1. Memos keyed on the key keep
+ * their identity while the faded set is unchanged.
+ */
+function doorFocusFactorKey(scene: FocusScene, doors: ReadonlyArray<DoorShape>): string {
+  if (!scene.active) return ''
+  const parts: string[] = []
+  for (const d of doors) {
+    const f = focusFactor(scene, NO_BLOCKERS, 'doors', d.id)
+    if (f !== 1) parts.push(`${d.id}:${f}`)
+  }
+  return parts.join(',')
+}
+
+/** Inverse of `doorFocusFactorKey`; null when no door is faded. */
+function parseDoorFactorKey(key: string): ReadonlyMap<number, number> | null {
+  if (key === '') return null
+  const out = new Map<number, number>()
+  for (const part of key.split(',')) {
+    const i = part.indexOf(':')
+    out.set(Number(part.slice(0, i)), Number(part.slice(i + 1)))
+  }
+  return out
+}
+
+const NO_FACTORS: ReadonlyMap<number, number> = new Map()
+
+/** Structural equality for the small paint values compared before a write. */
+function sameValue(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
 
 interface DoorMeshes {
   solid: LiftMeshData
@@ -191,6 +319,16 @@ export function MapDoorOverlay({
   // `map-polygon-overlay.tsx`.
   const [styleGen, setStyleGen] = useState(0)
 
+  // ---- Focus mode (view state from the host's FocusSceneContext) --------
+  // Outside a provider the scene is FOCUS_OFF: no door is focused, every
+  // factor is 1 and the focus paths below hand back today's data untouched.
+  const scene = useFocusScene()
+  const focusedDoorId = focusedIdOf(scene, 'doors')
+  const doorFactorKey = useMemo(() => doorFocusFactorKey(scene, doors), [scene, doors])
+  /** door id → focus factor (< 1) for the doors in the NEAR column; null when none. */
+  const doorFactors = useMemo(() => parseDoorFactorKey(doorFactorKey), [doorFactorKey])
+  const occlusionGhosts = useGraphicsSettings((s) => s.occlusionGhosts)
+
   // ---- Style readiness (mirrors stair / polygon overlay) ----------------
   useEffect(() => {
     if (!map) return
@@ -266,36 +404,59 @@ export function MapDoorOverlay({
   }, [livePreview])
 
   // ---- Built-door meshes ------------------------------------------------
+  // Focus mode routes a faded door's solid mesh (alpha × factor, cached per
+  // mesh + factor) to FADED_MESH_LAYER and its faded glass to the glass
+  // layer. With no faded door `faded` stays the shared empty list and the
+  // other two are exactly what they were before focus mode.
   const meshData = useMemo(() => {
     const solid: LiftMeshData[] = []
     const glass: LiftMeshData[] = []
+    let faded = NO_MESHES
     if (committedVisible) {
       for (const d of doors) {
         if (!d.visible) continue
         const m = cachedDoorMeshes(d)
         if (!m) continue
-        solid.push(m.solid)
-        glass.push(m.glass)
+        const factor = doorFactors?.get(d.id)
+        if (factor === undefined) {
+          solid.push(m.solid)
+          glass.push(m.glass)
+          continue
+        }
+        if (faded === NO_MESHES) faded = []
+        faded.push(fadeMeshData(m.solid, factor))
+        glass.push(fadeMeshData(m.glass, factor))
       }
     }
-    return { solid, glass }
-  }, [doors, committedVisible])
-  const meshLayersRef = useRef<{ solid: LiftMeshLayer; glass: LiftMeshLayer } | null>(null)
+    return { solid, glass, faded }
+  }, [doors, committedVisible, doorFactors])
+  const meshLayersRef = useRef<{ solid: LiftMeshLayer; glass: LiftMeshLayer; faded: LiftMeshLayer } | null>(null)
   if (meshLayersRef.current === null) {
     meshLayersRef.current = {
       solid: new LiftMeshLayer(MESH_LAYER),
       glass: new LiftMeshLayer(GLASS_MESH_LAYER, true),
+      faded: new LiftMeshLayer(FADED_MESH_LAYER, true, false),
     }
   }
+
+  // ---- Empty-layer gate --------------------------------------------------
+  // Every gate predicate goes through this hold (GatedLayerHold).
+  const gateHoldRef = useRef(new GatedLayerHold(DOOR_GATED_LAYERS))
+  useEffect(() => {
+    if (!map) return
+    return gateHoldRef.current.attach(map)
+  }, [map])
 
   // ---- Mount sources + layers ------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
 
     // Polygons (frame + leaves)
     if (!map.getSource(POLY_SOURCE)) {
       try {
         map.addSource(POLY_SOURCE, { type: 'geojson', data: EMPTY_FC, lineMetrics: true })
+        gateHold.resetSource(POLY_SOURCE)
       } catch (err) {
         console.warn('[door-overlay] poly source failed', err)
         return
@@ -335,6 +496,10 @@ export function MapDoorOverlay({
       try {
         if (!map.getLayer(MESH_LAYER)) map.addLayer(meshLayers.solid)
         if (!map.getLayer(GLASS_MESH_LAYER)) map.addLayer(meshLayers.glass)
+        // Right after the glass: both are translucent custom layers, so the
+        // ordering pass keeps them adjacent and the glass's place in the
+        // stack doesn't move.
+        if (!map.getLayer(FADED_MESH_LAYER)) map.addLayer(meshLayers.faded)
       } catch (err) {
         console.warn('[door-overlay] mesh layers failed', err)
       }
@@ -380,6 +545,7 @@ export function MapDoorOverlay({
           // effect rewrites this to match selected door ids.
           filter: ['==', ['get', 'doorId'], -1],
         })
+        gateHold.register(map, SELECTION_LAYER, doorSelectionPredicate([]))
       } catch (err) {
         console.warn('[door-overlay] selection layer failed', err)
       }
@@ -458,12 +624,11 @@ export function MapDoorOverlay({
             // Fold analytic occlusion into text-opacity: hidden labels
             // become opacity 0 while everything else keeps the authored
             // per-feature opacity. Mirrors the text-label overlay pattern.
-            'text-opacity': [
-              'case',
-              ['boolean', ['feature-state', 'occluded'], false],
-              0,
-              ['to-number', ['get', 'opacity']],
-            ],
+            // Focus mode's near tier and the "faint ghosts" setting fold in
+            // too (doorLabelOpacityExpr); installed with the current
+            // setting so the toggle effect has nothing to rewrite on mount.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            'text-opacity': doorLabelOpacityExpr(useGraphicsSettings.getState().occlusionGhosts) as any,
             'text-halo-color': '#ffffff',
             'text-halo-width': 1.2,
             // Force x-ray (1) so the GL depth buffer doesn't second-guess
@@ -627,16 +792,48 @@ export function MapDoorOverlay({
   useEffect(() => {
     if (!map || !styleLoaded) return
     const polySrc = map.getSource(POLY_SOURCE) as GeoJSONSource | undefined
-    const arcSrc = map.getSource(ARC_SOURCE) as GeoJSONSource | undefined
     const labelSrc = map.getSource(LABEL_SOURCE) as GeoJSONSource | undefined
+    // Before setData, where the gate re-counts (GatedLayerHold).
+    if (polySrc) gateHoldRef.current.push(map, POLY_SOURCE, collections.polygons)
     polySrc?.setData(collections.polygons as Parameters<GeoJSONSource['setData']>[0])
-    arcSrc?.setData(collections.lines as Parameters<GeoJSONSource['setData']>[0])
     labelSrc?.setData(collections.labels as Parameters<GeoJSONSource['setData']>[0])
   }, [map, styleLoaded, styleGen, collections])
+
+  // Swing arcs. ARC_LAYER's `line-opacity` reads the stamped `opacity`, so
+  // focus mode fades an arc by re-stamping it (opacity × factor) on a
+  // copy-on-write pass over `collections.lines`. Unfaded arcs keep their
+  // identity, and with no faded door the collection itself comes back, so
+  // this pushes exactly when it did before focus mode (on a data change),
+  // plus once per focus change that alters a door's tier.
+  const arcCollection = useMemo(() => {
+    const lines = collections.lines as GeoJSON.FeatureCollection<GeoJSON.Geometry, GeoJSON.GeoJsonProperties>
+    if (!doorFactors) return lines
+    return patchFeatureCollection(
+      lines,
+      (f) => {
+        const p = f.properties
+        if (typeof p?.doorId !== 'number' || typeof p.opacity !== 'number') return null
+        const factor = doorFactors.get(p.doorId)
+        return factor === undefined ? null : `focus:${factor}`
+      },
+      // Only reached for a numeric `opacity` (tagOf above).
+      (props, tag) => ({
+        ...props,
+        opacity: (props?.opacity as number) * Number(tag.slice('focus:'.length)),
+      }),
+    )
+  }, [collections, doorFactors])
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const arcSrc = map.getSource(ARC_SOURCE) as GeoJSONSource | undefined
+    arcSrc?.setData(arcCollection as Parameters<GeoJSONSource['setData']>[0])
+  }, [map, styleLoaded, styleGen, arcCollection])
 
   // Built-door meshes. The transforming door is drawn from its live copy
   // (pushInflightMesh) instead.
   const baseMeshesRef = useRef(meshData)
+  /** Whether FADED_MESH_LAYER was last handed any mesh (skip empty → empty). */
+  const fadedPushedRef = useRef(false)
   useEffect(() => {
     baseMeshesRef.current = meshData
     const layers = meshLayersRef.current
@@ -644,6 +841,11 @@ export function MapDoorOverlay({
     const skip = transformState ? `${transformState.doorId}:` : null
     layers.solid.setMeshes(skip ? meshData.solid.filter((m) => !m.key.startsWith(skip)) : meshData.solid)
     layers.glass.setMeshes(skip ? meshData.glass.filter((m) => !m.key.startsWith(skip)) : meshData.glass)
+    const faded = skip ? meshData.faded.filter((m) => !m.key.startsWith(skip)) : meshData.faded
+    if (faded.length > 0 || fadedPushedRef.current) {
+      layers.faded.setMeshes(faded)
+      fadedPushedRef.current = faded.length > 0
+    }
   }, [meshData, transformState])
   const pushInflightMesh = useCallback(
     (id: number, vertices: [[number, number], [number, number]], config: DoorConfig) => {
@@ -662,7 +864,7 @@ export function MapDoorOverlay({
     const layers = meshLayersRef.current
     return () => {
       if (!map || !layers) return
-      for (const id of [MESH_LAYER, GLASS_MESH_LAYER]) {
+      for (const id of [MESH_LAYER, GLASS_MESH_LAYER, FADED_MESH_LAYER]) {
         try {
           if (map.getLayer(id)) map.removeLayer(id)
         } catch { /* map gone */ }
@@ -704,36 +906,63 @@ export function MapDoorOverlay({
       occludeGrids,
     ],
   )
-  const occludedIdsRef = useRef<Set<number>>(new Set())
+  // Targets are the doors that actually DRAW a label. The pass only drives
+  // LABEL_LAYER's text-opacity, and a door without a label feature
+  // (`showLabels` off — every door in most facilities — empty text,
+  // hidden, degenerate frame) has nothing to hide; testing it every frame
+  // was pure cost. Same target per labelled door as before: opening
+  // midpoint, door-top altitude, own floor. `collections` is already
+  // empty while `committedVisible` is off. The focused door's label is
+  // left out — focus mode never hides it — so the next pass reports it in
+  // `left` and the effect below clears its `occluded` flag (a flip write).
+  // LABEL_LAYER already ignores placement, so nothing else can drop it.
+  const labelTargets = useMemo(() => {
+    const labelled = new Set<unknown>()
+    for (const f of collections.labels.features) {
+      labelled.add((f.properties as { doorId?: unknown } | null)?.doorId)
+    }
+    const targets: OccludableTarget[] = []
+    if (labelled.size === 0) return targets
+    for (const d of doors) {
+      if (d.id === undefined || !labelled.has(d.id)) continue
+      if (d.id === focusedDoorId) continue
+      if (d.visible === false) continue
+      const [v0, v1] = d.vertices
+      const position: [number, number] = [
+        (v0[0] + v1[0]) / 2,
+        (v0[1] + v1[1]) / 2,
+      ]
+      // Label rides at the door's top — same altitude the generator
+      // stamps on the label feature's `base_height`.
+      const elevationM =
+        (d.config.elevation ?? 0) + Math.max(0.01, d.config.doorHeight ?? 0)
+      targets.push({
+        id: d.id,
+        position,
+        elevationM,
+        floorPlanId: d.floorPlanId,
+      })
+    }
+    return targets
+  }, [doors, collections, focusedDoorId])
+  // LABEL_SOURCE's feature-state as an `OcclusionState`, tied to the source
+  // instance it was written to — see the matching note in
+  // `map-text-label-overlay.tsx`. A re-created source (style swap,
+  // StrictMode remount, HMR) starts empty and gets every occluded id
+  // written again; otherwise only the ids that flipped are written.
+  const labelOcclusionRef = useRef<{ source: unknown; state: OcclusionState } | null>(null)
   useEffect(() => {
     if (!map || !styleLoaded) return
-    const targets: OccludableTarget[] = []
-    if (committedVisible) {
-      for (const d of doors) {
-        if (d.id === undefined) continue
-        if (d.visible === false) continue
-        const [v0, v1] = d.vertices
-        const position: [number, number] = [
-          (v0[0] + v1[0]) / 2,
-          (v0[1] + v1[1]) / 2,
-        ]
-        // Label rides at the door's top — same altitude the generator
-        // stamps on the label feature's `base_height`.
-        const elevationM =
-          (d.config.elevation ?? 0) + Math.max(0.01, d.config.doorHeight ?? 0)
-        targets.push({
-          id: d.id,
-          position,
-          elevationM,
-          floorPlanId: d.floorPlanId,
-        })
+    const sync = () => {
+      const source = map.getSource(LABEL_SOURCE)
+      if (!source) return
+      let o = labelOcclusionRef.current
+      if (!o || o.source !== source) {
+        o = { source, state: createOcclusionState() }
+        labelOcclusionRef.current = o
       }
-    }
-    const apply = () => {
-      const nextOccluded = computeOccludedIds(map, targets, prisms)
-      const prev = occludedIdsRef.current
-      for (const id of prev) {
-        if (nextOccluded.has(id)) continue
+      const { entered, left } = updateOcclusion(map, labelTargets, prisms, o.state)
+      for (const id of left) {
         try {
           map.setFeatureState(
             { source: LABEL_SOURCE, id },
@@ -741,7 +970,7 @@ export function MapDoorOverlay({
           )
         } catch { /* source went away */ }
       }
-      for (const id of nextOccluded) {
+      for (const id of entered) {
         try {
           map.setFeatureState(
             { source: LABEL_SOURCE, id },
@@ -749,14 +978,75 @@ export function MapDoorOverlay({
           )
         } catch { /* source went away */ }
       }
-      occludedIdsRef.current = nextOccluded
     }
-    apply()
-    map.on('move', apply)
+    // One pass now (also clears labels that just lost their target).
+    sync()
+    // No drawn labels, or nothing to hide them behind: the result can't
+    // depend on the camera, so don't listen to it at all.
+    if (labelTargets.length === 0 || prisms.length === 0) return
+    map.on('move', sync)
     return () => {
-      map.off('move', apply)
+      map.off('move', sync)
     }
-  }, [map, styleLoaded, doors, prisms, committedVisible])
+  }, [map, styleLoaded, styleGen, labelTargets, prisms])
+
+  // ---- Focus mode: label near tier --------------------------------------
+  // `focusScale` (FOCUS_FACTOR.near) on the labels of the doors in the
+  // NEAR column, folded into LABEL_LAYER's text-opacity. Written from the scene,
+  // never from the camera, and only for ids whose value changed; tracked
+  // per LABEL_SOURCE instance like the occlusion state, so a re-created
+  // source gets every value written again.
+  const labelFocusRef = useRef<{ source: unknown; scales: ReadonlyMap<number, number> } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const source = map.getSource(LABEL_SOURCE)
+    if (!source) return
+    let w = labelFocusRef.current
+    if (!w || w.source !== source) {
+      w = { source, scales: NO_FACTORS }
+      labelFocusRef.current = w
+    }
+    let next: ReadonlyMap<number, number> = NO_FACTORS
+    if (doorFactors) {
+      const m = new Map<number, number>()
+      for (const f of collections.labels.features) {
+        const id = (f.properties as { doorId?: unknown } | null)?.doorId
+        if (typeof id !== 'number') continue
+        const factor = doorFactors.get(id)
+        if (factor !== undefined) m.set(id, factor)
+      }
+      if (m.size > 0) next = m
+    }
+    const prev = w.scales
+    if (prev === next) return
+    const write = (id: number, factor: number) => {
+      try {
+        map.setFeatureState({ source: LABEL_SOURCE, id }, { focusScale: factor })
+      } catch { /* source went away */ }
+    }
+    for (const id of prev.keys()) {
+      if (!next.has(id)) write(id, 1)
+    }
+    for (const [id, factor] of next) {
+      if (prev.get(id) !== factor) write(id, factor)
+    }
+    w.scales = next
+  }, [map, styleLoaded, styleGen, collections, doorFactors])
+
+  // ---- Graphics → "faint ghosts" (labels) --------------------------------
+  // Occluded branch of LABEL_LAYER's text-opacity: 0 or GHOST_OCCLUDED_OPACITY.
+  // Written only when the live value differs — one relayout per toggle,
+  // nothing on mount (the layer is installed with the current setting).
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    try {
+      if (!map.getLayer(LABEL_LAYER)) return
+      const value = doorLabelOpacityExpr(occlusionGhosts)
+      if (sameValue(map.getPaintProperty(LABEL_LAYER, 'text-opacity'), value)) return
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      map.setPaintProperty(LABEL_LAYER, 'text-opacity', value as any)
+    } catch { /* style torn down */ }
+  }, [map, styleLoaded, styleGen, occlusionGhosts])
 
   // ---- Selection filter ------------------------------------------------
   // Composes with the transform exclusion — while a transform is
@@ -780,6 +1070,10 @@ export function MapDoorOverlay({
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       map.setFilter(SELECTION_LAYER, filter as any)
+      // Same synchronous pass as the filter: a new selection's outline
+      // shows from the very next frame, and a cleared one is held until
+      // POLY_SOURCE re-tiles (GatedLayerHold).
+      gateHoldRef.current.register(map, SELECTION_LAYER, doorSelectionPredicate(ids, excludeId))
     } catch {
       /* ignore */
     }

@@ -24,6 +24,13 @@ import {
   glbUint8ToBlobUrl,
 } from '@/lib/image-plane-generators'
 import type { ImagePlaneShape } from '@/lib/shapes'
+import { hasMapLayer } from '@/lib/data-link/dl-layer-stack'
+import { useFocusBlockers, useFocusScene } from '@/lib/focus/focus-scene'
+import {
+  modelFocusFactors,
+  scaleModelOpacity,
+  withFocusModelOpacity,
+} from '@/components/map-model-overlay'
 import mapboxgl, {
   type Map as MapboxMapInstance,
   type MapMouseEvent,
@@ -223,12 +230,14 @@ export function MapImagePlaneOverlay({
   // fetch reports done, planes stay invisible.
   useEffect(() => {
     unmountedRef.current = false
+    // The cache Map lives for the component's lifetime (never reassigned).
+    const glbCache = glbCacheRef.current
     return () => {
       unmountedRef.current = true
-      for (const entry of glbCacheRef.current.values()) {
+      for (const entry of glbCache.values()) {
         try { URL.revokeObjectURL(entry.blobUrl) } catch { /* ignore */ }
       }
-      glbCacheRef.current.clear()
+      glbCache.clear()
     }
   }, [])
 
@@ -244,7 +253,9 @@ export function MapImagePlaneOverlay({
     for (const s of imagePlanes ?? []) {
       if (s.id === undefined) continue
       if (s.visible === false) continue
-      // eslint-disable-next-line react-hooks/refs -- latest-value ref, read/written outside effects intentionally
+      // Read during render on purpose: every cache write is followed by a
+      // `glbTick` bump, which re-runs this memo (see the synth effect).
+      // eslint-disable-next-line react-hooks/refs
       const cached = glbCacheRef.current.get(s.id)
       if (!cached || cached.imageUrl !== s.imageUrl) continue
       const entry = buildImagePlaneEntry(s, cached.blobUrl)
@@ -256,6 +267,28 @@ export function MapImagePlaneOverlay({
   }, [imagePlanes, glbTick])
 
   const activeShapeIdsKey = entries.map((e) => e.shapeId).sort((a, b) => a - b).join('|')
+
+  // ---- Focus mode -------------------------------------------------------
+  // Same per-item `model-opacity` factor as the 3D model overlay (see
+  // `scaleModelOpacity` in map-model-overlay.tsx, which also notes how
+  // translucent-layer-order treats model layers): only a plane anchored in
+  // the focused item's NEAR column fades (FOCUS_FACTOR.near); every other
+  // plane keeps factor 1. The layer effect reads
+  // the factors through a ref; the focus effect after it writes only the
+  // planes whose factor changed. `appliedFocusRef` = the factor each
+  // mounted layer currently shows.
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  const focusFactors = useMemo(
+    () => modelFocusFactors(imagePlanes, 'image-planes', focusScene, focusBlockers),
+    [imagePlanes, focusScene, focusBlockers],
+  )
+  const focusFactorsRef = useRef(focusFactors)
+  const appliedFocusRef = useRef<Map<number, number>>(new Map())
+  // Declared BEFORE the layer effect so it sees this commit's factors.
+  useEffect(() => {
+    focusFactorsRef.current = focusFactors
+  }, [focusFactors])
 
   // Tracks the GLB URL each shape's source is currently mounted with.
   // When the synthesised URL for a shape changes (e.g. the GLB just
@@ -289,13 +322,14 @@ export function MapImagePlaneOverlay({
     new Map(),
   )
   useEffect(() => {
+    // Both Maps live for the component's lifetime (never reassigned).
+    const pending = pendingRetryRef.current
+    const listeners = pendingListenerRef.current
     return () => {
-      const pending = pendingRetryRef.current
       for (const timers of pending.values()) {
         for (const t of timers) clearTimeout(t)
       }
       pending.clear()
-      const listeners = pendingListenerRef.current
       if (map) {
         for (const fn of listeners.values()) {
           try {
@@ -328,7 +362,6 @@ export function MapImagePlaneOverlay({
       console.debug(
         '[map-image-plane-overlay] layer effect running',
         'entries=', entries.length,
-        'imagePlanes=', imagePlanes?.length ?? 0,
         'glbCache=', glbCacheRef.current.size,
       )
     }
@@ -358,6 +391,7 @@ export function MapImagePlaneOverlay({
     for (const id of [...mountedUriRef.current.keys()]) {
       if (!wantedSources.has(sourceIdFor(id))) {
         mountedUriRef.current.delete(id)
+        appliedFocusRef.current.delete(id)
         const pending = pendingRetryRef.current.get(id)
         if (pending) {
           for (const t of pending) clearTimeout(t)
@@ -374,10 +408,13 @@ export function MapImagePlaneOverlay({
       }
     }
 
-    for (const { shapeId, entry, paint } of entries) {
+    for (const { shapeId, entry, paint: basePaint } of entries) {
       if (!entry) continue
       const sourceId = sourceIdFor(shapeId)
       const layerId = layerIdFor(shapeId)
+      // Focus fade (factor 1 → `basePaint` itself, i.e. no change).
+      const focusF = focusFactorsRef.current.get(shapeId) ?? 1
+      const paint = withFocusModelOpacity(basePaint, focusF)
       const newUri = String(entry.spec.uri)
       const mountedUri = mountedUriRef.current.get(shapeId)
       const uriChanged = mountedUri !== newUri
@@ -465,7 +502,9 @@ export function MapImagePlaneOverlay({
           const retryEntry = entry
           const retrySourceId = sourceId
           const retryLayerId = layerId
-          const retryPaint = paint
+          // Base paint: the focus factor is re-read when the retry fires
+          // (focus may have changed in the meantime).
+          const retryPaint = basePaint
           const retryUri = newUri
           const prevTimers = pendingRetryRef.current.get(retryShapeId)
           if (prevTimers) for (const t of prevTimers) clearTimeout(t)
@@ -548,6 +587,7 @@ export function MapImagePlaneOverlay({
                 models: { [retryEntry.key]: retryEntry.spec } as any,
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
               } as any)
+              const retryFocusF = focusFactorsRef.current.get(retryShapeId) ?? 1
               map.addLayer({
                 id: retryLayerId,
                 type: 'model',
@@ -557,8 +597,9 @@ export function MapImagePlaneOverlay({
                   'model-id': retryEntry.key as any,
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any,
-                paint: retryPaint as unknown as ModelLayerSpecification['paint'],
+                paint: withFocusModelOpacity(retryPaint, retryFocusF) as unknown as ModelLayerSpecification['paint'],
               })
+              appliedFocusRef.current.set(retryShapeId, retryFocusF)
               try { map.triggerRepaint() } catch { /* ignore */ }
               mountedUriRef.current.set(retryShapeId, retryUri)
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -595,6 +636,8 @@ export function MapImagePlaneOverlay({
           } catch { /* ignore */ }
         }
       }
+      // The layer now shows `paint` — i.e. this focus factor.
+      appliedFocusRef.current.set(shapeId, focusF)
       try {
         map.setLayoutProperty(
           layerId,
@@ -604,6 +647,31 @@ export function MapImagePlaneOverlay({
       } catch { /* ignore */ }
     }
   }, [map, styleLoaded, entries, activeShapeIdsKey, committedVisible])
+
+  // ---- Focus fade -------------------------------------------------------
+  // After the layer effect: `model-opacity` only for mounted planes whose
+  // factor differs from the one they show (focus enter / change / exit —
+  // never per camera move). Focus off → nothing differs → no writes.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const applied = appliedFocusRef.current
+    for (const { shapeId, paint } of entries) {
+      const f = focusFactors.get(shapeId) ?? 1
+      const shown = applied.get(shapeId)
+      if (shown === undefined || shown === f) continue
+      const layerId = layerIdFor(shapeId)
+      if (!hasMapLayer(map, layerId)) continue
+      try {
+        map.setPaintProperty(
+          layerId,
+          'model-opacity',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          scaleModelOpacity(paint['model-opacity'], f) as any,
+        )
+        applied.set(shapeId, f)
+      } catch { /* ignore */ }
+    }
+  }, [map, styleLoaded, entries, focusFactors])
 
   // ---- Selection outline ------------------------------------------------
   //
@@ -643,6 +711,18 @@ export function MapImagePlaneOverlay({
     imagePlanesRef.current = imagePlanes
   }, [imagePlanes])
 
+  // Same as the model handle: stand at the plane's elevation so the dot
+  // (and its drag, which unprojects at the marker altitude) is on the
+  // plane's floor, not the ground under it.
+  const moveHandleRef = useRef<mapboxgl.Marker | null>(null)
+  const movePlaneElevation =
+    transformState?.kind === 'move'
+      ? (imagePlanes ?? []).find((p) => p.id === transformState.imagePlaneId)?.config.elevation ?? 0
+      : 0
+  useEffect(() => {
+    moveHandleRef.current?.setAltitude(Math.max(0, movePlaneElevation))
+  }, [movePlaneElevation])
+
   useEffect(() => {
     if (!map) return
     if (!transformState || transformState.kind !== 'move') return
@@ -667,7 +747,9 @@ export function MapImagePlaneOverlay({
       draggable: true,
     })
       .setLngLat(plane.position)
+      .setAltitude(Math.max(0, plane.config.elevation ?? 0))
       .addTo(map)
+    moveHandleRef.current = handle
 
     // Bypass React state during drag. Rewriting the spec via a direct
     // `setModels` call on the transforming plane's Mapbox source updates
@@ -739,6 +821,7 @@ export function MapImagePlaneOverlay({
       } catch { /* ignore */ }
       if (rafId !== 0) cancelAnimationFrame(rafId)
       pendingLngLat = null
+      if (moveHandleRef.current === handle) moveHandleRef.current = null
       handle.remove()
     }
   }, [map, transformState])

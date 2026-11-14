@@ -33,6 +33,7 @@ const VIDEO_EXT = /\.(mp4|webm|ogv|mov|m4v|mkv|avi)(\?|#|$)/i
 const STREAM_EXT = /\.(m3u8|mpd)(\?|#|$)/i
 const STREAM_SCHEME = /^(rtsp|rtmp|rtmps|srt|udp|mms):\/\//i
 const HTTP_SCHEME = /^https?:\/\//i
+const ROOT_PATH = /^\/(?!\/)/
 
 // Matches keys that MEAN "this string is a media URL", even when they
 // carry a `Url` / `Uri` / `Src` / `Href` suffix or a plural `s`.
@@ -105,10 +106,21 @@ export function classifyValue(key: string, value: unknown): MediaItem[] {
   // Stream by scheme (RTSP / RTMP / SRT / UDP / MMS — camera feeds)
   if (STREAM_SCHEME.test(s)) return [{ kind: 'stream', src: s, sourceKey: key }]
 
+  // A video file on a stream / camera / feed / live key is a camera feed
+  // (an NVR relay or a recorded loop), shown live rather than as a clip.
+  const streamKey = /stream|camera|feed|cctv|live/i.test(key)
+  // Same-origin paths (`/files/…`, `/camera-feeds/…`) count when they name
+  // a media file; any other path stays plain text.
+  if (ROOT_PATH.test(s) && (IMAGE_EXT.test(s) || VIDEO_EXT.test(s) || STREAM_EXT.test(s))) {
+    if (IMAGE_EXT.test(s)) return [{ kind: 'image', src: s, sourceKey: key }]
+    if (STREAM_EXT.test(s) || streamKey) return [{ kind: 'stream', src: s, sourceKey: key }]
+    return [{ kind: 'video', src: s, sourceKey: key }]
+  }
+
   // HTTP(S) URLs — classify by extension or by key hint
   if (HTTP_SCHEME.test(s)) {
     if (IMAGE_EXT.test(s)) return [{ kind: 'image', src: s, sourceKey: key }]
-    if (VIDEO_EXT.test(s)) return [{ kind: 'video', src: s, sourceKey: key }]
+    if (VIDEO_EXT.test(s)) return [{ kind: streamKey ? 'stream' : 'video', src: s, sourceKey: key }]
     if (STREAM_EXT.test(s)) return [{ kind: 'stream', src: s, sourceKey: key }]
     if (hint) {
       // Extensionless URL on a media-named key — assume it serves the

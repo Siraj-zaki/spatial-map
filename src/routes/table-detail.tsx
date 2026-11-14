@@ -79,7 +79,7 @@ export default function TableDetailPage() {
   const validId = Number.isInteger(tableId) && tableId > 0
   const navigate = useNavigate()
   const { t, i18n } = useTranslation()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('data.manage')
 
   const [tabParam, setTabParam] = useUrlState<string>('tab', 'records')
   const tab: TabKey = TABS.includes(tabParam as TabKey) ? (tabParam as TabKey) : 'records'

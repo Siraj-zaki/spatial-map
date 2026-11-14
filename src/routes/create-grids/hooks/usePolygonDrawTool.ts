@@ -5,11 +5,12 @@ import type { TFunction } from 'i18next'
 
 import { apiDb } from '@/lib/api-db'
 import { type Tool } from '@/lib/keyboard-shortcuts'
+import { assistedPoint, type DrawAssist } from '@/lib/measure/geometry'
 import { type FillShapeConfig } from '@/lib/shapes'
 import { type LengthUnit } from '@/lib/units'
 import { queryCache } from '@/lib/useApiQuery'
 
-import { unprojectAtAltitude } from './unproject-at-altitude'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 /**
  * Polygon draw tool. Click N times to add vertices, double-click (or
@@ -17,7 +18,8 @@ import { unprojectAtAltitude } from './unproject-at-altitude'
  * last vertex. Esc cancels an in-flight chain; Esc again exits the
  * tool. Ray-casts clicks against the tool's configured elevation
  * plane so vertices land on the raster the user is pointing at, not
- * on the ground under it.
+ * on the ground under it. The drafting bar's angle lock (flipped while
+ * Shift is held) moves each vertex onto the nearest locked angle.
  */
 export function usePolygonDrawTool({
   mapInstance,
@@ -28,6 +30,7 @@ export function usePolygonDrawTool({
   activeWarehouseIdRef,
   defaultFloorPlanIdRef,
   polygonVerticesRef,
+  drawAssistRef,
   pinWarehouseCenterIfNeeded,
   setPolygonDraftVertices,
   setPolygonDraftCursor,
@@ -45,6 +48,7 @@ export function usePolygonDrawTool({
   activeWarehouseIdRef: MutableRefObject<number | null>
   defaultFloorPlanIdRef: MutableRefObject<number | null>
   polygonVerticesRef: MutableRefObject<[number, number][]>
+  drawAssistRef: MutableRefObject<DrawAssist>
   pinWarehouseCenterIfNeeded: (
     zoneId: number | null,
     center: [number, number],
@@ -103,11 +107,14 @@ export function usePolygonDrawTool({
       // is the ground point (`e.lngLat`), but the vertex dot we
       // render is lifted to `elevation` — the parallax at pitch means
       // the dot visibly drifts away from the cursor.
-      const hit = unprojectAtAltitude(map, e.point, polygonConfig.elevation ?? 0)
-      setPolygonDraftVertices((prev) => [
-        ...prev,
-        [hit.lng, hit.lat] as [number, number],
-      ])
+      const hit = unprojectOnScene(map, e.point, polygonConfig.elevation ?? 0)
+      const placed = assistedPoint(
+        drawAssistRef.current,
+        e.originalEvent.shiftKey,
+        polygonVerticesRef.current,
+        [hit.lng, hit.lat],
+      )
+      setPolygonDraftVertices((prev) => [...prev, placed])
     }
     const onDblClick = (e: MapMouseEvent) => {
       // Mapbox fires `dblclick` AFTER the two underlying `click` events,
@@ -133,8 +140,13 @@ export function usePolygonDrawTool({
       setPolygonDraftCursor(hit)
     }
     const onMouseMove = (e: MapMouseEvent) => {
-      const hit = unprojectAtAltitude(map, e.point, polygonConfig.elevation ?? 0)
-      pendingHit = [hit.lng, hit.lat]
+      const hit = unprojectOnScene(map, e.point, polygonConfig.elevation ?? 0)
+      pendingHit = assistedPoint(
+        drawAssistRef.current,
+        e.originalEvent.shiftKey,
+        polygonVerticesRef.current,
+        [hit.lng, hit.lat],
+      )
       if (moveRafId === 0) moveRafId = requestAnimationFrame(flushMove)
     }
     const onKey = (e: KeyboardEvent) => {
@@ -181,6 +193,7 @@ export function usePolygonDrawTool({
     activeWarehouseIdRef,
     defaultFloorPlanIdRef,
     polygonVerticesRef,
+    drawAssistRef,
     setPolygonDraftVertices,
     setPolygonDraftCursor,
     setSelectedPolygonIds,

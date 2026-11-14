@@ -41,6 +41,15 @@
  * Crop is done with texture coordinates on the full image — no canvas
  * re-encode, so a crop change is instant.
  *
+ * Cut-out (focus mode): `cuts` — up to `MAX_CUTS` discs ([lng, lat] +
+ * radius in metres). Every fragment within a disc is discarded, with a
+ * `cutFeatherM` smoothstep edge, so a plate standing in the line of sight
+ * keeps its opacity and gets a soft round hole around the focused item
+ * instead of fading whole. Discarded fragments write no depth, so only
+ * the hole shows what is below. The disc centres are converted to the
+ * plan's local metres once per change (cuts or geometry), never per
+ * frame. With no cuts the shader path is bit-identical to having none.
+ *
  * Mask ("hide outside walls"): optional polygons in full-image UV. They
  * are rasterised once into a single-channel texture (unit 1) and every
  * fragment outside them is discarded, so the sheet margin, title block
@@ -78,7 +87,24 @@ export interface FloorPlanLayerState {
   visible: boolean
   /** Keep only these areas: rings in full-image UV (0–1, v down). */
   mask?: number[][][][] | null
+  /**
+   * Round holes (focus-mode cut-out): [lng, lat] centre + radius in
+   * metres, at most `MAX_CUTS` (extra ones are ignored). Compared by
+   * value: equal cuts never repaint.
+   */
+  cuts?: ReadonlyArray<FloorPlanCut> | null
+  /** Soft edge of each hole, metres (default 1). */
+  cutFeatherM?: number
 }
+
+export interface FloorPlanCut {
+  center: readonly [number, number]
+  radiusM: number
+}
+
+/** Most holes the shader takes (`u_cuts` length). */
+export const MAX_CUTS = 12
+const DEFAULT_CUT_FEATHER_M = 1
 
 const FULL_UV: FloorPlanUV = { u0: 0, v0: 0, u1: 1, v1: 1 }
 
@@ -93,24 +119,41 @@ in vec2 a_uv;
 uniform mat4 u_matrix;
 uniform float u_elevation;
 out vec2 v_uv;
+out vec2 v_pos;
 void main() {
   v_uv = a_uv;
+  v_pos = a_pos;
   gl_Position = u_matrix * vec4(a_pos, u_elevation, 1.0);
 }`
 
 const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 in vec2 v_uv;
+in vec2 v_pos;
 uniform sampler2D u_texture;
 uniform sampler2D u_mask;
 uniform float u_use_mask;
 uniform float u_opacity;
+// Cut-out discs: local metres (x east, y south) + radius.
+uniform int u_cut_count;
+uniform vec3 u_cuts[${MAX_CUTS}];
+uniform float u_cut_feather;
 out vec4 fragColor;
 void main() {
   if (u_use_mask > 0.5 && texture(u_mask, v_uv).r < 0.5) discard;
   // The texture is premultiplied, matching Mapbox's blend
   // (ONE, ONE_MINUS_SRC_ALPHA).
   vec4 c = texture(u_texture, v_uv) * u_opacity;
+  if (u_cut_count > 0) {
+    float f = 1.0;
+    for (int i = 0; i < ${MAX_CUTS}; i++) {
+      if (i >= u_cut_count) break;
+      vec3 k = u_cuts[i];
+      f = min(f, smoothstep(k.z - u_cut_feather, k.z, distance(v_pos, k.xy)));
+    }
+    if (f < 0.02) discard;
+    c *= f;
+  }
   if (c.a < 0.004) discard;
   fragColor = c;
 }`
@@ -125,6 +168,9 @@ interface GlResources {
   uOpacity: WebGLUniformLocation | null
   uMask: WebGLUniformLocation | null
   uUseMask: WebGLUniformLocation | null
+  uCutCount: WebGLUniformLocation | null
+  uCuts: WebGLUniformLocation | null
+  uCutFeather: WebGLUniformLocation | null
 }
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
@@ -210,6 +256,10 @@ export class FloorPlanLayer implements CustomLayerInterface {
   private aspect = 1
   /** Plan centre in Mercator units, and metres → Mercator scale there. */
   private origin = { x: 0, y: 0, scale: 1 }
+  /** `state.cuts` in local metres (x, y, r per disc), rebuilt when the cuts or the geometry change. */
+  private cutData = new Float32Array(MAX_CUTS * 3)
+  private cutCount = 0
+  private cutsDirty = true
 
   constructor(id: string, state: FloorPlanLayerState, slot?: string) {
     this.id = id
@@ -217,15 +267,47 @@ export class FloorPlanLayer implements CustomLayerInterface {
     if (slot) this.slot = slot
   }
 
-  /** Apply new props; reloads the texture only when the URL changed. */
+  /**
+   * Apply new props; reloads the texture only when the URL changed.
+   * Compared by value (corners, uv, cuts) or identity (mask): props equal
+   * to the current ones leave everything as is and don't repaint.
+   */
   update(next: Partial<FloorPlanLayerState>): void {
     const prev = this.state
-    this.state = { ...prev, ...next }
-    if (next.corners && next.corners !== prev.corners) this.geometryDirty = true
-    if (next.uv && !sameUV(next.uv, prev.uv)) this.geometryDirty = true
+    let changed = false
+    const merged: FloorPlanLayerState = { ...prev, ...next }
+    if (next.corners && !sameCorners(next.corners, prev.corners)) {
+      this.geometryDirty = true
+      changed = true
+    } else {
+      merged.corners = prev.corners
+    }
+    if (next.uv && !sameUV(next.uv, prev.uv)) {
+      this.geometryDirty = true
+      changed = true
+    }
+    if ('mask' in next && next.mask !== prev.mask) {
+      this.maskDirty = true
+      changed = true
+    }
+    if ('cuts' in next && !sameCuts(next.cuts, prev.cuts)) {
+      this.cutsDirty = true
+      changed = true
+    } else {
+      merged.cuts = prev.cuts
+    }
+    if ((merged.cutFeatherM ?? DEFAULT_CUT_FEATHER_M) !== (prev.cutFeatherM ?? DEFAULT_CUT_FEATHER_M)) changed = true
+    if (
+      merged.url !== prev.url ||
+      merged.elevation !== prev.elevation ||
+      merged.opacity !== prev.opacity ||
+      merged.visible !== prev.visible
+    ) {
+      changed = true
+    }
+    this.state = merged
     if (next.url && next.url !== prev.url) this.load()
-    if ('mask' in next && next.mask !== prev.mask) this.maskDirty = true
-    this.map?.triggerRepaint()
+    if (changed) this.map?.triggerRepaint()
   }
 
   onAdd(map: MapboxMapInstance, gl: WebGL2RenderingContext): void {
@@ -241,6 +323,7 @@ export class FloorPlanLayer implements CustomLayerInterface {
     this.map = map
     this.gl = gl
     this.geometryDirty = true
+    this.cutsDirty = true
     if (this.textureUrl !== this.state.url) this.load()
   }
 
@@ -270,6 +353,7 @@ export class FloorPlanLayer implements CustomLayerInterface {
     if (!this.texture) return
     const res = this.res ?? (this.res = this.createResources(gl))
     if (this.geometryDirty) this.writeGeometry(gl, res)
+    if (this.cutsDirty) this.writeCuts()
 
     // matrix (float64 copy of Mapbox's mercatorMatrix) × T(origin) ×
     // S(metres → Mercator). Composing in float64 and only then dropping
@@ -292,6 +376,13 @@ export class FloorPlanLayer implements CustomLayerInterface {
     gl.bindTexture(gl.TEXTURE_2D, useMask ? this.maskTexture : this.texture)
     gl.uniform1i(res.uMask, 1)
     gl.activeTexture(gl.TEXTURE0)
+    // The program is this layer's own, but its uniforms are set every
+    // frame anyway (three calls) — a recreated program never misses them.
+    gl.uniform1i(res.uCutCount, this.cutCount)
+    if (this.cutCount > 0) {
+      gl.uniform3fv(res.uCuts, this.cutData)
+      gl.uniform1f(res.uCutFeather, Math.max(1e-3, state.cutFeatherM ?? DEFAULT_CUT_FEATHER_M))
+    }
 
     // Mapbox has set LEQUAL depth testing, the 3D depth range and
     // premultiplied blending for us (drawCustom, renderingMode '3d').
@@ -311,6 +402,33 @@ export class FloorPlanLayer implements CustomLayerInterface {
     gl.bindTexture(gl.TEXTURE_2D, null)
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, null)
+  }
+
+  /**
+   * `state.cuts` → local metres around the plan centre (x east, y south,
+   * the same frame as the vertices), radius scaled by the Mercator scale
+   * at the disc over the one at the centre. Runs after `writeGeometry`
+   * (needs `origin`), only when the cuts or the geometry changed.
+   */
+  private writeCuts(): void {
+    this.cutsDirty = false
+    this.cutData.fill(0)
+    this.cutCount = 0
+    const cuts = this.state.cuts
+    if (!cuts || cuts.length === 0) return
+    const { x: ox, y: oy, scale } = this.origin
+    let n = 0
+    for (const cut of cuts) {
+      if (n >= MAX_CUTS) break
+      const [lng, lat] = cut.center
+      if (!Number.isFinite(lng) || !Number.isFinite(lat) || !(cut.radiusM > 0)) continue
+      const m = mapboxgl.MercatorCoordinate.fromLngLat([lng, lat], 0)
+      this.cutData[n * 3] = (m.x - ox) / scale
+      this.cutData[n * 3 + 1] = (m.y - oy) / scale
+      this.cutData[n * 3 + 2] = (cut.radiusM * m.meterInMercatorCoordinateUnits()) / scale
+      n++
+    }
+    this.cutCount = n
   }
 
   /** Rasterise `state.mask` (UV rings) into a single-channel texture. */
@@ -445,6 +563,9 @@ export class FloorPlanLayer implements CustomLayerInterface {
       uOpacity: gl.getUniformLocation(program, 'u_opacity'),
       uMask: gl.getUniformLocation(program, 'u_mask'),
       uUseMask: gl.getUniformLocation(program, 'u_use_mask'),
+      uCutCount: gl.getUniformLocation(program, 'u_cut_count'),
+      uCuts: gl.getUniformLocation(program, 'u_cuts'),
+      uCutFeather: gl.getUniformLocation(program, 'u_cut_feather'),
     }
   }
 
@@ -455,6 +576,8 @@ export class FloorPlanLayer implements CustomLayerInterface {
    */
   private writeGeometry(gl: WebGL2RenderingContext, res: GlResources): void {
     this.geometryDirty = false
+    // The cut centres are relative to `origin`, which this recomputes.
+    this.cutsDirty = true
     const merc = this.state.corners.map(([lng, lat]) => mapboxgl.MercatorCoordinate.fromLngLat([lng, lat], 0))
     const ox = (merc[0].x + merc[1].x + merc[2].x + merc[3].x) / 4
     const oy = (merc[0].y + merc[1].y + merc[2].y + merc[3].y) / 4
@@ -474,6 +597,30 @@ export class FloorPlanLayer implements CustomLayerInterface {
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, data)
     gl.bindBuffer(gl.ARRAY_BUFFER, null)
   }
+}
+
+function sameCorners(a: FloorPlanCorners, b: FloorPlanCorners): boolean {
+  if (a === b) return true
+  for (let i = 0; i < 4; i++) {
+    if (a[i][0] !== b[i][0] || a[i][1] !== b[i][1]) return false
+  }
+  return true
+}
+
+/** Equal by value (null / undefined / [] are all "no cuts"). */
+export function sameCuts(
+  a: ReadonlyArray<FloorPlanCut> | null | undefined,
+  b: ReadonlyArray<FloorPlanCut> | null | undefined,
+): boolean {
+  if (a === b) return true
+  const n = a?.length ?? 0
+  if (n !== (b?.length ?? 0)) return false
+  for (let i = 0; i < n; i++) {
+    const x = a![i]
+    const y = b![i]
+    if (x.radiusM !== y.radiusM || x.center[0] !== y.center[0] || x.center[1] !== y.center[1]) return false
+  }
+  return true
 }
 
 function sameUV(a: FloorPlanUV | undefined, b: FloorPlanUV | undefined): boolean {

@@ -3,12 +3,15 @@
  * (polygons, circles, markers, models, stairs, doors, image planes,
  * text labels, grids, floor plans, bins) with data-link layers
  * (sensors, cameras, assets). Each kind has an eye toggle for
- * show/hide and an expandable list of individual items with
- * zoom-to-item. Lines / walls are intentionally excluded from
- * the viewer layer controls.
+ * show/hide and an expandable list of individual items, each with a
+ * "Show on map" button that hands the item to the host's focus mode
+ * (camera fly, item exempt from occlusion, the rest of the scene
+ * dimmed). Lines / walls are intentionally excluded from the viewer
+ * layer controls.
  */
 
 import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   Activity,
   Box,
@@ -94,8 +97,8 @@ const DL_META: Record<DataLinkLayerKind, { label: string; Icon: typeof LayersIco
 interface ShapeItem {
   id: number
   name: string
-  /** Optional centroid for zoom-to. */
-  center?: [number, number]
+  /** false hides the item's "Show on map" button (nothing on the map to focus). Default true. */
+  focusable?: boolean
 }
 
 // ---- Props ----------------------------------------------------------------
@@ -103,10 +106,12 @@ interface ShapeItem {
 interface ViewerLayersPanelProps {
   // ---- Shape data (from spatial store) ----
   shapeItems: Partial<Record<ShapeLayerKind, ShapeItem[]>>
-  /** Callback to get centroid for a specific shape kind + id. */
-  getShapeCenter?: (kind: ShapeLayerKind, id: number) => [number, number] | null
-  /** Called when user clicks zoom-to on an item. */
-  onZoomTo?: (center: [number, number]) => void
+  /**
+   * "Show on map" for one item. The host focuses it (flies the camera,
+   * shows it even behind other geometry); the panel closes so the map
+   * is visible.
+   */
+  onFocusItem?: (kind: ShapeLayerKind, id: number) => void
 
   // ---- Shape visibility (lifted to parent for overlay filtering) ----
   hiddenShapeKinds: ReadonlySet<string>
@@ -124,6 +129,7 @@ interface ViewerLayersPanelProps {
    * `ViewerFilterBar`, so this panel stays about visibility.
    */
   activeFilterLabels?: Readonly<Record<number, string>>
+  /** "Show on map" for one data-link row (same focus flow as shapes). */
   onZoomToDataLinkItem?: (cfg: DataLinkConfig, entity: EntityState) => void
 }
 
@@ -131,8 +137,7 @@ interface ViewerLayersPanelProps {
 
 export function ViewerLayersPanel({
   shapeItems,
-  getShapeCenter,
-  onZoomTo,
+  onFocusItem,
   hiddenShapeKinds,
   onToggleShapeKind,
   dataLinkConfigs,
@@ -143,8 +148,24 @@ export function ViewerLayersPanel({
   activeFilterLabels,
   onZoomToDataLinkItem,
 }: ViewerLayersPanelProps) {
+  const [open, setOpen] = useState(false)
   const [expandedKinds, setExpandedKinds] = useState<Set<string>>(new Set())
   const [hiddenShapeItems, setHiddenShapeItems] = useState<Record<string, Set<number>>>({})
+
+  // A focus action closes the menu first: the item is about to be shown
+  // on the map, which the open menu would partly cover.
+  const focusShape = onFocusItem
+    ? (kind: ShapeLayerKind, id: number) => {
+        setOpen(false)
+        onFocusItem(kind, id)
+      }
+    : undefined
+  const focusDataLinkItem = onZoomToDataLinkItem
+    ? (cfg: DataLinkConfig, entity: EntityState) => {
+        setOpen(false)
+        onZoomToDataLinkItem(cfg, entity)
+      }
+    : undefined
 
   const toggleKindExpanded = (kind: string) => {
     setExpandedKinds((prev) => {
@@ -182,7 +203,7 @@ export function ViewerLayersPanel({
   const visibleKinds = visibleShapeKinds + visibleDlConfigs
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
@@ -265,8 +286,7 @@ export function ViewerLayersPanel({
                         items={items}
                         hiddenItems={hiddenShapeItems[kind]}
                         onToggleItem={toggleItemVisibility}
-                        getCenter={getShapeCenter}
-                        onZoomTo={onZoomTo}
+                        onFocusItem={focusShape}
                       />
                     </div>
                   )}
@@ -286,7 +306,7 @@ export function ViewerLayersPanel({
             onSetAll={onSetAllDataLinkConfigs ?? (() => {})}
             onToggleEnabled={onToggleDataLinkEnabled}
             activeFilterLabels={activeFilterLabels}
-            onZoomToItem={onZoomToDataLinkItem}
+            onZoomToItem={focusDataLinkItem}
           />
         )}
       </DropdownMenuContent>
@@ -301,16 +321,20 @@ function ShapeItemsList({
   items,
   hiddenItems,
   onToggleItem,
-  getCenter,
-  onZoomTo,
+  onFocusItem,
 }: {
   kind: ShapeLayerKind
   items: ShapeItem[]
   hiddenItems?: Set<number>
   onToggleItem: (kind: string, id: number) => void
-  getCenter?: (kind: ShapeLayerKind, id: number) => [number, number] | null
-  onZoomTo?: (center: [number, number]) => void
+  onFocusItem?: (kind: ShapeLayerKind, id: number) => void
 }) {
+  const { t } = useTranslation()
+  const focusLabel = t('view.layers.focusItem', { defaultValue: 'Show on map' })
+  // The eye only shows / hides the row on the map; "Show on map" is the
+  // crosshair's focus action, so the eye says "this item" instead.
+  const showItemLabel = t('view.layers.showItem', { defaultValue: 'Show this item' })
+  const hideItemLabel = t('view.layers.hideItem', { defaultValue: 'Hide this item' })
   if (items.length === 0) {
     return (
       <div className="px-1 py-1.5 text-muted-foreground">No items.</div>
@@ -333,8 +357,8 @@ function ShapeItemsList({
                 'flex-shrink-0 h-5 w-5 grid place-items-center rounded hover:bg-accent/60 ' +
                 (isHidden ? 'text-muted-foreground' : 'text-emerald-500')
               }
-              aria-label={isHidden ? 'Show item' : 'Hide item'}
-              title={isHidden ? 'Show on map' : 'Hide from map'}
+              aria-label={isHidden ? showItemLabel : hideItemLabel}
+              title={isHidden ? showItemLabel : hideItemLabel}
             >
               {isHidden ? (
                 <EyeOff className="h-3 w-3" />
@@ -350,18 +374,15 @@ function ShapeItemsList({
             <span className="flex-1 truncate text-foreground/90" title={item.name || `#${item.id}`}>
               {item.name || `#${item.id}`}
             </span>
-            {onZoomTo && (
+            {onFocusItem && item.focusable !== false && (
               <button
                 type="button"
-                onClick={() => {
-                  const center = getCenter?.(kind, item.id)
-                  if (center) onZoomTo(center)
-                }}
-                className="flex-shrink-0 h-6 w-6 grid place-items-center rounded-md text-primary hover:bg-accent/80"
-                aria-label="Zoom to item"
-                title="Zoom to item"
+                onClick={() => onFocusItem(kind, item.id)}
+                className="flex-shrink-0 h-6 w-6 grid place-items-center rounded-md text-primary hover:bg-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={`${focusLabel}: ${item.name || `#${item.id}`}`}
+                title={focusLabel}
               >
-                <Crosshair className="h-3 w-3" />
+                <Crosshair className="h-3 w-3" aria-hidden />
               </button>
             )}
           </li>
@@ -390,6 +411,9 @@ function DataLinkLayersSection({
   activeFilterLabels?: Readonly<Record<number, string>>
   onZoomToItem?: (cfg: DataLinkConfig, entity: EntityState) => void
 }) {
+  const { t } = useTranslation()
+  const showLayerLabel = t('view.layers.showLayer', { defaultValue: 'Show layer' })
+  const hideLayerLabel = t('view.layers.hideLayer', { defaultValue: 'Hide layer' })
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [itemsByConfig, setItemsByConfig] = useState<Record<number, EntityState[] | undefined>>({})
   const [itemsStatus, setItemsStatus] = useState<Record<number, 'idle' | 'loading' | 'loaded' | 'error'>>({})
@@ -523,7 +547,8 @@ function DataLinkLayersSection({
                         'flex-shrink-0 h-7 w-7 grid place-items-center rounded-md hover:bg-accent/60 ' +
                         (isHidden ? 'text-muted-foreground' : 'text-emerald-500')
                       }
-                      aria-label={isHidden ? 'Show layer' : 'Hide layer'}
+                      aria-label={isHidden ? showLayerLabel : hideLayerLabel}
+                      title={isHidden ? showLayerLabel : hideLayerLabel}
                     >
                       {isHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                     </button>
@@ -577,6 +602,8 @@ function DataLinkItemsList({
   items: EntityState[] | undefined
   onZoomToItem?: (cfg: DataLinkConfig, entity: EntityState) => void
 }) {
+  const { t } = useTranslation()
+  const focusLabel = t('view.layers.focusItem', { defaultValue: 'Show on map' })
   const labelKey = cfg.fieldMapping?.labelField ?? 'label'
 
   if (status === 'idle' || status === 'loading') {
@@ -613,10 +640,11 @@ function DataLinkItemsList({
               <button
                 type="button"
                 onClick={() => onZoomToItem(cfg, entity)}
-                className="flex-shrink-0 h-6 w-6 grid place-items-center rounded-md text-primary hover:bg-accent/80"
-                aria-label="Zoom to item"
+                className="flex-shrink-0 h-6 w-6 grid place-items-center rounded-md text-primary hover:bg-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={`${focusLabel}: ${label}`}
+                title={focusLabel}
               >
-                <Crosshair className="h-3 w-3" />
+                <Crosshair className="h-3 w-3" aria-hidden />
               </button>
             )}
           </li>

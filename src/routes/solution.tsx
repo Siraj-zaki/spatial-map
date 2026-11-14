@@ -52,7 +52,7 @@ export default function SolutionPage() {
   const { id: raw } = useParams()
   const id = Number(raw)
   const tenantId = useCurrentTenantId()
-  const { canEdit } = useWorkspaceRole()
+  const canEdit = useWorkspaceRole().can('solutions.manage')
   const solutions = useSolutions()
   const solution = (solutions.data ?? []).find((s) => s.id === id) ?? null
   const catalog = useSolutionCatalog()

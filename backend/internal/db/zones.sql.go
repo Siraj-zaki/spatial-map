@@ -79,8 +79,13 @@ func (q *Queries) CreateZone(ctx context.Context, arg CreateZoneParams) (CreateZ
 }
 
 const deleteZone = `-- name: DeleteZone :exec
-DELETE FROM zones
-WHERE id = $1 AND tenant_id = $2
+WITH generated AS (
+  DELETE FROM reports r
+  WHERE r.tenant_id = $2 AND r.zone_id = $1
+    AND r.spec->'origin'->>'kind' IN ('facility-set', 'data-link')
+)
+DELETE FROM zones z
+WHERE z.id = $1 AND z.tenant_id = $2
 `
 
 type DeleteZoneParams struct {
@@ -88,6 +93,10 @@ type DeleteZoneParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
+// The facility's generated reports (the facility set and the data-link
+// reports, `spec.origin.kind`) go with it, in the same statement. Left to the
+// FK they'd become zone-less "Shared" reports, listed under every facility as
+// duplicate Overview / Floors / … Reports a user made keep ON DELETE SET NULL.
 func (q *Queries) DeleteZone(ctx context.Context, arg DeleteZoneParams) error {
 	_, err := q.db.Exec(ctx, deleteZone, arg.ID, arg.TenantID)
 	return err

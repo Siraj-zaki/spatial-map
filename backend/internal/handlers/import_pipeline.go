@@ -1687,6 +1687,12 @@ type gridConfigShape struct {
 	LabelDirection string  `json:"labelDirection"`
 	LabelStart     float64 `json:"labelStart"`
 	Levels         float64 `json:"levels"`
+	CellGap        float64 `json:"cellGap"`
+	// Path layout (see grid_path.go).
+	Layout     string       `json:"layout"`
+	Path       [][2]float64 `json:"path"`
+	PathRows   float64      `json:"pathRows"`
+	PathSmooth bool         `json:"pathSmooth"`
 }
 
 func gridConfig(raw json.RawMessage) gridConfigShape {
@@ -1729,6 +1735,9 @@ func estimateGridDimensions(startLng, startLat, currentLng, currentLat float64, 
 	}
 	if cfg.XSize <= 0 || cfg.YSize <= 0 {
 		return nil
+	}
+	if isPathGrid(cfg) {
+		return pathGridDimensions(startLng, startLat, currentLng, currentLat, cfg)
 	}
 	widthM := distanceMeters([2]float64{startLng, startLat}, [2]float64{currentLng, startLat})
 	heightM := distanceMeters([2]float64{startLng, startLat}, [2]float64{startLng, currentLat})

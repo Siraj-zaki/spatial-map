@@ -637,6 +637,61 @@ function defaultFilenameStem(options: ExportOptions, groups: CollectedGroup[]): 
   return `sgv-export-${total}shapes-${groups.length}kinds`
 }
 
+// ------------------------------------------- shared with the 3D export
+
+/**
+ * The shapes a scope covers, per kind — what `export-3d.ts` builds its
+ * model from. Same filter (`kinds`, `selectedIds`, `zoneId`) the data
+ * exports use, so a 3D export of "selected only" matches a GeoJSON one.
+ */
+export function scopedSource(source: ExportSource, scope: ExportScope): ExportSource {
+  const pick = <T extends { id?: number; zoneId?: number }>(kind: ExportableKind, arr: readonly T[] | undefined): T[] =>
+    scope.kinds.includes(kind) ? scopeShapes(arr, kind, scope) : []
+  return {
+    grids: pick('grid', source.grids),
+    polygons: pick('polygon', source.polygons),
+    circles: pick('circle', source.circles),
+    lines: pick('line', source.lines),
+    routes: pick('route', source.routes),
+    markers: pick('marker', source.markers),
+    images: pick('image', source.images),
+    imagePlanes: pick('imagePlane', source.imagePlanes),
+    models: pick('model', source.models),
+    stairs: pick('stair', source.stairs),
+    doors: pick('door', source.doors),
+    textLabels: pick('text', source.textLabels),
+  }
+}
+
+/** Zone-scoped (not selection-scoped) shapes — context such as wall joins and door openings. */
+export function zoneSource(source: ExportSource, zoneId: number | null | undefined): ExportSource {
+  return scopedSource(source, { kinds: ALL_EXPORTABLE_KINDS, zoneId })
+}
+
+/**
+ * The flat data record of one shape — the row GeoJSON / JSON / XLSX
+ * exports write, with every config field. The 3D export embeds it in
+ * the glTF node's `extras` so the data travels with the model.
+ */
+export function exportRecordOf(kind: ExportableKind, shape: unknown, options: ExportOptions): Record<string, unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const s = shape as any
+  switch (kind) {
+    case 'grid': return mapGrid(s, options).record
+    case 'polygon': return mapPolygon(s, options).record
+    case 'circle': return mapCircle(s, options).record
+    case 'line': return mapLine(s, options).record
+    case 'route': return mapRoute(s, options).record
+    case 'marker': return mapMarker(s, options).record
+    case 'image': return mapImage(s, options).record
+    case 'imagePlane': return mapImagePlane(s, options).record
+    case 'model': return mapModel(s, options).record
+    case 'stair': return mapStair(s, options).record
+    case 'door': return mapDoor(s, options).record
+    case 'text': return mapTextLabel(s, options).record
+  }
+}
+
 // ----------------------------------------------------------- public
 
 export function countByKind(source: ExportSource, scope: ExportScope): Record<ExportableKind, number> {

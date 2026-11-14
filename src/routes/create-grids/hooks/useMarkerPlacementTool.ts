@@ -1,6 +1,7 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 import type { TFunction } from 'i18next'
 
 import { apiDb } from '@/lib/api-db'
@@ -56,9 +57,15 @@ export function useMarkerPlacementTool({
     }
     const map = mapInstance
     map.getCanvas().style.cursor = 'crosshair'
+    // Where the cursor touches the scene (on the marker's floor: its elevation less the pole) —
+    // not the ground under it, which is off by the floor's height at pitch.
+    const at = (e: MapMouseEvent): [number, number] => {
+      const p = unprojectOnScene(map, e.point, Math.max(0, (markerConfig.elevation ?? 0) - (markerConfig.height ?? 0)))
+      return [p.lng, p.lat]
+    }
 
     const onMove = (e: MapMouseEvent) => {
-      setMarkerCursor([e.lngLat.lng, e.lngLat.lat])
+      setMarkerCursor(at(e))
     }
     const onClick = (e: MapMouseEvent) => {
       // Don't double-fire if the click was on an existing marker — the
@@ -67,7 +74,7 @@ export function useMarkerPlacementTool({
       const now = new Date()
       void (async () => {
         const wid = activeWarehouseIdRef.current
-        const pos: [number, number] = [e.lngLat.lng, e.lngLat.lat]
+        const pos: [number, number] = at(e)
         const id = await apiDb.markers.add({
           name: t('marker.defaultName', { defaultValue: 'Marker' }),
           unit: configUnit,

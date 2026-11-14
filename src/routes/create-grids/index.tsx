@@ -1,9 +1,10 @@
 import { MapFloorBaseOverlay } from '@/components/map-floor-base-overlay'
 import { useAIMapTool } from '@/routes/create-grids/hooks/useAIMapTool'
-import { AIDetectionReviewDialog } from '@/components/ai-detection-review-dialog'
 import { MapAIDetectionOverlay } from '@/components/map-ai-detection-overlay'
+import { AIDetectionReviewDialog } from '@/components/ai-detection-review-dialog'
 import { MapRoutePreviewOverlay } from '@/components/map-route-preview-overlay'
 import { RouteDirectionsPanel } from '@/components/route-directions-panel'
+import type { FacilityRoutingInput } from '@/lib/routing/floors'
 import { acceptDetection, type AcceptResult } from '@/lib/ai-accept'
 import type { AIDetection } from '@/lib/ai-client'
 import { useEditorBootstrap } from '@/routes/create-grids/hooks/useEditorBootstrap'
@@ -17,6 +18,7 @@ import { useKeyboardDispatch } from '@/routes/create-grids/hooks/useKeyboardDisp
 import { OverlayStack } from '@/routes/create-grids/layers/OverlayStack'
 import { SecondaryLayers } from '@/routes/create-grids/layers/SecondaryLayers'
 import { DataLinkPill } from '@/routes/create-grids/panels/DataLinkPill'
+import { FloorReferencePill } from '@/routes/create-grids/panels/FloorReferencePill'
 import { StatusBar } from '@/routes/create-grids/panels/StatusBar'
 import { WarehousePill } from '@/routes/create-grids/panels/WarehousePill'
 import { SaveStatus, useUnsavedEditsGuard } from '@/routes/create-grids/panels/SaveStatus'
@@ -28,6 +30,10 @@ import { EditorDialogs } from '@/routes/create-grids/dialogs/EditorDialogs'
 import { ExportDialog } from '@/components/export-dialog'
 import { useImagePlacementTool } from '@/routes/create-grids/hooks/useImagePlacementTool'
 import { useLineDrawTool } from '@/routes/create-grids/hooks/useLineDrawTool'
+import { useCalibrateImageTool } from '@/routes/create-grids/hooks/useCalibrateImageTool'
+import { useLengthEntry } from '@/routes/create-grids/hooks/useLengthEntry'
+import { useMeasureScene } from '@/routes/create-grids/hooks/useMeasureScene'
+import { useMeasureTool } from '@/routes/create-grids/hooks/useMeasureTool'
 import { useMarkerPlacementTool } from '@/routes/create-grids/hooks/useMarkerPlacementTool'
 import { useModelPlacementTool } from '@/routes/create-grids/hooks/useModelPlacementTool'
 import { usePolygonDrawTool } from '@/routes/create-grids/hooks/usePolygonDrawTool'
@@ -46,6 +52,7 @@ import { useMarkerHandlers } from '@/routes/create-grids/handlers/useMarkerHandl
 import { useModelHandlers } from '@/routes/create-grids/handlers/useModelHandlers'
 import { usePolygonHandlers } from '@/routes/create-grids/handlers/usePolygonHandlers'
 import { useRouteHandlers } from '@/routes/create-grids/handlers/useRouteHandlers'
+import { useSavedListBulk } from '@/routes/create-grids/handlers/useSavedListBulk'
 import { useStairHandlers } from '@/routes/create-grids/handlers/useStairHandlers'
 import { useTextLabelHandlers } from '@/routes/create-grids/handlers/useTextLabelHandlers'
 import { useCircleEditorState } from '@/routes/create-grids/state/useCircleEditorState'
@@ -54,6 +61,12 @@ import { useGridEditorState } from '@/routes/create-grids/state/useGridEditorSta
 import { useImageEditorState } from '@/routes/create-grids/state/useImageEditorState'
 import { useImagePlaneEditorState } from '@/routes/create-grids/state/useImagePlaneEditorState'
 import { useLineEditorState } from '@/routes/create-grids/state/useLineEditorState'
+import { useMeasureEditorState, type Guide } from '@/routes/create-grids/state/useMeasureEditorState'
+import { MapMeasureOverlay } from '@/components/map-measure-overlay'
+import { CalibratePanel } from '@/components/measure/calibrate-panel'
+import { DraftingBar } from '@/components/measure/drafting-bar'
+import { imageFrame, recenterImageBbox, straightenedRotation, type CalibrationSample } from '@/lib/measure/calibration'
+import { activeLock, planBaseAngle, typedLengthTarget, type DrawAssist, type LngLat } from '@/lib/measure/geometry'
 import { useMarkerEditorState } from '@/routes/create-grids/state/useMarkerEditorState'
 import { useModelEditorState } from '@/routes/create-grids/state/useModelEditorState'
 import { usePolygonEditorState } from '@/routes/create-grids/state/usePolygonEditorState'
@@ -62,6 +75,7 @@ import { useStairEditorState } from '@/routes/create-grids/state/useStairEditorS
 import { useTextLabelEditorState } from '@/routes/create-grids/state/useTextLabelEditorState'
 import { KeyboardHint } from '@/components/keyboard-status-bar'
 import { DataLinkFullScreenLoader } from '@/components/data-link/data-link-loader'
+import { MapFocusOverlay } from '@/components/map-focus-overlay'
 import { type CommittedLine } from '@/components/map-grid-overlay'
 import {
   MapToolbar,
@@ -110,17 +124,32 @@ import {
   type Grid,
 } from '@/lib/db'
 import { useDoorStore } from '@/lib/door/store'
+import { useTrackFocusBlockers } from '@/lib/focus/focus-blockers'
+import { flyToFocus } from '@/lib/focus/focus-camera'
+import { useFocusNear } from '@/lib/focus/focus-near'
+import { FocusBlockersContext, FocusSceneContext, useFocusSceneValue } from '@/lib/focus/focus-scene'
+import {
+  FOCUS_SHAPE_KINDS,
+  focusKey,
+  resolveFocus,
+  type FocusCell,
+  type FocusShapeKind,
+  type FocusShapes,
+  type FocusTarget,
+} from '@/lib/focus/focus-target'
+import { buildOccluders, type OccluderInput, type OccluderPrism } from '@/lib/marker-occlusion'
 import {
   exportAllShapesAsGeoJSON,
   exportMapAsPNG,
   importGridsFromGeoJSONFile,
-  updateGridGeometry,
+  updateGridGeometry, updateGridShape,
 } from '@/lib/export'
 import { distanceMeters, type GridConfig } from '@/lib/grid-generators'
+import { isPathGrid } from '@/lib/grid-path'
 import { generateMagicWallPolylines } from '@/lib/magic-wall-generator'
 import { usePersistedState } from '@/lib/persisted-state'
 import { gridHistory } from '@/lib/grid-history'
-import { imageCorners, imageLngLatToUV } from '@/lib/image-generators'
+import { imageCorners, imageLngLatToUV, scaleImageBbox } from '@/lib/image-generators'
 import {
   backfillUserModelBounds,
   backfillUserModelInspectors,
@@ -162,6 +191,47 @@ interface CreateGridsProps {
 }
 
 const EMPTY_GRIDS: ReadonlyArray<never> = Object.freeze([]) as ReadonlyArray<never>
+
+const NO_FOCUS_PRISMS: ReadonlyArray<OccluderPrism> = Object.freeze([])
+
+/** Map chrome a `?select=` deep link frames its shape clear of (px). */
+const DEEP_LINK_PAD_TOP_PX = 72 // top-row pills
+const DEEP_LINK_PAD_TOOLBAR_PX = 88 // vertical toolbar, start side
+const DEEP_LINK_PAD_EDGE_PX = 32 // bottom, and beside the side panel
+
+/** The editor's per-kind selection sets, by focus-target (API) kind, plus routes. */
+type EditorSelectionSets = Readonly<Record<FocusShapeKind, ReadonlySet<number>>> & {
+  readonly routes: ReadonlySet<number>
+}
+
+/** The rack cell staged for the bin editor (`selectedBin`). */
+type EditorSelectedBin = { gridId: number; row: number; col: number; level: number } | null
+
+/**
+ * Focus mode in the editor: the one selected item, or null. Exactly one
+ * item across every kind; a staged bin is its rack's cell when it is the
+ * whole selection, or when only its own rack is selected (a bin left over
+ * from another rack is ignored). Routes are not focusable, so a selected
+ * route means no focus.
+ */
+function editorFocusSelection(
+  sel: EditorSelectionSets,
+  bin: EditorSelectedBin,
+): { kind: FocusShapeKind; id: number; cell: FocusCell | null } | null {
+  let count = sel.routes.size
+  let only: { kind: FocusShapeKind; id: number } | null = null
+  for (const kind of FOCUS_SHAPE_KINDS) {
+    const ids = sel[kind]
+    if (ids.size === 0) continue
+    count += ids.size
+    if (count > 1) return null
+    for (const id of ids) only = { kind, id }
+  }
+  const cell = bin ? { row: bin.row, col: bin.col, level: bin.level } : null
+  if (count === 0) return bin && cell ? { kind: 'grids', id: bin.gridId, cell } : null
+  if (!only) return null
+  return { ...only, cell: only.kind === 'grids' && bin?.gridId === only.id ? cell : null }
+}
 
 export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = false }: CreateGridsProps) {
   const { t, i18n } = useTranslation()
@@ -290,6 +360,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     text: true,
     stair: true,
     door: true,
+    guides: true,
     zones: true,
   })
   const handleLayerVisibilityChange = useCallback(
@@ -507,7 +578,6 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     setLineDraftCursor,
     lineDraftSnap,
     setLineDraftSnap,
-    drawingUnit,
     setDrawingUnit,
     lineTransform,
     setLineTransform,
@@ -704,9 +774,42 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     return set
   }, [savedImagesRawAll])
 
+  /**
+   * Floors whose shapes the user switched off ("Show shapes" in the Floor
+   * plans list) while keeping the floor-plan image as a reference. A view
+   * setting for this session only — never saved, so nobody later opens a
+   * facility that looks empty.
+   */
+  const [shapesHiddenFloorIds, setShapesHiddenFloorIds] = useState<ReadonlySet<number>>(() => new Set())
+  const toggleFloorShapesVisible = useCallback((floorId: number, visible: boolean) => {
+    setShapesHiddenFloorIds((prev) => {
+      const next = new Set(prev)
+      if (visible) next.delete(floorId)
+      else next.add(floorId)
+      return next
+    })
+  }, [])
+  /**
+   * Floor-plan alignment view: while a floor plan is being placed or
+   * moved / rotated / scaled, every shape is hidden and the other plans
+   * are drawn unclipped and dimmed (see `MapImageOverlay` `alignment`),
+   * so the drawings underneath are a clean reference. Ends on its own.
+   */
+  const floorPlanAligning = activeTool === 'create-image' || imageTransform !== null
+  const imageAlignment = useMemo(
+    () => (floorPlanAligning ? { activeImageId: imageTransform?.imageId ?? null } : null),
+    [floorPlanAligning, imageTransform?.imageId],
+  )
+  /** Floors whose shapes are out of view: hidden floors + "Show shapes" off. */
+  const shapeHiddenFloorIds = useMemo(() => {
+    if (shapesHiddenFloorIds.size === 0) return hiddenFloorPlanIds
+    return new Set([...hiddenFloorPlanIds, ...shapesHiddenFloorIds])
+  }, [hiddenFloorPlanIds, shapesHiddenFloorIds])
+
   const scopeToWarehouse = useCallback(
     <T extends { zoneId?: number; floorPlanId?: number }>(
       rows: ReadonlyArray<T>,
+      opts?: { floorPlans?: boolean },
     ): T[] => {
       // First the warehouse filter, then the floor-plan-visibility
       // cascade. Both are O(n) over the input so ordering only affects
@@ -716,12 +819,19 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
         activeWarehouseId === null
           ? (rows as T[])
           : rows.filter((r) => r.zoneId === activeWarehouseId)
-      if (hiddenFloorPlanIds.size === 0) return inZone
+      // Floor-plan images are the reference itself: only the old
+      // hidden-floor cascade applies to them, never the shape-hiding views.
+      if (opts?.floorPlans) {
+        if (hiddenFloorPlanIds.size === 0) return inZone
+        return inZone.filter((r) => r.floorPlanId === undefined || !hiddenFloorPlanIds.has(r.floorPlanId))
+      }
+      if (floorPlanAligning) return []
+      if (shapeHiddenFloorIds.size === 0) return inZone
       return inZone.filter(
-        (r) => r.floorPlanId === undefined || !hiddenFloorPlanIds.has(r.floorPlanId),
+        (r) => r.floorPlanId === undefined || r.floorPlanId === null || !shapeHiddenFloorIds.has(r.floorPlanId),
       )
     },
-    [activeWarehouseId, hiddenFloorPlanIds],
+    [activeWarehouseId, hiddenFloorPlanIds, shapeHiddenFloorIds, floorPlanAligning],
   )
 
   const { data: savedGridsRawAll } = useSpatialGrids()
@@ -1054,7 +1164,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
   // visibility-cascade can read it). Here we just derive the scoped
   // view that the side panel + overlays consume.
   const savedImages = useMemo<ImageShape[]>(
-    () => scopeToWarehouse(savedImagesRawAll ?? []),
+    () => scopeToWarehouse(savedImagesRawAll ?? [], { floorPlans: true }),
     [savedImagesRawAll, scopeToWarehouse],
   )
   const selectedImage = useMemo<ImageShape | null>(() => {
@@ -1137,7 +1247,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
   const savedStairs = useMemo<StairShape[]>(() => {
     const all = savedStairsRawAll ?? []
     const scoped = scopeToWarehouse(all)
-    if (hiddenFloorPlanIds.size === 0) return scoped
+    if (floorPlanAligning) return scoped
+    if (shapeHiddenFloorIds.size === 0) return scoped
     // A lift spans floors: keep it while any floor it links is shown,
     // even when its own `floorPlanId` floor is hidden.
     const kept = new Set(scoped)
@@ -1145,10 +1256,10 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       (s) =>
         !kept.has(s) &&
         (activeWarehouseId === null || s.zoneId === activeWarehouseId) &&
-        liftFloorPlanIds(s.config).some((id) => !hiddenFloorPlanIds.has(id)),
+        liftFloorPlanIds(s.config).some((id) => !shapeHiddenFloorIds.has(id)),
     )
     return rescued.length ? [...scoped, ...rescued] : scoped
-  }, [savedStairsRawAll, scopeToWarehouse, hiddenFloorPlanIds, activeWarehouseId]
+  }, [savedStairsRawAll, scopeToWarehouse, shapeHiddenFloorIds, floorPlanAligning, activeWarehouseId]
   )
 
   // Image planes — separate kind from `images`. Renders user images as
@@ -1215,16 +1326,6 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     return map
   }, [scopedDoors])
 
-  // Route-preview (indoor wayfinding) — click A, click B, path drawn.
-  // Owns its own session state; deactivating the tool wipes it.
-  const routePreview = useRoutePreviewTool({
-    mapInstance,
-    activeTool,
-    walls: savedLines,
-    doors: scopedDoors,
-    polygons: savedPolygons,
-    grids: savedGrids,
-  })
   // ---- Image-plane tool state ----------------------------------------------
   const {
     selectedImagePlaneIds,
@@ -1334,34 +1435,21 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
 
   /**
    * Phase 2: per-rule target/source linking. Build a viewer index of
-   * every shape currently on the canvas (plus addressable grid cells)
-   * so the resolver can broadcast a rule with a pinned source to every
-   * eligible target — e.g. "for every text label, when this polygon's
-   * status is occupied, set text = OCCUPIED." Or pin both target and
-   * source to drive a one-to-one relationship.
+   * every shape currently on the canvas so the resolver can broadcast a
+   * rule with a pinned source to every eligible target — e.g. "for every
+   * text label, when this polygon's status is occupied, set text =
+   * OCCUPIED." Or pin both target and source to drive a one-to-one
+   * relationship.
+   *
+   * Grid cells are NOT listed here: `gridCellsFromBins` has the resolver
+   * enumerate every cell that has a bin itself (cells without a bin have
+   * nothing for a `self` rule to read). Building that list here made the
+   * index — and with it a full resolve — change on every bin edit or SSE
+   * event; without it the index only changes with the shapes, and a bin
+   * change re-resolves just the cells it drives.
    */
-  const viewerIndex = useMemo<import('@/lib/style-rules').ViewerIndex>(() => {
-    // Enumerate the address of every cell that already has a bin. The
-    // resolver's `target: 'all' + scope: 'grid-cell'` branch reads
-    // exclusively from `viewers.gridCells` (see resolver.ts:311-316) —
-    // without this list, that branch returns an empty array and no
-    // grid-cell rule ever fires, even when the bin data satisfies its
-    // conditions. Cells without a bin are intentionally skipped: a
-    // grid-cell rule's conditions almost always evaluate against the
-    // cell's own bin (`source: 'self'`), and an empty cell has no bin
-    // to evaluate against.
-    const gridCells: { gridId: number; row: number; col: number; level: number }[] = []
-    for (const bin of savedBins) {
-      if (bin.targetKind !== 'grid-cell') continue
-      if (bin.gridId === undefined || bin.row === undefined || bin.col === undefined) continue
-      gridCells.push({
-        gridId: bin.gridId,
-        row: bin.row,
-        col: bin.col,
-        level: bin.level ?? 0,
-      })
-    }
-    return {
+  const viewerIndex = useMemo<import('@/lib/style-rules').ViewerIndex>(
+    () => ({
       polygons: savedPolygons,
       circles: savedCircles,
       lines: savedLines,
@@ -1370,25 +1458,26 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       models: savedModels,
       textLabels: savedTextLabels,
       stairs: savedStairs,
-      gridCells,
-    }
-  }, [
-    savedPolygons,
-    savedCircles,
-    savedLines,
-    savedMarkers,
-    savedImages,
-    savedModels,
-    savedTextLabels,
-    savedStairs,
-    savedBins,
-  ])
+      gridCells: [],
+    }),
+    [
+      savedPolygons,
+      savedCircles,
+      savedLines,
+      savedMarkers,
+      savedImages,
+      savedModels,
+      savedTextLabels,
+      savedStairs,
+    ],
+  )
 
   const resolvedStyles = useMemo(
     () =>
       resolveStyleMaps(savedStyleRules, savedBins, {
         zoneId: activeWarehouseId ?? undefined,
         viewers: viewerIndex,
+        gridCellsFromBins: true,
       }),
     [savedStyleRules, savedBins, activeWarehouseId, viewerIndex],
   )
@@ -1406,7 +1495,12 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
    * `MarkerStyleOverride` directly. Text labels are a Phase-2 addition
    * — they don't have a bin themselves, but the resolver's link pass
    * may have emitted a style keyed by `text-label:<id>`.
+   *
+   * Keyed on the shapes map alone: the resolver keeps that map's identity
+   * when only seat / cell styles changed, so a seat event doesn't hand
+   * every shape overlay new override maps (and a full rebuild).
    */
+  const resolvedShapeStyles = resolvedStyles.shapes
   const styleOverridesByKind = useMemo(() => {
     const polygon = new Map<number, import('@/lib/polygon-generators').PolygonStyleOverride>()
     const circle = new Map<number, import('@/lib/circle-generators').CircleStyleOverride>()
@@ -1414,7 +1508,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     const marker = new Map<number, import('@/components/map-marker-overlay').MarkerStyleOverride>()
     const model = new Map<number, Record<string, unknown>>()
     const textLabel = new Map<number, { labelText?: string; labelColor?: string; fillColor?: string; fillOpacity?: number }>()
-    for (const [key, resolved] of resolvedStyles.shapes) {
+    for (const [key, resolved] of resolvedShapeStyles) {
       const sep = key.indexOf(':')
       if (sep < 0) continue
       const kind = key.slice(0, sep)
@@ -1449,7 +1543,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       }
     }
     return { polygon, circle, line, marker, model, textLabel }
-  }, [resolvedStyles])
+  }, [resolvedShapeStyles])
 
   const selectedStair = useMemo<StairShape | null>(() => {
     if (selectedStairIds.size !== 1) return null
@@ -1515,6 +1609,41 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
   /** Per-asset full AABB — drives vertical bottom-anchor so the model
    *  rests on the elevation plane instead of centring on it. */
   const modelBounds = useModelBoundsMap()
+
+  // Route-preview (indoor wayfinding) — click A, click B, routes planned
+  // across floors through stairs / lifts / escalators. The planner gets
+  // every floor of this facility (hidden floors too — a route may pass
+  // through a floor that isn't on screen); clicks land on the shown floors.
+  const routeFacility = useMemo<FacilityRoutingInput>(() => {
+    const inZone = <T extends { zoneId?: number }>(rows: ReadonlyArray<T> | undefined): T[] =>
+      (rows ?? []).filter((r) => activeWarehouseId === null || r.zoneId === activeWarehouseId)
+    return {
+      images: inZone(savedImagesRawAll),
+      lines: inZone(savedLinesRawAll),
+      doors: inZone(doors),
+      polygons: inZone(savedPolygonsRawAll),
+      grids: inZone(savedGridsRawAll),
+      stairs: inZone(savedStairsRawAll),
+      circles: inZone(savedCirclesRawAll),
+      models: inZone(savedModelsRawAll),
+      modelBounds,
+    }
+  }, [activeWarehouseId, savedImagesRawAll, savedLinesRawAll, doors, savedPolygonsRawAll, savedGridsRawAll, savedStairsRawAll, savedCirclesRawAll, savedModelsRawAll, modelBounds])
+  const routePickableFloorIds = useMemo(
+    () => new Set(savedImages.filter((img) => img.id !== undefined && img.visible !== false).map((img) => img.id!)),
+    [savedImages],
+  )
+  const routePreview = useRoutePreviewTool({
+    mapInstance,
+    activeTool,
+    facility: routeFacility,
+    pickableFloorIds: routePickableFloorIds,
+  })
+  const routePortalLabel = useCallback(
+    (kind: 'stairs' | 'escalator' | 'lift', name: string, dir: 'up' | 'down' | null) =>
+      `${name || t(`routePanel.portal.${kind}`)}${dir === 'up' ? ' ↑' : dir === 'down' ? ' ↓' : ''}`,
+    [t],
+  )
   // Kick off the inspector fetch for any bundled asset the user has
   // placed. Without this, `useModelBoundsMap()` returns nothing for
   // bundled assets (they don't stamp `inspector` at build time), so
@@ -1855,9 +1984,11 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
           start: g.start,
           current: g.current,
           config: g.config,
-          visible: g.visible,
+          // A path grid being re-drawn is replaced by the live preview —
+          // keep the old cells from showing under the points being removed.
+          visible: g.visible && !(g.id === redrawingGridId && isPathGrid(g.config)),
         })),
-    [savedGrids]
+    [savedGrids, redrawingGridId]
   )
 
   const selectedGrid = useMemo<Grid | null>(() => {
@@ -1937,11 +2068,14 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     hasAnchor,
     drawMode,
     liveLine,
+    livePreviewConfig,
     setHasAnchor,
     setDrawMode,
     setLiveStart,
     setLiveCurrent,
     exitDrawMode,
+    undoPathVertex,
+    finishPathDraw,
     handleToggleDrawMode,
     drawModeSourceRef,
   } = useGridDrawTool({
@@ -2138,12 +2272,15 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     handleDeleteRouteById,
     handleRenameRoute,
     handleExitRoutePlacement,
+    handleSelectRoute,
   } = useRouteHandlers({
     mapInstance,
     savedRoutes,
     setSelectedRouteIds,
     setActiveTool,
   })
+
+  const { handleBulkSetVisible } = useSavedListBulk()
 
   const {
     handleStairPatch,
@@ -2272,10 +2409,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     setActiveTool,
   })
 
-  // Region-select drag state for the AI Map tool. Two pieces:
-  //   - aiDragStartRef: mousedown position (screen + lngLat). Consumed
-  //     by the click dispatch below to decide "drag = region" vs "click
-  //     = whole image".
+  // Area drag state for the AI Map tool ("Part of the floor"). Two pieces:
+  //   - aiDragStartRef: mousedown position (screen + lngLat).
   //   - aiDragRect (state, not ref): live rect in SCREEN space during
   //     the drag, driving the semi-transparent preview overlay.
   //     Screen-space is intentional — Mapbox's coord system re-projects
@@ -2402,25 +2537,37 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       }
       setMarqueeRect(null)
     }
-    const onMove = (e: mapboxgl.MapMouseEvent) => {
+    // Move / release are read on the window, clamped to the canvas: a drag
+    // that ends over the side panel, toolbar or status bar never reaches
+    // the map, which left the rectangle stuck and selected nothing.
+    const canvasPoint = (ev: MouseEvent) => {
+      const r = map.getCanvas().getBoundingClientRect()
+      return {
+        x: Math.min(Math.max(ev.clientX - r.left, 0), r.width),
+        y: Math.min(Math.max(ev.clientY - r.top, 0), r.height),
+      }
+    }
+    const onMove = (ev: MouseEvent) => {
       const start = marqueeStartRef.current
       if (!start) return
-      const x0 = Math.min(start.screen.x, e.point.x)
-      const y0 = Math.min(start.screen.y, e.point.y)
-      const w = Math.abs(e.point.x - start.screen.x)
-      const h = Math.abs(e.point.y - start.screen.y)
+      const pt = canvasPoint(ev)
+      const x0 = Math.min(start.screen.x, pt.x)
+      const y0 = Math.min(start.screen.y, pt.y)
+      const w = Math.abs(pt.x - start.screen.x)
+      const h = Math.abs(pt.y - start.screen.y)
       if (w < 4 && h < 4) return
       setMarqueeRect({ x: x0, y: y0, w, h })
     }
-    const onUp = (e: mapboxgl.MapMouseEvent) => {
+    const onUp = (ev: MouseEvent) => {
       const start = marqueeStartRef.current
       marqueeStartRef.current = null
       setMarqueeRect(null)
       if (!start) return
-      const x0 = Math.min(start.screen.x, e.point.x)
-      const y0 = Math.min(start.screen.y, e.point.y)
-      const x1 = Math.max(start.screen.x, e.point.x)
-      const y1 = Math.max(start.screen.y, e.point.y)
+      const pt = canvasPoint(ev)
+      const x0 = Math.min(start.screen.x, pt.x)
+      const y0 = Math.min(start.screen.y, pt.y)
+      const x1 = Math.max(start.screen.x, pt.x)
+      const y1 = Math.max(start.screen.y, pt.y)
       const w = x1 - x0
       const h = y1 - y0
       // A tiny release is a click, not a drag. Fall through to the map's
@@ -2766,15 +2913,15 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     }
 
     map.on('mousedown', onDown)
-    map.on('mousemove', onMove)
-    map.on('mouseup', onUp)
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp, true)
     // If focus leaves the window mid-drag, drop the state so the rect
     // doesn't reappear when the user comes back with the mouse held.
     window.addEventListener('blur', onCancel)
     return () => {
       map.off('mousedown', onDown)
-      map.off('mousemove', onMove)
-      map.off('mouseup', onUp)
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp, true)
       window.removeEventListener('blur', onCancel)
       map.getCanvas().style.cursor = ''
       map.dragPan.enable()
@@ -3012,9 +3159,10 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
 
   // Deep link from a report row ("Open in editor"): `?select=<kind>:<id>`
   // selects that shape once this facility has loaded and the first
-  // viewport fit has run; the select handler then brings it into view.
+  // viewport fit has run; once the selection resolves, focus mode flies to
+  // it (the deep-link fly effect below `panelInset`).
   // See facilityEditorHref in src/lib/reports/facility-sources.ts.
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const selectParam = searchParams.get('select')
   const selectMatch = useMemo(() => (selectParam ? /^([a-z-]+):(\d+)$/.exec(selectParam) : null), [selectParam])
   const selectKind = selectMatch?.[1] as EntityKind | undefined
@@ -3022,10 +3170,26 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     selectKind !== undefined && s.loadedFor[selectKind] !== undefined && s.loadedFor[selectKind] === (activeWarehouseId ?? null),
   )
   const deepLinkDoneRef = useRef<string | null>(null)
+  /**
+   * The focus key the deep link is waiting to fly to. `seen` once the
+   * selection got there, so a selection that moves on before resolving
+   * drops it instead of flying later.
+   */
+  const deepLinkFlyRef = useRef<{ key: string; seen: boolean } | null>(null)
+  /**
+   * The applied deep link, until the focus leaves it: `seen` once the
+   * selection resolved to its focus key; the effect below `focusTargetKey`
+   * then drops `?select=` from the URL when the focus moves on.
+   */
+  const deepLinkReleaseRef = useRef<{ param: string; key: string; seen: boolean } | null>(null)
   useEffect(() => {
+    // The param is gone (released below, or navigated away): a later link
+    // to the same shape applies again. Never reset while it is still in
+    // the URL, so a render before the release lands can't re-apply it.
+    if (!selectParam) deepLinkDoneRef.current = null
     if (!selectMatch || !selectParam || deepLinkDoneRef.current === selectParam) return
     if (!mapInstance || !viewportInputsReady || !selectKindLoaded) return
-    const handlers: Partial<Record<string, (id: number, additive: boolean) => void>> = {
+    const handlers: Partial<Record<FocusShapeKind, (id: number, additive: boolean) => void>> = {
       polygons: handleSelectPolygon,
       markers: handleSelectMarker,
       grids: handleSelectGrid,
@@ -3036,31 +3200,18 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       'text-labels': handleSelectTextLabel,
       models: handleSelectModel,
     }
-    const select = handlers[selectMatch[1]]
+    const kind = selectMatch[1] as FocusShapeKind
+    const select = handlers[kind]
     if (!select) return
     deepLinkDoneRef.current = selectParam
     const id = Number(selectMatch[2])
     select(id, false)
     // The select handlers only pan when the shape is off-screen; a link
-    // from a report should land close enough to see the shape itself.
-    const state = useSpatialStore.getState() as unknown as Record<string, unknown>
-    const key = selectMatch[1] === 'text-labels' ? 'textLabels' : selectMatch[1]
-    const shape = (state[key] as Array<Record<string, unknown>> | undefined)?.find((x) => x.id === id)
-    const pts: [number, number][] = []
-    if (shape) {
-      if (Array.isArray(shape.vertices)) pts.push(...(shape.vertices as [number, number][]))
-      if (Array.isArray(shape.position)) pts.push(shape.position as [number, number])
-      if (Array.isArray(shape.start) && Array.isArray(shape.current)) pts.push(shape.start as [number, number], shape.current as [number, number])
-    }
-    if (pts.length > 0) {
-      const lngs = pts.map((p) => p[0])
-      const lats = pts.map((p) => p[1])
-      mapInstance.easeTo({
-        center: [(Math.min(...lngs) + Math.max(...lngs)) / 2, (Math.min(...lats) + Math.max(...lats)) / 2],
-        zoom: Math.max(mapInstance.getZoom(), 19),
-        duration: 800,
-      })
-    }
+    // from a report should land looking at the shape itself — framed, and
+    // from an angle where no wall or slab stands in front of it. That is
+    // `flyToFocus`, run once the selection resolves to a focus.
+    deepLinkFlyRef.current = { key: focusKey({ kind, id }), seen: false }
+    deepLinkReleaseRef.current = { param: selectParam, key: focusKey({ kind, id }), seen: false }
   }, [
     selectMatch,
     selectParam,
@@ -3216,6 +3367,186 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
   })
 
 
+  // ---- Drafting: live dimensions, angle lock, typed lengths, guides,
+  // image calibration (docs/frontend.md § Drafting tools) -------------------
+  const {
+    measureSettings,
+    setMeasureSettings,
+    measureDraftVertices,
+    setMeasureDraftVertices,
+    measureDraftCursor,
+    setMeasureDraftCursor,
+    measureSnapped,
+    setMeasureSnapped,
+    measureVerticesRef,
+    guides,
+    setGuides,
+    typedLength,
+    setTypedLength,
+    calibration,
+    setCalibration,
+    calibrationCursor,
+    setCalibrationCursor,
+    calibrationSamples,
+    setCalibrationSamples,
+  } = useMeasureEditorState(activeWarehouseId ?? null)
+
+  const activeFloorPlan = useMemo(
+    () => (defaultFloorPlanId === null ? null : savedImagesRawAll?.find((img) => img.id === defaultFloorPlanId) ?? null),
+    [defaultFloorPlanId, savedImagesRawAll],
+  )
+  const activeFloorElevation = activeFloorPlan?.config.elevation ?? 0
+  const angleBaseDeg = planBaseAngle(activeFloorPlan?.rotation ?? 0)
+  // Read by the vertex tools at event time — a ref, so toggling the lock
+  // doesn't rebind their map handlers mid-draw.
+  const drawAssistRef = useRef<DrawAssist>({ angleLock: false, angleStep: 45, baseDeg: 0 })
+  useEffect(() => {
+    drawAssistRef.current = {
+      angleLock: measureSettings.angleLock,
+      angleStep: measureSettings.angleStep,
+      baseDeg: angleBaseDeg,
+    }
+  }, [measureSettings.angleLock, measureSettings.angleStep, angleBaseDeg])
+
+  // Guides of the floor being drawn on (all of them with no default floor).
+  const floorGuides = useMemo(
+    () => guides.filter((g) => defaultFloorPlanId === null || g.floorPlanId === null || g.floorPlanId === defaultFloorPlanId),
+    [guides, defaultFloorPlanId],
+  )
+  const measureSnapTargetsRef = useRef<LngLat[]>([])
+  useEffect(() => {
+    measureSnapTargetsRef.current = [
+      ...savedLines.flatMap((l) => l.vertices),
+      ...savedPolygons.flatMap((p) => p.vertices),
+      ...floorGuides.flatMap((g) => g.vertices),
+    ]
+  }, [savedLines, savedPolygons, floorGuides])
+
+  const handleMeasureFinish = useCallback(
+    (vertices: LngLat[], closed: boolean) => {
+      const guide: Guide = {
+        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        floorPlanId: defaultFloorPlanIdRef.current,
+        vertices,
+        closed,
+        elevation: activeFloorElevation,
+      }
+      setGuides((prev) => [...prev, guide])
+      // A new guide hidden by the Layers toggle would look like a failed draw.
+      setLayerVisibility((prev) => (prev.guides ? prev : { ...prev, guides: true }))
+    },
+    [defaultFloorPlanIdRef, activeFloorElevation, setGuides],
+  )
+  const handleClearGuides = useCallback(() => {
+    const onFloor = new Set(floorGuides.map((g) => g.id))
+    setGuides((prev) => prev.filter((g) => !onFloor.has(g.id)))
+  }, [floorGuides, setGuides])
+
+  useMeasureTool({
+    mapInstance,
+    activeTool,
+    elevation: activeFloorElevation,
+    drawAssistRef,
+    snapTargetsRef: measureSnapTargetsRef,
+    measureVerticesRef,
+    setMeasureDraftVertices,
+    setMeasureDraftCursor,
+    setMeasureSnapped,
+    onFinish: handleMeasureFinish,
+    setActiveTool,
+  })
+
+  // Typed lengths: "3.5" + Enter places the next vertex 3.5 units toward
+  // the cursor, for walls, polygons and the Measure tool alike.
+  useLengthEntry({
+    enabled: activeTool === 'create-line' || activeTool === 'create-polygon' || activeTool === 'measure',
+    canStart: () =>
+      (activeTool === 'create-line'
+        ? lineVerticesRef.current
+        : activeTool === 'create-polygon'
+          ? polygonVerticesRef.current
+          : measureVerticesRef.current
+      ).length > 0,
+    unit: measureSettings.unit,
+    buffer: typedLength,
+    setBuffer: setTypedLength,
+    onSubmit: (meters, shiftKey) => {
+      const lock = activeLock(drawAssistRef.current, shiftKey)
+      if (activeTool === 'create-line') {
+        const at = typedLengthTarget({ vertices: lineVerticesRef.current, cursor: lineDraftCursor, meters, lock })
+        if (at) setLineDraftVertices((prev) => [...prev, at])
+      } else if (activeTool === 'create-polygon') {
+        const at = typedLengthTarget({ vertices: polygonVerticesRef.current, cursor: polygonDraftCursor, meters, lock })
+        if (at) setPolygonDraftVertices((prev) => [...prev, at])
+      } else {
+        const at = typedLengthTarget({ vertices: measureVerticesRef.current, cursor: measureDraftCursor, meters, lock })
+        if (at) setMeasureDraftVertices((prev) => [...prev, at])
+      }
+    },
+  })
+
+  // Shift + click on the map starts Mapbox's box-zoom, which swallows the
+  // click; Shift is the angle-lock modifier for these tools.
+  useEffect(() => {
+    if (!mapInstance) return
+    const vertexTool =
+      activeTool === 'create-line' || activeTool === 'create-polygon' || activeTool === 'measure' || activeTool === 'calibrate-image'
+    if (!vertexTool) return
+    mapInstance.boxZoom.disable()
+    return () => {
+      mapInstance.boxZoom.enable()
+    }
+  }, [mapInstance, activeTool])
+
+  // ---- Image calibration session ------------------------------------------
+  const calibrationImage = useMemo(
+    () => (calibration ? savedImagesRawAll?.find((img) => img.id === calibration.imageId) ?? null : null),
+    [calibration, savedImagesRawAll],
+  )
+  const calibrationFrame = useMemo(() => (calibrationImage ? imageFrame(calibrationImage) : null), [calibrationImage])
+  const handleStartCalibrateImage = useCallback(
+    (id: number) => {
+      setCalibration({ imageId: id, mode: 'area', firstPick: null, pending: null })
+      setActiveTool('calibrate-image')
+    },
+    [setCalibration],
+  )
+  const handleExitCalibration = useCallback(() => {
+    const id = calibration?.imageId
+    setCalibration(null)
+    setActiveTool('select')
+    // Back on the image it was entered from, so its side panel shows the new size.
+    if (id !== undefined) setSelectedImageIds(new Set([id]))
+  }, [calibration, setCalibration, setSelectedImageIds])
+  // Leaving the tool any other way (toolbar, shortcut) or losing the image
+  // ends the session.
+  useEffect(() => {
+    if (!calibration) return
+    if (activeTool === 'calibrate-image' && calibrationFrame) return
+    queueMicrotask(() => setCalibration(null))
+  }, [activeTool, calibration, calibrationFrame, setCalibration])
+  const patchCalibrationImage = useCallback(
+    (patch: Partial<ImageShape>) => {
+      if (!calibrationImage?.id) return
+      void patchSpatialEntity('images', calibrationImage.id, { ...patch, updatedAt: new Date() })
+    },
+    [calibrationImage],
+  )
+  useCalibrateImageTool({
+    mapInstance,
+    activeTool,
+    session: calibration,
+    frame: calibrationFrame,
+    elevation: calibrationImage?.config.elevation ?? 0,
+    drawAssistRef,
+    setSession: setCalibration,
+    setCursor: setCalibrationCursor,
+    onStraighten: (a, b) => {
+      if (calibrationFrame) patchCalibrationImage({ rotation: straightenedRotation(calibrationFrame, a, b) })
+    },
+    onExit: handleExitCalibration,
+  })
+
   // ---- Vertex-chain draw tools (polygon / line / route) ------------------
   usePolygonDrawTool({
     mapInstance,
@@ -3226,6 +3557,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     activeWarehouseIdRef,
     defaultFloorPlanIdRef,
     polygonVerticesRef,
+    drawAssistRef,
     pinWarehouseCenterIfNeeded,
     setPolygonDraftVertices,
     setPolygonDraftCursor,
@@ -3271,6 +3603,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     activeWarehouseIdRef,
     defaultFloorPlanIdRef,
     lineVerticesRef,
+    drawAssistRef,
     pinWarehouseCenterIfNeeded,
     setLineDraftVertices,
     setLineDraftCursor,
@@ -3560,7 +3893,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       }
       queryCache.invalidate('grids')
     } else if (entry.type === 'redraw') {
-      await updateGridGeometry(entry.gridId, entry.oldStart, entry.oldCurrent)
+      if (entry.oldConfig) await updateGridShape(entry.gridId, entry.oldStart, entry.oldCurrent, entry.oldConfig)
+      else await updateGridGeometry(entry.gridId, entry.oldStart, entry.oldCurrent)
     } else if (entry.type === 'recreate') {
       // Redo of a delete — push the inverse onto the undo stack via history.
       const ids = entry.grids.map((g) => g.id!).filter((id) => id !== undefined)
@@ -3657,7 +3991,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       }
       queryCache.invalidate('grids')
     } else if (entry.type === 'redraw') {
-      await updateGridGeometry(entry.gridId, entry.newStart, entry.newCurrent)
+      if (entry.newConfig) await updateGridShape(entry.gridId, entry.newStart, entry.newCurrent, entry.newConfig)
+      else await updateGridGeometry(entry.gridId, entry.newStart, entry.newCurrent)
     } else if (entry.type === 'delete-marker') {
       // Redo a marker delete — re-delete the same shapes by id.
       const ids = entry.markers.map((m) => m.id!).filter((x): x is number => x !== undefined)
@@ -4055,6 +4390,215 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     selectedRouteIds.size +
     selectedImagePlaneIds.size
 
+  // ---- Focus mode (blockers + near set) -----------------------------------
+  // The one selected item is "focused": occlusion never hides it, the
+  // shapes standing between the camera and it fade to 15 % (recomputed
+  // when the camera settles), its NEAR set — what it sits inside,
+  // volumetric shapes on its floor within 5 m, anything overhead; computed
+  // once per focus (`useFocusNear`) — fades to 35 % (a large shape only
+  // around the item / the line of sight: the cut-away), and a brief ring
+  // marks it. Everything else stays exactly as drawn: the same
+  // policy as the viewer, nothing dimmed. View state only: nothing here
+  // writes a shape. Multi-select, a lone route, and the magic-wall / AI-map
+  // tools (their map picks are not the selection) give no focus, and no
+  // focus is FOCUS_OFF: the editor exactly as it was without focus mode.
+  const focusAllowed = activeTool !== 'magic-wall' && activeTool !== 'ai-map'
+  const focusSelection = useMemo(
+    () =>
+      focusAllowed
+        ? editorFocusSelection(
+            {
+              markers: selectedMarkerIds,
+              polygons: selectedPolygonIds,
+              circles: selectedCircleIds,
+              lines: selectedLineIds,
+              stairs: selectedStairIds,
+              grids: selectedGridIds,
+              images: selectedImageIds,
+              'image-planes': selectedImagePlaneIds,
+              models: selectedModelIds,
+              doors: selectedDoorIds,
+              'text-labels': selectedTextLabelIds,
+              routes: selectedRouteIds,
+            },
+            selectedBin,
+          )
+        : null,
+    [
+      focusAllowed,
+      selectedMarkerIds,
+      selectedPolygonIds,
+      selectedCircleIds,
+      selectedLineIds,
+      selectedStairIds,
+      selectedGridIds,
+      selectedImageIds,
+      selectedImagePlaneIds,
+      selectedModelIds,
+      selectedDoorIds,
+      selectedTextLabelIds,
+      selectedRouteIds,
+      selectedBin,
+    ],
+  )
+  // Keyed on primitives, so a re-render, a re-created selection Set or a
+  // bin object with the same cell keeps the same target object.
+  const focusKind = focusSelection?.kind ?? null
+  const focusId = focusSelection?.id ?? null
+  const focusCellRow = focusSelection?.cell?.row ?? null
+  const focusCellCol = focusSelection?.cell?.col ?? null
+  const focusCellLevel = focusSelection?.cell?.level ?? null
+  const focusTarget = useMemo<FocusTarget | null>(() => {
+    if (focusKind === null || focusId === null) return null
+    if (focusCellRow === null || focusCellCol === null || focusCellLevel === null) {
+      return { kind: focusKind, id: focusId }
+    }
+    return { kind: focusKind, id: focusId, cell: { row: focusCellRow, col: focusCellCol, level: focusCellLevel } }
+  }, [focusKind, focusId, focusCellRow, focusCellCol, focusCellLevel])
+  const focusTargetKey = focusKey(focusTarget)
+  // `?select=` deep link: once its selection has resolved to a focus and
+  // the focus then moves away (cleared, Esc, another shape), take `select`
+  // out of the URL — replaced, so history.length is unchanged and Back
+  // doesn't re-select. Never before the link has applied.
+  useEffect(() => {
+    const pending = deepLinkReleaseRef.current
+    if (!pending) return
+    if (selectParam !== pending.param) {
+      deepLinkReleaseRef.current = null
+      return
+    }
+    if (focusTargetKey === pending.key) {
+      pending.seen = true
+      return
+    }
+    if (!pending.seen) return
+    deepLinkReleaseRef.current = null
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('select')
+        return next
+      },
+      { replace: true },
+    )
+  }, [focusTargetKey, selectParam, setSearchParams])
+  // Resolved against the arrays each overlay draws (transform drafts
+  // merged in), so the ring and the occlusion samples follow a dragged
+  // shape. Rows keep their identity while unchanged, and `resolveFocus`
+  // caches per row, so an unrelated edit returns the same object.
+  const focusShapes = useMemo<FocusShapes>(
+    () => ({
+      markers: savedMarkers,
+      polygons: polygonsForOverlay,
+      circles: circlesForOverlay,
+      lines: linesForOverlay,
+      stairs: stairsForOverlay,
+      grids: savedGrids,
+      images: imagesForOverlay,
+      imagePlanes: imagePlanesForOverlay,
+      models: modelsForOverlay,
+      doors: scopedDoors,
+      textLabels: textLabelsForOverlay,
+    }),
+    [
+      savedMarkers,
+      polygonsForOverlay,
+      circlesForOverlay,
+      linesForOverlay,
+      stairsForOverlay,
+      savedGrids,
+      imagesForOverlay,
+      imagePlanesForOverlay,
+      modelsForOverlay,
+      scopedDoors,
+      textLabelsForOverlay,
+    ],
+  )
+  const focusResolved = useMemo(() => resolveFocus(focusTarget, focusShapes), [focusTarget, focusShapes])
+  // What a marker, text label or door can hide behind: every extruded
+  // kind, each gated on its own layer toggle (geometry the user hid paints
+  // nothing, so it occludes nothing). One bag for the marker, text-label
+  // and door overlays (SecondaryLayers) and for focus mode, so
+  // `buildOccluders` hands every one of them the same prism list and
+  // spatial index.
+  const occluderBag = useMemo<OccluderInput>(
+    () => ({
+      images: layerVisibility.image ? savedImages : undefined,
+      polygons: layerVisibility.polygon ? savedPolygons : undefined,
+      circles: layerVisibility.circle ? savedCircles : undefined,
+      lines: layerVisibility.line ? savedLines : undefined,
+      stairs: layerVisibility.stair ? savedStairs : undefined,
+      grids: layerVisibility.grid ? savedGrids : undefined,
+    }),
+    [
+      layerVisibility.image,
+      layerVisibility.polygon,
+      layerVisibility.circle,
+      layerVisibility.line,
+      layerVisibility.stair,
+      layerVisibility.grid,
+      savedImages,
+      savedPolygons,
+      savedCircles,
+      savedLines,
+      savedStairs,
+      savedGrids,
+    ],
+  )
+  // Built only while something is focused: with marker occlusion switched
+  // off in Graphics, nothing else builds this list.
+  const focusActive = focusTarget !== null
+  const focusPrisms = useMemo<ReadonlyArray<OccluderPrism>>(
+    () => (focusActive ? buildOccluders(occluderBag) : NO_FOCUS_PRISMS),
+    [focusActive, occluderBag],
+  )
+  const focusBlockers = useTrackFocusBlockers(overlayMap, focusResolved, focusPrisms)
+  // Recomputed only when the resolution, the prism list or a shape array
+  // changes (never on a camera event); the same object while its key holds.
+  const focusNear = useFocusNear(focusResolved, focusPrisms, focusShapes)
+  const focusScene = useFocusSceneValue({ target: focusTarget, resolved: focusResolved, near: focusNear })
+
+  // A focused item on a floor whose shapes were switched off this session
+  // ("Show shapes" in the floor-plan list) is not drawn: show that floor's
+  // shapes again. Only when the item is actually missing (a lift linked to
+  // a shown floor is drawn already), and once per new focus — switching
+  // the floor off again while the item stays selected sticks. A floor
+  // plan hidden for real (`images.visible`) is never written: its shapes
+  // cannot be selected anyway. Adjusted during render, like the other
+  // derived resets in this file.
+  const [focusFloorCheckedFor, setFocusFloorCheckedFor] = useState('')
+  if (focusFloorCheckedFor !== focusTargetKey) {
+    setFocusFloorCheckedFor(focusTargetKey)
+    if (
+      focusTarget &&
+      focusTarget.kind !== 'dl' &&
+      focusTarget.kind !== 'images' &&
+      !focusResolved &&
+      !floorPlanAligning &&
+      shapesHiddenFloorIds.size > 0
+    ) {
+      const { kind, id } = focusTarget
+      const rows: ReadonlyArray<{ id?: number; floorPlanId?: number | null }> | undefined =
+        kind === 'markers' ? savedMarkersRawAll
+        : kind === 'polygons' ? savedPolygonsRawAll
+        : kind === 'circles' ? savedCirclesRawAll
+        : kind === 'lines' ? savedLinesRawAll
+        : kind === 'stairs' ? savedStairsRawAll
+        : kind === 'grids' ? savedGridsRawAll
+        : kind === 'image-planes' ? savedImagePlanesRawAll
+        : kind === 'models' ? savedModelsRawAll
+        : kind === 'doors' ? doors
+        : kind === 'text-labels' ? savedTextLabelsRawAll
+        : undefined
+      const floorId = rows?.find((r) => r.id === id)?.floorPlanId ?? null
+      if (floorId !== null && shapesHiddenFloorIds.has(floorId)) {
+        const next = new Set(shapesHiddenFloorIds)
+        next.delete(floorId)
+        setShapesHiddenFloorIds(next)
+      }
+    }
+  }
+
   // Cross-kind selection detection is computed above (before panelMode)
   // as `selectedKindCountForPanel` / `isCrossKindSelection` so the
   // panel-mode useMemo can consume it. Aliased here to keep the
@@ -4289,6 +4833,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
     handleRedo,
     handleExportGeoJSON,
     exitDrawMode,
+    undoGridPathVertex: undoPathVertex,
+    finishGridPath: finishPathDraw,
   })
   const setCheatsheetOpen = keyboardState.setCheatsheetOpen
   const openCheatsheet = useCallback(() => setCheatsheetOpen(true), [setCheatsheetOpen])
@@ -4311,6 +4857,36 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
    * row. Local caches are invalidated by kind afterward so the SSE
    * reload lands the new state in the UI.
    */
+
+  const measureScene = useMeasureScene({
+    t,
+    activeTool,
+    settings: measureSettings,
+    angleBaseDeg,
+    angleLocked: measureSettings.angleLock !== keyboardState.shiftHeld,
+    lineDraftVertices,
+    lineDraftCursor,
+    lineSnapped: lineDraftSnap?.kind === 'endpoint',
+    lineElevation: lineConfig.elevation ?? 0,
+    polygonDraftVertices,
+    polygonDraftCursor,
+    polygonElevation: polygonConfig.elevation ?? 0,
+    measureDraftVertices,
+    measureDraftCursor,
+    measureSnapped,
+    floorElevation: activeFloorElevation,
+    guides: floorGuides,
+    // Drafting aids stay out of the live operations preview.
+    guidesVisible: layerVisibility.guides && !preview,
+    typedLength,
+    calibration,
+    calibrationFrame,
+    calibrationElevation: calibrationImage?.config.elevation ?? 0,
+    calibrationSamples,
+    calibrationCursor,
+  })
+  const draftingBarVisible =
+    !preview && (activeTool === 'create-line' || activeTool === 'create-polygon' || activeTool === 'measure')
 
   const sidePanelActions = useMemo<SidePanelActions>(
     () => ({
@@ -4387,6 +4963,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       onCancelLineTransform: handleCancelLineTransform,
       lineTransformActive: lineTransform !== null,
       lineTransformKind: lineTransform?.kind ?? null,
+      onSelectRoute: handleSelectRoute,
+      onBulkSetVisible: handleBulkSetVisible,
       onFitToRouteById: handleFitToRouteById,
       onDeleteRouteById: handleDeleteRouteById,
       onRenameRoute: handleRenameRoute,
@@ -4429,6 +5007,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       onStartMoveImage: handleStartMoveImage,
       onStartRotateImage: handleStartRotateImage,
       onStartScaleImage: handleStartScaleImage,
+      onStartCalibrateImage: handleStartCalibrateImage,
       onCancelImageTransform: handleCancelImageTransform,
       imageTransformActive: imageTransform !== null,
       imageTransformKind: imageTransform?.kind ?? null,
@@ -4440,6 +5019,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       onReplaceImageFile: handleReplaceImageFile,
       onClearImageDraft: handleClearImageDraft,
       onToggleImageVisible: handleToggleImageVisible,
+      floorShapesHiddenIds: shapesHiddenFloorIds,
+      onToggleFloorShapesVisible: toggleFloorShapesVisible,
       onReorderFloorPlans: handleReorderFloorPlans,
       // ---- Magic-wall actions ----
       onGenerateMagicWall: handleGenerateMagicWall,
@@ -4691,6 +5272,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       handleStartMoveImage,
       handleStartRotateImage,
       handleStartScaleImage,
+      handleStartCalibrateImage,
       handleCancelImageTransform,
       imageTransform,
       handleBulkDeleteImages,
@@ -4701,6 +5283,8 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       handleReplaceImageFile,
       handleClearImageDraft,
       handleToggleImageVisible,
+      shapesHiddenFloorIds,
+      toggleFloorShapesVisible,
       handleGenerateMagicWall,
       handleExitMagicWall,
       handleTogglePolygonVisible,
@@ -4749,6 +5333,33 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
   const panelInset = panelOpen && rootWidth >= 640 ? 416 : 0
   const searchOnTopRow = rootWidth - panelInset >= 860
 
+  // `?select=` deep link (effect above): fly to the shape once its
+  // selection resolves to a focus, framed in the map area left beside the
+  // side panel (end side) and the vertical toolbar (start side).
+  useEffect(() => {
+    const pending = deepLinkFlyRef.current
+    if (!pending) return
+    if (focusTargetKey !== pending.key) {
+      if (pending.seen) deepLinkFlyRef.current = null
+      return
+    }
+    pending.seen = true
+    if (!mapInstance || !focusResolved || focusResolved.key !== pending.key) return
+    deepLinkFlyRef.current = null
+    const end = panelInset + DEEP_LINK_PAD_EDGE_PX
+    const start = DEEP_LINK_PAD_TOOLBAR_PX
+    const rtl = i18n.dir() === 'rtl'
+    flyToFocus(mapInstance, focusResolved, focusPrisms, {
+      mode: 'always',
+      padding: {
+        top: DEEP_LINK_PAD_TOP_PX,
+        bottom: DEEP_LINK_PAD_EDGE_PX,
+        left: rtl ? end : start,
+        right: rtl ? start : end,
+      },
+    })
+  }, [focusTargetKey, focusResolved, focusPrisms, mapInstance, panelInset, i18n])
+
   // The floor-plan tool's picker (library / upload) lives in the side
   // panel, which starts closed on a phone — open it with the tool, then
   // get the drawer out of the way once an image is picked so the user can
@@ -4781,101 +5392,106 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
       </div>
 
       <MapFloorBaseOverlay map={overlayMap} input={floorBaseInput} />
-      <OverlayStack
-        overlayMap={overlayMap}
-        layerOrder={layerOrder}
-        layerVisibility={layerVisibility}
-        shapeSelectionEnabled={shapeSelectionEnabled}
-        activeTool={activeTool}
-        onMapClickEmpty={handleMapClickEmpty}
-        imagesForOverlay={imagesForOverlay}
-        imageWallLines={floorBaseInput.lines}
-        imageLivePreview={imageLivePreview}
-        selectedImageIds={selectedImageIds}
-        imageTransform={imageTransform}
-        onImageClick={handleImageClickDispatch}
-        onImageTransformChange={handleImageTransformChange}
-        liveLine={liveLine}
-        committedLines={committedLines}
-        panelMode={panelMode}
-        selectedGrid={selectedGrid}
-        gridConfig={config}
-        selectedGridIds={selectedGridIds}
-        gridTransform={transform}
-        gridTransformDraft={transformDraft}
-        onCellClick={handleCellClick}
-        onGridTransformChange={handleTransformMove}
-        resolvedStyles={resolvedStyles}
-        circlesForOverlay={circlesForOverlay}
-        circleLivePreview={circleLivePreview}
-        selectedCircleIds={selectedCircleIds}
-        circleTransform={circleTransform}
-        onCircleClick={handleCircleClick}
-        onCircleTransformChange={handleCircleTransformChange}
-        circleStyleOverrides={
-          styleOverridesByKind.circle.size > 0 ? styleOverridesByKind.circle : null
-        }
-        polygonsForOverlay={polygonsForOverlay}
-        polygonDraftVertices={polygonDraftVertices}
-        polygonDraftCursor={polygonDraftCursor}
-        polygonConfig={polygonConfig}
-        selectedPolygonIds={polygonOverlaySelectedIds}
-        polygonTransform={polygonTransform}
-        onPolygonClick={handlePolygonClickRouted}
-        onPolygonTransformChange={handlePolygonTransformChange}
-        polygonStyleOverrides={
-          styleOverridesByKind.polygon.size > 0 ? styleOverridesByKind.polygon : null
-        }
-        linesForOverlay={linesForOverlay}
-        lineDraftVertices={lineDraftVertices}
-        lineDraftCursor={lineDraftCursor}
-        lineConfig={lineConfig}
-        lineDraftSnap={lineDraftSnap}
-        drawingUnit={drawingUnit}
-        selectedLineIds={selectedLineIds}
-        lineTransform={lineTransform}
-        onLineClick={handleLineClick}
-        onLineTransformChange={handleLineTransformChange}
-        lineStyleOverrides={
-          styleOverridesByKind.line.size > 0 ? styleOverridesByKind.line : null
-        }
-        attachedDoorsByLineId={
-          attachedDoorsByLineId.size > 0 ? attachedDoorsByLineId : null
-        }
-        savedRoutes={savedRoutes}
-        routeDraftVertices={routeDraftVertices}
-        routeDraftCursor={routeDraftCursor}
-        routeConfig={routeConfig}
-        routeDraftSnap={routeDraftSnap}
-        selectedRouteIds={selectedRouteIds}
-        onRouteClick={(id) => {
-          setSelectedRouteIds(new Set([id]))
-          setActiveTool('select')
-        }}
-        stairsForOverlay={stairsForOverlay}
-        selectedStairIds={selectedStairIds}
-        stairDraftAnchors={stairDraftAnchors}
-        stairDraftCursor={stairDraftCursor}
-        stairConfig={stairConfig}
-        onStairClick={(id, e) =>
-          handleSelectStair(id, e.shiftKey || e.metaKey || e.ctrlKey)
-        }
-        stairTransform={stairTransform}
-        onStairTransformChange={handleStairTransformChange}
-        modelsForOverlay={modelsForOverlay}
-        modelUrlMap={modelUrlMap}
-        modelBoundingCenters={modelBoundingCenters}
-        modelBounds={modelBounds}
-        modelShapeExtras={modelShapeExtrasMerged}
-        modelCursor={modelCursor}
-        modelAssetId={modelConfig.modelAssetId}
-        selectedModelIds={selectedModelIds}
-        modelTransform={modelTransform}
-        onModelClick={(id, e) =>
-          handleSelectModel(id, e.shiftKey || e.metaKey || e.ctrlKey)
-        }
-        onModelTransformChange={handleModelTransformChange}
-      />
+      <FocusSceneContext.Provider value={focusScene}>
+        <FocusBlockersContext.Provider value={focusBlockers}>
+          <OverlayStack
+            overlayMap={overlayMap}
+            layerOrder={layerOrder}
+            layerVisibility={layerVisibility}
+            shapeSelectionEnabled={shapeSelectionEnabled}
+            activeTool={activeTool}
+            onMapClickEmpty={handleMapClickEmpty}
+            imagesForOverlay={imagesForOverlay}
+            imageWallLines={floorBaseInput.lines}
+            imageAlignment={imageAlignment}
+            imageLivePreview={imageLivePreview}
+            selectedImageIds={selectedImageIds}
+            imageTransform={imageTransform}
+            onImageClick={handleImageClickDispatch}
+            onImageTransformChange={handleImageTransformChange}
+            liveLine={liveLine}
+            livePreviewConfig={livePreviewConfig}
+            committedLines={committedLines}
+            panelMode={panelMode}
+            selectedGrid={selectedGrid}
+            gridConfig={config}
+            selectedGridIds={selectedGridIds}
+            gridTransform={transform}
+            gridTransformDraft={transformDraft}
+            onCellClick={handleCellClick}
+            onGridTransformChange={handleTransformMove}
+            resolvedStyles={resolvedStyles}
+            circlesForOverlay={circlesForOverlay}
+            circleLivePreview={circleLivePreview}
+            selectedCircleIds={selectedCircleIds}
+            circleTransform={circleTransform}
+            onCircleClick={handleCircleClick}
+            onCircleTransformChange={handleCircleTransformChange}
+            circleStyleOverrides={
+              styleOverridesByKind.circle.size > 0 ? styleOverridesByKind.circle : null
+            }
+            polygonsForOverlay={polygonsForOverlay}
+            polygonDraftVertices={polygonDraftVertices}
+            polygonDraftCursor={polygonDraftCursor}
+            polygonConfig={polygonConfig}
+            selectedPolygonIds={polygonOverlaySelectedIds}
+            polygonTransform={polygonTransform}
+            onPolygonClick={handlePolygonClickRouted}
+            onPolygonTransformChange={handlePolygonTransformChange}
+            polygonStyleOverrides={
+              styleOverridesByKind.polygon.size > 0 ? styleOverridesByKind.polygon : null
+            }
+            linesForOverlay={linesForOverlay}
+            lineDraftVertices={lineDraftVertices}
+            lineDraftCursor={lineDraftCursor}
+            lineConfig={lineConfig}
+            lineDraftSnap={lineDraftSnap}
+            selectedLineIds={selectedLineIds}
+            lineTransform={lineTransform}
+            onLineClick={handleLineClick}
+            onLineTransformChange={handleLineTransformChange}
+            lineStyleOverrides={
+              styleOverridesByKind.line.size > 0 ? styleOverridesByKind.line : null
+            }
+            attachedDoorsByLineId={
+              attachedDoorsByLineId.size > 0 ? attachedDoorsByLineId : null
+            }
+            savedRoutes={savedRoutes}
+            routeDraftVertices={routeDraftVertices}
+            routeDraftCursor={routeDraftCursor}
+            routeConfig={routeConfig}
+            routeDraftSnap={routeDraftSnap}
+            selectedRouteIds={selectedRouteIds}
+            onRouteClick={(id) => {
+              setSelectedRouteIds(new Set([id]))
+              setActiveTool('select')
+            }}
+            stairsForOverlay={stairsForOverlay}
+            selectedStairIds={selectedStairIds}
+            stairDraftAnchors={stairDraftAnchors}
+            stairDraftCursor={stairDraftCursor}
+            stairConfig={stairConfig}
+            onStairClick={(id, e) =>
+              handleSelectStair(id, e.shiftKey || e.metaKey || e.ctrlKey)
+            }
+            stairTransform={stairTransform}
+            onStairTransformChange={handleStairTransformChange}
+            modelsForOverlay={modelsForOverlay}
+            modelUrlMap={modelUrlMap}
+            modelBoundingCenters={modelBoundingCenters}
+            modelBounds={modelBounds}
+            modelShapeExtras={modelShapeExtrasMerged}
+            modelCursor={modelCursor}
+            modelAssetId={modelConfig.modelAssetId}
+            selectedModelIds={selectedModelIds}
+            modelTransform={modelTransform}
+            onModelClick={(id, e) =>
+              handleSelectModel(id, e.shiftKey || e.metaKey || e.ctrlKey)
+            }
+            onModelTransformChange={handleModelTransformChange}
+          />
+        </FocusBlockersContext.Provider>
+      </FocusSceneContext.Provider>
 
       {/*
        * Image-plane overlay + placement tool. Renders user images as
@@ -4895,6 +5511,61 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
         onDetectionClick={setAiSelectedDetectionId}
       />
 
+      {/* Drafting layer — live dimensions on wall / polygon / Measure
+          drafts, kept guides, calibration marks and the cursor readout.
+          Always mounted so guides stay visible under every tool. */}
+      <MapMeasureOverlay map={overlayMap} items={measureScene.items} hud={measureScene.hud} />
+      {draftingBarVisible && (
+        <DraftingBar
+          settings={measureSettings}
+          onSettingsChange={(patch) => setMeasureSettings((prev) => ({ ...prev, ...patch }))}
+          guideCount={floorGuides.length}
+          guidesVisible={layerVisibility.guides}
+          onGuidesVisibleChange={(v) => handleLayerVisibilityChange('guides', v)}
+          onClearGuides={handleClearGuides}
+          planVisible={layerVisibility.image}
+          onPlanVisibleChange={(v) => handleLayerVisibilityChange('image', v)}
+        />
+      )}
+      {activeTool === 'calibrate-image' && calibration && calibrationImage && calibrationFrame && (
+        <CalibratePanel
+          imageName={calibrationImage.name}
+          frame={calibrationFrame}
+          unit={measureSettings.unit}
+          mode={calibration.mode}
+          onModeChange={(mode) => setCalibration((s) => (s ? { ...s, mode, firstPick: null, pending: null } : s))}
+          hasFirstPick={calibration.firstPick !== null}
+          pending={calibration.pending}
+          onAddSample={(real) => {
+            const p = calibration.pending
+            if (!p) return
+            const sample: CalibrationSample = {
+              id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+              kind: p.kind,
+              a: p.a,
+              b: p.b,
+              real,
+              enabled: true,
+            }
+            setCalibrationSamples((prev) => [...prev, sample])
+            setCalibration((s) => (s ? { ...s, pending: null } : s))
+          }}
+          onCancelPending={() => setCalibration((s) => (s ? { ...s, firstPick: null, pending: null } : s))}
+          samples={calibrationSamples}
+          onToggleSample={(id) =>
+            setCalibrationSamples((prev) => prev.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)))
+          }
+          onDeleteSample={(id) => setCalibrationSamples((prev) => prev.filter((s) => s.id !== id))}
+          onApplyScale={(factor) => {
+            const next = scaleImageBbox(calibrationImage, factor)
+            if (next) patchCalibrationImage(next)
+          }}
+          onRotate={(rotation) => patchCalibrationImage({ rotation })}
+          onCenterChange={(center) => patchCalibrationImage(recenterImageBbox(calibrationImage, center))}
+          onDone={handleExitCalibration}
+        />
+      )}
+
       {/* Route-preview overlay — visible only while the routing tool
           is active (`activeTool === 'route-preview'`). Handles its own
           layer/marker teardown; nothing to gate here beyond keeping it
@@ -4906,14 +5577,18 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
             map={overlayMap}
             start={routePreview.start}
             end={routePreview.end}
-            path={routePreview.path}
+            option={routePreview.options[routePreview.selected] ?? null}
             status={routePreview.status}
+            floors={routePreview.floors}
             elevatedPolygons={routePreview.elevatedPolygons}
+            portalLabel={routePortalLabel}
           />
           <RouteDirectionsPanel
             status={routePreview.status}
-            waypoints={routePreview.path}
-            distanceMeters={routePreview.distanceMeters}
+            options={routePreview.options}
+            selected={routePreview.selected}
+            onSelect={routePreview.setSelected}
+            floors={routePreview.floors}
             onClear={routePreview.reset}
             side="right"
           />
@@ -5028,79 +5703,83 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
         </div>
       )}
 
-      <SecondaryLayers
-        overlayMap={overlayMap}
-        activeTool={activeTool}
-        shapeSelectionEnabled={shapeSelectionEnabled}
-        layerVisibility={layerVisibility}
-        onMapClickEmpty={handleMapClickEmpty}
-        preview={preview}
-        activeWarehouseId={activeWarehouseId}
-        defaultFloorPlanId={defaultFloorPlanId}
-        defaultFloorPlanElevation={defaultFloorPlanElevation}
-        configUnit={config.unit}
-        imagePlanesForOverlay={imagePlanesForOverlay}
-        selectedImagePlaneIds={selectedImagePlaneIds}
-        imagePlaneTransform={imagePlaneTransform}
-        onImagePlaneTransformChange={handleImagePlaneTransformChange}
-        setSelectedImagePlaneIds={setSelectedImagePlaneIds}
-        setActiveTool={setActiveTool}
-        scopedDoors={scopedDoors}
-        selectedDoorIds={selectedDoorIds}
-        doorTransform={doorTransform}
-        doorConfig={doorConfig}
-        doorDraftAnchors={doorDraftAnchors}
-        doorDraftCursor={doorDraftCursor}
-        doorCursorPreview={doorCursorPreview}
-        onDoorTransformChange={handleDoorTransformChange}
-        setSelectedDoorIds={setSelectedDoorIds}
-        savedMarkers={savedMarkers}
-        markerConfig={markerConfig}
-        markerCursor={markerCursor}
-        selectedMarkerIds={selectedMarkerIds}
-        markerTransform={markerTransform}
-        onMarkerClick={handleMarkerClick}
-        onMarkerTransformChange={handleMarkerTransformChange}
-        markerStyleOverrides={
-          styleOverridesByKind.marker.size > 0
-            ? styleOverridesByKind.marker
-            : null
-        }
-        binCommittedLines={committedLines}
-        savedBins={savedBins}
-        gridsVisible={gridsVisible}
-        textLabelsForOverlay={textLabelsForOverlay}
-        textLabelCursor={textLabelCursor}
-        textLabelConfig={textLabelConfig}
-        selectedTextLabelIds={selectedTextLabelIds}
-        textLabelTransform={textLabelTransform}
-        textLabelTransformDraft={textLabelTransformDraft}
-        setTextLabelTransform={setTextLabelTransform}
-        setTextLabelTransformDraft={setTextLabelTransformDraft}
-        setSelectedTextLabelIds={setSelectedTextLabelIds}
-        textLabelStyleOverrides={
-          styleOverridesByKind.textLabel.size > 0
-            ? styleOverridesByKind.textLabel
-            : null
-        }
-        savedDataLinks={savedDataLinks}
-        savedPolygons={savedPolygons}
-        savedCircles={savedCircles}
-        savedLines={savedLines}
-        savedModels={savedModels}
-        savedStairs={savedStairs}
-        savedGrids={savedGrids}
-        savedStyleRules={savedStyleRules}
-        savedImages={savedImages}
-        setSelectedGridIds={setSelectedGridIds}
-        setSelectedMarkerIds={setSelectedMarkerIds}
-        setSelectedCircleIds={setSelectedCircleIds}
-        setSelectedPolygonIds={setSelectedPolygonIds}
-        setSelectedLineIds={setSelectedLineIds}
-        setSelectedImageIds={setSelectedImageIds}
-        setSelectedModelIds={setSelectedModelIds}
-        setSelectedStairIds={setSelectedStairIds}
-      />
+      <FocusSceneContext.Provider value={focusScene}>
+        <FocusBlockersContext.Provider value={focusBlockers}>
+          <SecondaryLayers
+            overlayMap={overlayMap}
+            activeTool={activeTool}
+            shapeSelectionEnabled={shapeSelectionEnabled}
+            layerVisibility={layerVisibility}
+            onMapClickEmpty={handleMapClickEmpty}
+            preview={preview}
+            activeWarehouseId={activeWarehouseId}
+            defaultFloorPlanId={defaultFloorPlanId}
+            defaultFloorPlanElevation={defaultFloorPlanElevation}
+            configUnit={config.unit}
+            imagePlanesForOverlay={imagePlanesForOverlay}
+            selectedImagePlaneIds={selectedImagePlaneIds}
+            imagePlaneTransform={imagePlaneTransform}
+            onImagePlaneTransformChange={handleImagePlaneTransformChange}
+            setSelectedImagePlaneIds={setSelectedImagePlaneIds}
+            setActiveTool={setActiveTool}
+            scopedDoors={scopedDoors}
+            selectedDoorIds={selectedDoorIds}
+            doorTransform={doorTransform}
+            doorConfig={doorConfig}
+            doorDraftAnchors={doorDraftAnchors}
+            doorDraftCursor={doorDraftCursor}
+            doorCursorPreview={doorCursorPreview}
+            onDoorTransformChange={handleDoorTransformChange}
+            setSelectedDoorIds={setSelectedDoorIds}
+            savedMarkers={savedMarkers}
+            markerConfig={markerConfig}
+            markerCursor={markerCursor}
+            selectedMarkerIds={selectedMarkerIds}
+            markerTransform={markerTransform}
+            onMarkerClick={handleMarkerClick}
+            onMarkerTransformChange={handleMarkerTransformChange}
+            markerStyleOverrides={
+              styleOverridesByKind.marker.size > 0
+                ? styleOverridesByKind.marker
+                : null
+            }
+            binCommittedLines={committedLines}
+            savedBins={savedBins}
+            gridsVisible={gridsVisible}
+            textLabelsForOverlay={textLabelsForOverlay}
+            textLabelCursor={textLabelCursor}
+            textLabelConfig={textLabelConfig}
+            selectedTextLabelIds={selectedTextLabelIds}
+            textLabelTransform={textLabelTransform}
+            textLabelTransformDraft={textLabelTransformDraft}
+            setTextLabelTransform={setTextLabelTransform}
+            setTextLabelTransformDraft={setTextLabelTransformDraft}
+            setSelectedTextLabelIds={setSelectedTextLabelIds}
+            textLabelStyleOverrides={
+              styleOverridesByKind.textLabel.size > 0
+                ? styleOverridesByKind.textLabel
+                : null
+            }
+            savedDataLinks={savedDataLinks}
+            savedPolygons={savedPolygons}
+            savedCircles={savedCircles}
+            savedLines={savedLines}
+            savedModels={savedModels}
+            occluders={occluderBag}
+            savedStyleRules={savedStyleRules}
+            savedImages={savedImages}
+            setSelectedGridIds={setSelectedGridIds}
+            setSelectedMarkerIds={setSelectedMarkerIds}
+            setSelectedCircleIds={setSelectedCircleIds}
+            setSelectedPolygonIds={setSelectedPolygonIds}
+            setSelectedLineIds={setSelectedLineIds}
+            setSelectedImageIds={setSelectedImageIds}
+            setSelectedModelIds={setSelectedModelIds}
+            setSelectedStairIds={setSelectedStairIds}
+          />
+          <MapFocusOverlay map={overlayMap} focus={focusResolved} variant="brief" prisms={focusPrisms} />
+        </FocusBlockersContext.Provider>
+      </FocusSceneContext.Provider>
 
       {/* Global full-screen loader for data-link fetches — also mounted
           in view.tsx. Sub-renderers report their query.isLoading state
@@ -5203,6 +5882,7 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
         open={exportDialogOpen}
         onOpenChange={setExportDialogOpen}
         activeZoneId={activeWarehouseId}
+        modelUrls={modelUrlMap}
         source={{
           grids: savedGrids,
           polygons: savedPolygons,
@@ -5329,6 +6009,11 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
             setDataLinkEditorOpen(true)
           }}
         />
+        <FloorReferencePill
+          aligning={floorPlanAligning}
+          hiddenFloorCount={shapesHiddenFloorIds.size}
+          onShowAll={() => setShapesHiddenFloorIds(new Set())}
+        />
         <SaveStatus />
       </div>
 
@@ -5340,7 +6025,9 @@ export default function CreateGrids({ panelOpen, onPanelOpenChange, preview = fa
         onRedo={redoStable}
         hint={
           <KeyboardHint
-            activeTool={activeTool}
+            // Re-draw enters the grid draw mode without switching tools.
+            activeTool={drawMode ? 'create-grid' : activeTool}
+            gridPathLayout={config.type === 'square' && config.layout === 'path'}
             panelMode={panelMode}
             transformActive={
               transform !== null ||

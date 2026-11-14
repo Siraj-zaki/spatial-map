@@ -7,8 +7,9 @@
  * `persist` middleware carries it across reloads via localStorage.
  *
  * Deliberately doesn't re-implement the toggles' behaviour — every
- * downstream effect (shadow pass, AO, marker/text-label occlusion)
- * already reads the same store. This component is UI-only.
+ * downstream effect (shadow pass, AO, marker/text-label occlusion,
+ * focus mode's occlusion ghosts) already reads the same store. This
+ * component is UI-only.
  */
 
 import { useState } from 'react'
@@ -30,11 +31,13 @@ export function ViewerGraphicsPanel() {
   const shadows = useGraphicsSettings((s) => s.shadows)
   const ambientOcclusion = useGraphicsSettings((s) => s.ambientOcclusion)
   const markerOcclusion = useGraphicsSettings((s) => s.markerOcclusion)
+  const occlusionGhosts = useGraphicsSettings((s) => s.occlusionGhosts)
   const setShadows = useGraphicsSettings((s) => s.setShadows)
   const setAmbientOcclusion = useGraphicsSettings((s) => s.setAmbientOcclusion)
   const setMarkerOcclusion = useGraphicsSettings((s) => s.setMarkerOcclusion)
+  const setOcclusionGhosts = useGraphicsSettings((s) => s.setOcclusionGhosts)
 
-  const enabledCount = [shadows, ambientOcclusion, markerOcclusion].filter(Boolean).length
+  const enabledCount = [shadows, ambientOcclusion, markerOcclusion, occlusionGhosts].filter(Boolean).length
 
   return (
     <>
@@ -100,6 +103,17 @@ export function ViewerGraphicsPanel() {
               })}
               checked={markerOcclusion}
               onChange={setMarkerOcclusion}
+            />
+            <ToggleRow
+              label={t('view.graphicsOcclusionGhosts', {
+                defaultValue: 'Show hidden items as faint ghosts',
+              })}
+              hint={t('view.graphicsOcclusionGhostsHint', {
+                defaultValue:
+                  'Markers, labels and live data hidden behind floors or walls stay faintly visible. Click one to show it.',
+              })}
+              checked={occlusionGhosts}
+              onChange={setOcclusionGhosts}
             />
           </div>
 

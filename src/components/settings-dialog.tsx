@@ -10,6 +10,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { apiDb } from '@/lib/api-db'
+import { siteUrl } from '@/lib/site'
 import {
   type RoleVocabulary,
   type RoleVocabularyEntry,
@@ -243,7 +244,7 @@ function WarehouseSettings({
 
   const copyShareLink = async () => {
     if (!shareToken) return
-    const url = `${window.location.origin}/share/${shareToken}`
+    const url = siteUrl(`/share/${shareToken}`)
     try {
       await navigator.clipboard.writeText(url)
       setCopied(true)

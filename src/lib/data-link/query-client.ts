@@ -16,6 +16,7 @@
  */
 
 import { apiGet, apiPost } from '@/lib/api-client'
+import { sourceShareActive, sourceSharePost } from '@/lib/reports/report-share'
 import type {
   DataLinkFieldType,
   DataLinkFilter,
@@ -92,13 +93,17 @@ export async function queryDataSource(
   sourceId: number,
   req: DataSourceQueryRequest,
 ): Promise<DataSourceQueryResponse> {
-  const body = await apiPost<{
+  type Body = {
     rows: Array<
       Omit<DataSourceRow, 'ts' | 'updatedAt'> & { ts: string; updatedAt: string }
     >
     totalCount?: number
     truncated: boolean
-  }>(`/data-sources/${sourceId}/query`, req)
+  }
+  const body =
+    sourceShareActive()
+      ? await sourceSharePost<Body>(`/sources/${sourceId}/query`, req)
+      : await apiPost<Body>(`/data-sources/${sourceId}/query`, req)
   return {
     rows: body.rows.map((r) => ({
       id: r.id,

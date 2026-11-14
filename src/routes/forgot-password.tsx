@@ -16,7 +16,7 @@ import { ArrowLeft, KeyRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { AuthAlert } from '@/components/auth/auth-alert'
-import { PRODUCT_NAME } from '@/components/auth/auth-brand-mark'
+import { productName } from '@/lib/site'
 import { AuthInput, AuthSubmitButton, FieldError, PasswordInput } from '@/components/auth/auth-fields'
 import { AuthHeader, AuthLayout, rise } from '@/components/auth/auth-layout'
 import { AuthOtpStep, OTP_LENGTH } from '@/components/auth/auth-otp-step'
@@ -78,7 +78,7 @@ export default function ForgotPasswordPage() {
   const visibleAlert = rateLimited && lockedFor === 0 ? null : alert
   const hasError =
     !!(emailError || codeError || Object.keys(pwErrors).length > 0) || visibleAlert?.tone === 'error'
-  useDocumentTitle(`${t('auth.resetTitle')} · ${PRODUCT_NAME}`, hasError ? t('auth.errorTitlePrefix') : null)
+  useDocumentTitle(`${t('auth.resetTitle')} · ${productName()}`, hasError ? t('auth.errorTitlePrefix') : null)
 
   const goTo = (next: Step) => {
     clear()

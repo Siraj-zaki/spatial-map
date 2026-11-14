@@ -19,6 +19,7 @@
 
 import * as XLSX from 'xlsx'
 import type { ExportBlock, ExportCell, ExportColumn, ExportDocument, ExportTable } from './model'
+import { productName } from '@/lib/site'
 
 export interface XlsxOptions {
   values: 'formatted' | 'raw'
@@ -437,7 +438,7 @@ export function documentToXlsx(doc: ExportDocument, opts: XlsxOptions): Uint8Arr
       '</Relationships>',
     'docProps/core.xml':
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
-      `<dc:title>${xmlEscape(doc.report.name)}</dc:title><dc:creator>Spatial Map</dc:creator>` +
+      `<dc:title>${xmlEscape(doc.report.name)}</dc:title><dc:creator>${xmlEscape(productName())}</dc:creator>` +
       `<dcterms:created xsi:type="dcterms:W3CDTF">${doc.report.generatedAt.toISOString().replace(/\.\d+Z$/, 'Z')}</dcterms:created>` +
       '</cp:coreProperties>',
     'xl/workbook.xml':

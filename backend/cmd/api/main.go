@@ -247,6 +247,10 @@ func main() {
 		w.Write(obj.Data)
 	})
 
+	// One report executor, shared by the signed-in report routes and the
+	// public report-share routes.
+	reportExecutor := reports.NewExecutor(pool)
+
 	// Public, unauthenticated presentation view. Mounted before the authed
 	// /api/v1 group so APIKeyMiddleware never applies — anyone with the
 	// warehouse ID can open the shareable view. The by-token route is the
@@ -262,7 +266,13 @@ func main() {
 		// one round-trip. Mounted INSIDE the /public group so the SPA's
 		// `publicFetch` helper (which prefixes `/api/v1/public`) reaches
 		// it without a special path branch.
-		r.Get("/share/{token}", handlers.PublicShareHandler(queries))
+		// The link's facility data (its layers' rows, queries and history)
+		// lives under it too — handlers/share_sources.go.
+		r.Mount("/share/{token}", handlers.PublicFacilityShareRouter(queries, pool))
+		// Public links to one report: its widgets, its map layers and
+		// their history, scoped to the sources the report reads. Same
+		// gates as /share/{token} (revoke, expiry, view cap → 404).
+		r.Mount("/report-share", handlers.PublicReportShareRouter(queries, pool, reportExecutor))
 		// Public per-table CRUD: users POST/GET/PATCH/DELETE rows into
 		// their thing-type tables from their own code using a scoped
 		// `table_api_tokens` bearer token (no X-Tenant-Id, no API key
@@ -327,6 +337,9 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(api.RequireUserOrAPIKey)
 			r.Use(api.TenantMiddleware(queries))
+			// Changes need the member's role to allow them (permissions.go):
+			// viewers stay read-only on the API, not just in the UI.
+			r.Use(api.WritePermissionMiddleware)
 			// Real-time invalidation stream. The SPA reads it with fetch
 			// (not EventSource) so it can send the JWT and X-Tenant-Id;
 			// TenantMiddleware checks membership and the broadcaster only
@@ -382,7 +395,7 @@ func main() {
 			// Dynamic Report Builder — the executor compiles the JSON
 			// spec to safe parameterized SQL over `data_source_rows` and
 			// records each run in `report_runs` for the history drawer.
-			r.Mount("/reports", handlers.ReportsRouter(queries, pool, reports.NewExecutor(pool)))
+			r.Mount("/reports", handlers.ReportsRouter(queries, pool, reportExecutor))
 			// One-shot "seed a starter demo" endpoint. Creates a demo
 			// warehouse-events table with ~120 rows and 3 v2 reports so
 			// a new tenant can click through the whole builder + viewer

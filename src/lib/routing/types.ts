@@ -103,6 +103,14 @@ export interface RouteRequest {
    * still fit inside the grid. Default 2 m.
    */
   paddingMeters?: number
+  /**
+   * The building's main wall direction in maths degrees (0 = east,
+   * counter-clockwise). The routing grid is laid out along it so routes
+   * run parallel to the walls. Omitted → found from the walls / doors /
+   * racks in the scene; floors whose walls agree on no direction stay
+   * north-up.
+   */
+  axisDeg?: number
 }
 
 /**

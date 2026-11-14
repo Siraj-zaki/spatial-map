@@ -29,6 +29,9 @@ export type HistoryEntry =
       oldCurrent: [number, number]
       newStart: [number, number]
       newCurrent: [number, number]
+      /** Path-layout grids: the config carries the path, so a redraw swaps it too. */
+      oldConfig?: Grid['config']
+      newConfig?: Grid['config']
     }
   | { type: 'recreate'; grids: Grid[] } // inverse of delete — for redo of a delete
   | { type: 'delete-marker'; markers: MarkerShape[] }

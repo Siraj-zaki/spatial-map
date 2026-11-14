@@ -42,6 +42,7 @@ import {
   PencilLine,
   RefreshCw,
   RotateCcw,
+  SlidersHorizontal,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -69,6 +70,9 @@ import { ParamsBar } from '@/components/reports/params/params-bar'
 import { ReportCanvas } from '@/components/reports/layout/report-canvas'
 import { DocumentFlow } from '@/components/reports/layout/document-flow'
 import { ReportMapView, ViewSwitch } from '@/components/reports/layout/report-map-view'
+import { ReportShareDialog } from '@/components/reports/report-share-dialog'
+import { useWorkspaceRole } from '@/hooks/useWorkspaceRole'
+import { isMasterReport } from '@/lib/reports/master-report'
 import { CLASS_META, ReportIcon, StarButton, useStarred } from '@/components/reports/report-identity'
 import { ApiError } from '@/lib/api-client'
 import { apiDb } from '@/lib/api-db'
@@ -198,6 +202,31 @@ export function ReportViewer() {
   )
 }
 
+/**
+ * A report opened from a public link (routes/shared-report.tsx): the same
+ * page and full map, read-only — no back link, star, edit, share or run
+ * history. Data reads go through the link (lib/reports/report-share.ts).
+ */
+export function SharedReportViewer({ report, facility, view }: { report: Report; facility: string | null; view?: 'map' | 'page' }) {
+  const [opened] = useState(() => {
+    const v2 = migrateToV2(report.spec)
+    return { spec: v2, store: createReportRuntimeStore(report.id, v2) }
+  })
+  useEffect(() => {
+    void opened.store.getState().runAll()
+  }, [opened])
+  return (
+    <ReportViewerBody
+      report={report}
+      spec={opened.spec}
+      store={opened.store}
+      back={null}
+      onEdit={() => {}}
+      shared={{ facility, view }}
+    />
+  )
+}
+
 /** Body — mounts only when `store` is guaranteed non-null. Every
  *  `useStore` call inside here (either directly or via subcomponents)
  *  sees a stable store instance for the fiber's whole lifetime. */
@@ -207,12 +236,15 @@ function ReportViewerBody({
   store,
   back,
   onEdit,
+  shared,
 }: {
   report: Report
   spec: ReportSpecV2
   store: ReportRuntimeStore
   back: React.ReactNode
   onEdit: () => void
+  /** Set on a public link's page: read-only chrome, facility name from the link. */
+  shared?: { facility: string | null; view?: 'map' | 'page' }
 }) {
   const { t, i18n } = useTranslation()
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -233,9 +265,9 @@ function ReportViewerBody({
   const anyRunning = queriesRunning || manualRefresh
   const updatedAt = useLastUpdated(store)
 
-  const [facility, setFacility] = useState<string | null>(null)
+  const [facility, setFacility] = useState<string | null>(shared?.facility ?? null)
   useEffect(() => {
-    if (report.zoneId == null) return
+    if (shared || report.zoneId == null) return
     let cancelled = false
     apiDb.zones
       .toArray()
@@ -248,7 +280,7 @@ function ReportViewerBody({
     return () => {
       cancelled = true
     }
-  }, [report.zoneId])
+  }, [shared, report.zoneId])
 
   const refresh = () => {
     setManualRefresh(true)
@@ -323,6 +355,16 @@ function ReportViewerBody({
   )
   const hasExportable = (spec.widgets ?? []).some((w) => exportableKinds(w.kind).length > 0)
 
+  // Editors manage public links in the Share dialog; everyone else copies
+  // this page's link.
+  const [shareOpen, setShareOpen] = useState(false)
+  // A master report is set up from the Reports page's dialog.
+  const navigate = useNavigate()
+  const canManage = useWorkspaceRole().can('reports.create')
+  const masterSetup =
+    !shared && canManage && report.zoneId != null && isMasterReport(report)
+      ? () => navigate(`/reports?facility=${report.zoneId}&master=1`)
+      : undefined
   const share = async () => {
     try {
       await navigator.clipboard.writeText(window.location.href)
@@ -344,6 +386,7 @@ function ReportViewerBody({
   const viewKey = `sgv-report-view:${report.id}`
   const [view, setView] = useState<'page' | 'map'>(() => {
     if (!explorer) return 'page'
+    if (shared?.view) return shared.view
     let saved: string | null = null
     try {
       saved = localStorage.getItem(viewKey)
@@ -379,6 +422,9 @@ function ReportViewerBody({
   const overlays = (
     <>
       {historyOpen && <RunHistoryPanel open={historyOpen} onOpenChange={setHistoryOpen} reportId={report.id} />}
+      {shareOpen && (
+        <ReportShareDialog open onOpenChange={setShareOpen} report={report} hasMap={Boolean(explorer)} currentView={view} />
+      )}
       {exportDialog && (
         <ReportExportDialog
           open
@@ -427,11 +473,14 @@ function ReportViewerBody({
                 onToggleStar: () => toggleStar(report.id),
                 onRefresh: refresh,
                 onQuietRefresh: () => void store.getState().runAll(),
-                onShare: () => void share(),
+                onShare: shared ? undefined : () => void share(),
+                onShareDialog: !shared && report.canEdit ? () => setShareOpen(true) : undefined,
                 onExport: hasExportable ? () => setExportDialog({}) : undefined,
-                onEdit: report.canEdit ? onEdit : undefined,
-                onHistory: () => setHistoryOpen(true),
+                onEdit: !shared && report.canEdit ? onEdit : undefined,
+                onMasterSetup: masterSetup,
+                onHistory: shared ? undefined : () => setHistoryOpen(true),
                 onPageView: () => switchView('page'),
+                shared: Boolean(shared),
               }}
             />
           </ReportQueryContext.Provider>
@@ -443,7 +492,7 @@ function ReportViewerBody({
 
   return (
     <PageContainer className="gap-6">
-      <div {...rise(0)}>{back}</div>
+      {back && <div {...rise(0)}>{back}</div>}
 
       <header {...rise(1, 'flex items-start justify-between gap-4')}>
         <div className="flex min-w-0 items-start gap-4">
@@ -453,7 +502,9 @@ function ReportViewerBody({
           <div className="min-w-0 space-y-1.5">
             <div className="flex items-start gap-1.5 sm:items-center">
               <h1 className="line-clamp-2 break-words text-2xl font-semibold tracking-tight sm:truncate sm:text-[28px] sm:leading-9">{report.name}</h1>
-              <StarButton plain starred={starred.has(report.id)} onToggle={() => toggleStar(report.id)} name={report.name} className="shrink-0" />
+              {!shared && (
+                <StarButton plain starred={starred.has(report.id)} onToggle={() => toggleStar(report.id)} name={report.name} className="shrink-0" />
+              )}
             </div>
             {report.description && (
               <p className="line-clamp-2 max-w-3xl text-sm text-muted-foreground">{report.description}</p>
@@ -466,6 +517,9 @@ function ReportViewerBody({
                   : (facility ?? t('reports.viewer.facility', { defaultValue: 'Facility' }))}
               </span>
               <span>{t(meta.labelKey, { defaultValue: meta.fallback })}</span>
+              {shared && (
+                <span className="rounded-full border px-2 py-0.5 text-xs">{t('reports.shared.badge', { defaultValue: 'Shared · read-only' })}</span>
+              )}
               <span className="inline-flex items-center gap-1.5" aria-live="polite">
                 <span
                   className={cn('h-1.5 w-1.5 rounded-full', anyRunning ? 'animate-pulse bg-info motion-reduce:animate-none' : 'bg-success')}
@@ -499,15 +553,21 @@ function ReportViewerBody({
           >
             <RefreshCw className={cn('h-4 w-4', anyRunning && 'animate-spin motion-reduce:animate-none')} />
           </Button>
-          <Button variant="outline" className="hidden sm:inline-flex" onClick={() => void share()}>
-            <Link2 className="h-4 w-4" />
-            {t('reports.viewer.share', { defaultValue: 'Share' })}
-          </Button>
+          {!shared && (
+            <Button
+              variant="outline"
+              className="hidden sm:inline-flex"
+              onClick={report.canEdit ? () => setShareOpen(true) : () => void share()}
+            >
+              <Link2 className="h-4 w-4" />
+              {t('reports.viewer.share', { defaultValue: 'Share' })}
+            </Button>
+          )}
           <Button variant="outline" className="hidden sm:inline-flex" disabled={!hasExportable} onClick={() => setExportDialog({})}>
             <Download className="h-4 w-4" />
             {t('reports.viewer.export', { defaultValue: 'Export' })}
           </Button>
-          {report.canEdit && (
+          {!shared && report.canEdit && (
             <Button onClick={onEdit}>
               <PencilLine className="h-4 w-4" />
               {t('reports.editReport', { defaultValue: 'Edit' })}
@@ -515,7 +575,13 @@ function ReportViewerBody({
           )}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="icon" aria-label={t('reports.viewerMoreActions', { defaultValue: 'More actions' })}>
+              <Button
+                variant="outline"
+                size="icon"
+                // On a public link's page every wide-screen item is gone.
+                className={cn(shared && 'sm:hidden')}
+                aria-label={t('reports.viewerMoreActions', { defaultValue: 'More actions' })}
+              >
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
@@ -530,21 +596,33 @@ function ReportViewerBody({
                 <RefreshCw className="me-2 h-4 w-4" />
                 {t('reports.viewerRefresh', { defaultValue: 'Refresh' })}
               </DropdownMenuItem>
-              <DropdownMenuItem className="sm:hidden" onSelect={() => void share()}>
-                <Link2 className="me-2 h-4 w-4" />
-                {t('reports.viewer.share', { defaultValue: 'Share' })}
-              </DropdownMenuItem>
+              {!shared && (
+                <DropdownMenuItem className="sm:hidden" onSelect={report.canEdit ? () => setShareOpen(true) : () => void share()}>
+                  <Link2 className="me-2 h-4 w-4" />
+                  {t('reports.viewer.share', { defaultValue: 'Share' })}
+                </DropdownMenuItem>
+              )}
               {hasExportable && (
                 <DropdownMenuItem className="sm:hidden" onSelect={() => setExportDialog({})}>
                   <Download className="me-2 h-4 w-4" />
                   {t('reports.export.menuItem', { defaultValue: 'Export…' })}
                 </DropdownMenuItem>
               )}
-              <DropdownMenuSeparator className="sm:hidden" />
-              <DropdownMenuItem onSelect={() => setHistoryOpen(true)}>
-                <History className="me-2 h-4 w-4" />
-                {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
-              </DropdownMenuItem>
+              {masterSetup && (
+                <DropdownMenuItem onSelect={masterSetup}>
+                  <SlidersHorizontal className="me-2 h-4 w-4" />
+                  {t('reports.master.setupItem', { defaultValue: 'Set up master report…' })}
+                </DropdownMenuItem>
+              )}
+              {!shared && (
+                <>
+                  <DropdownMenuSeparator className="sm:hidden" />
+                  <DropdownMenuItem onSelect={() => setHistoryOpen(true)}>
+                    <History className="me-2 h-4 w-4" />
+                    {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

@@ -1,7 +1,12 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Siraj-zaki/spatial-map/backend/internal/api"
@@ -43,6 +48,10 @@ type WarehouseView struct {
 	// even when the configs were toggled ON in the share dialog.
 	DataLinkConfigs []any `json:"dataLinkConfigs"`
 	StyleRules      []any `json:"styleRules"`
+	// ModelBounds: each 3D model asset's local bounding box (`user_<id>` →
+	// {min, max, center}, glTF metres before the model's scale), so the
+	// mobile app can route around model footprints without loading GLBs.
+	ModelBounds map[string]json.RawMessage `json:"modelBounds"`
 }
 
 // buildWarehouseView assembles the full public envelope from a resolved
@@ -132,7 +141,8 @@ func buildWarehouseViewPayload(q *db.Queries, r *http.Request, zone db.CreateZon
 			// path (buildWarehouseView) already logs via api.InternalError
 			// before responding. The payload-only path returns a 404 through
 			// the second return value so the /share/{token} endpoint stays
-			// leak-free.
+			// leak-free — so log it here, or it vanishes.
+			slog.Default().Warn("warehouse view: query failed", "zone", zone.ID, "error", e)
 			return WarehouseView{}, false
 		}
 	}
@@ -179,6 +189,7 @@ func buildWarehouseViewPayload(q *db.Queries, r *http.Request, zone db.CreateZon
 	for _, row := range models {
 		view.Models = append(view.Models, toModelResponse(row))
 	}
+	view.ModelBounds = modelBounds(ctx, q, zone.TenantID, models)
 	for _, row := range imagePlanes {
 		view.ImagePlanes = append(view.ImagePlanes, toImagePlaneResponse(row))
 	}
@@ -258,6 +269,47 @@ func GetPublicWarehouseByToken(q *db.Queries) http.HandlerFunc {
 			return
 		}
 
-		buildWarehouseView(q, w, r, db.CreateZoneRow(zoneRow), zoneRow.IsPublic)
+		view, ok := buildWarehouseViewPayload(q, r, db.CreateZoneRow(zoneRow), zoneRow.IsPublic)
+		if !ok {
+			api.NotFound(w, "warehouse not found")
+			return
+		}
+		api.JSON(w, http.StatusOK, view)
 	}
+}
+
+// modelBounds reads the bounding boxes of the user model assets the
+// facility's models use. Best effort: no bounds is an empty map.
+func modelBounds(ctx context.Context, q *db.Queries, tenantID int64, models []db.Model) map[string]json.RawMessage {
+	out := map[string]json.RawMessage{}
+	var ids []int64
+	seen := map[int64]bool{}
+	for _, m := range models {
+		var cfg struct {
+			ModelAssetID string `json:"modelAssetId"`
+		}
+		if json.Unmarshal(m.Config, &cfg) != nil || !strings.HasPrefix(cfg.ModelAssetID, "user_") {
+			continue
+		}
+		id, err := strconv.ParseInt(strings.TrimPrefix(cfg.ModelAssetID, "user_"), 10, 64)
+		if err != nil || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return out
+	}
+	rows, err := q.ListUserModelBounds(ctx, db.ListUserModelBoundsParams{TenantID: tenantID, Ids: ids})
+	if err != nil {
+		slog.Default().Warn("warehouse view: model bounds", "error", err)
+		return out
+	}
+	for _, r := range rows {
+		if len(r.Bounds) > 0 && string(r.Bounds) != "null" {
+			out["user_"+strconv.FormatInt(r.ID, 10)] = json.RawMessage(r.Bounds)
+		}
+	}
+	return out
 }

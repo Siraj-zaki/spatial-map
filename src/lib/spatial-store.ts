@@ -171,8 +171,19 @@ interface SpatialState {
   setTenantId: (id: number) => void
   setActiveZoneId: (id: number | null) => void
   loadAll: () => Promise<void>
-  loadKind: (kind: EntityKind, opts?: { zoneId?: number }) => Promise<void>
+  /**
+   * `fresh`: if the same list is already loading, load it again once that
+   * request lands instead of sharing it — the running request may predate
+   * the change that asked for this load (SSE bulk invalidations).
+   */
+  loadKind: (kind: EntityKind, opts?: { zoneId?: number; fresh?: boolean }) => Promise<void>
   loadEntity: (kind: EntityKind, id: number) => Promise<void>
+  /**
+   * Refetch several rows of one kind (an SSE burst). Rows land in the store
+   * as they arrive, batched to one store update per animation frame;
+   * resolves once all of them have landed.
+   */
+  loadEntities: (kind: EntityKind, ids: ReadonlyArray<number>) => Promise<void>
   updateLocal: <T extends CatalogEntity>(kind: EntityKind, id: number, patch: Partial<T>) => void
   /** One store update for many entities of a kind (bulk edits). */
   updateManyLocal: <T extends CatalogEntity>(kind: EntityKind, patches: ReadonlyArray<readonly [number, Partial<T>]>) => void
@@ -194,6 +205,10 @@ interface SpatialState {
   hasPending: (kind: EntityKind, id: number) => boolean
   applyServerEntity: <T extends CatalogEntity>(kind: EntityKind, entity: T) => void
   removeServerEntity: (kind: EntityKind, id: number) => void
+  /** `applyServerEntity` for many rows of a kind: one array copy, one store update. */
+  applyServerEntities: <T extends CatalogEntity>(kind: EntityKind, entities: ReadonlyArray<T>) => void
+  /** `removeServerEntity` for many ids of a kind: one store update. */
+  removeServerEntities: (kind: EntityKind, ids: ReadonlyArray<number>) => void
 }
 
 /**
@@ -319,6 +334,71 @@ function isNewer(current: CatalogEntity | undefined, incoming: CatalogEntity): b
   return !sameValue(current, incoming)
 }
 
+/**
+ * id → position in a kind's row array, built once per array. The store
+ * replaces rows by copying the array, so a cached index stays valid for
+ * the array it was built from; an apply that only replaces rows hands the
+ * same index on to the copy.
+ */
+const idIndexCache = new WeakMap<ReadonlyArray<CatalogEntity>, Map<number, number>>()
+
+function idIndexOf(list: ReadonlyArray<CatalogEntity>): Map<number, number> {
+  let index = idIndexCache.get(list)
+  if (!index) {
+    index = new Map()
+    // First occurrence wins, like `findIndex`.
+    for (let i = 0; i < list.length; i++) {
+      const id = list[i].id
+      if (id !== undefined && !index.has(id)) index.set(id, i)
+    }
+    idIndexCache.set(list, index)
+  }
+  return index
+}
+
+/**
+ * Server rows applied to a kind's list in order, each under the same
+ * monotonic gate as a single apply (`isNewer`), then `removeIds` dropped.
+ * Returns the new list, or null when nothing changed.
+ */
+function mergeServerRows(
+  list: ReadonlyArray<CatalogEntity>,
+  upserts: Iterable<CatalogEntity>,
+  removeIds: ReadonlySet<number> | null,
+): CatalogEntity[] | null {
+  const cached = idIndexOf(list)
+  let index = cached
+  let next: CatalogEntity[] | null = null
+  for (const entity of upserts) {
+    const id = entity.id
+    if (id === undefined) continue
+    const idx = index.get(id)
+    // Late responses, SSE refetches and duplicate applies are no-ops.
+    if (idx !== undefined && !isNewer((next ?? list)[idx], entity)) continue
+    next ??= list.slice()
+    if (idx !== undefined) {
+      next[idx] = entity
+    } else {
+      // Never grow the index another array still uses.
+      if (index === cached) index = new Map(cached)
+      index.set(id, next.length)
+      next.push(entity)
+    }
+  }
+  if (removeIds && removeIds.size > 0) {
+    let present = false
+    for (const id of removeIds) {
+      if (index.has(id)) {
+        present = true
+        break
+      }
+    }
+    if (present) return (next ?? list).filter((r) => r.id === undefined || !removeIds.has(r.id))
+  }
+  if (next) idIndexCache.set(next, index)
+  return next
+}
+
 /** Is the failure worth retrying (network / server), or did the server refuse the value? */
 function isRetryable(err: unknown): boolean {
   if (err instanceof ApiError) {
@@ -348,6 +428,17 @@ const loadsInFlight = new Map<string, Promise<void>>()
  */
 const staged = new Map<EntityKind, Map<number, Draft>>()
 let stagedFrame: number | null = null
+/**
+ * Server rows (null = gone) fetched by `loadEntities`, applied together once
+ * per animation frame: a burst of 100 seat events is one store update, not
+ * 100 array copies and 100 re-renders of every bin consumer.
+ */
+const serverStaged = new Map<EntityKind, Map<number, CatalogEntity | null>>()
+let serverFrame: number | null = null
+/** Refetches running at once per `loadEntities` call. */
+const LOAD_PARALLEL = 8
+/** `loadKind({ fresh })` follow-ups, one per list. */
+const followUpLoads = new Map<string, Promise<void>>()
 
 const requestFrame = (cb: () => void): number =>
   typeof requestAnimationFrame === 'function' ? requestAnimationFrame(cb) : (setTimeout(cb, 16) as unknown as number)
@@ -395,6 +486,45 @@ export const useSpatialStore = create<SpatialState>((set, get) => {
     })
   }
   applyStagedRef = applyStaged
+
+  /** Apply the staged server rows of every kind in one store update. */
+  const applyServerStaged = () => {
+    if (serverFrame !== null) {
+      cancelFrame(serverFrame)
+      serverFrame = null
+    }
+    if (serverStaged.size === 0) return
+    const s = get()
+    const patch: Record<string, CatalogEntity[]> = {}
+    let any = false
+    for (const [kind, rows] of serverStaged) {
+      const upserts: CatalogEntity[] = []
+      const removals = new Set<number>()
+      for (const [id, row] of rows) {
+        if (row) upserts.push(row)
+        else removals.add(id)
+      }
+      const stateKey = kindStateKey[kind]
+      const next = mergeServerRows((s[stateKey] as CatalogEntity[]) ?? [], upserts, removals)
+      if (next) {
+        patch[stateKey] = next
+        any = true
+      }
+    }
+    serverStaged.clear()
+    if (any) set(patch as Partial<SpatialState>)
+  }
+
+  const stageServerRow = (kind: EntityKind, id: number, row: CatalogEntity | null) => {
+    let m = serverStaged.get(kind)
+    if (!m) serverStaged.set(kind, (m = new Map()))
+    const prev = m.get(id)
+    // Two refetches of one row in a frame: keep the newer, as applying
+    // them one after the other would.
+    if (row && prev && !isNewer(prev, row)) return
+    m.set(id, row)
+    if (serverFrame === null) serverFrame = requestFrame(applyServerStaged)
+  }
 
   const stage = (kind: EntityKind, id: number, patch: Draft) => {
     let m = staged.get(kind)
@@ -591,6 +721,20 @@ export const useSpatialStore = create<SpatialState>((set, get) => {
       // effect, an SSE burst) shares that request.
       const loadKey = `${kind}?${query ?? ''}`
       const running = loadsInFlight.get(loadKey)
+      if (running && opts?.fresh) {
+        // That request may have been answered before the change this load
+        // is for: run one more after it, shared by every fresh caller.
+        let follow = followUpLoads.get(loadKey)
+        if (!follow) {
+          follow = running.then(() => {
+            followUpLoads.delete(loadKey)
+            if (loadsInFlight.get(loadKey) === running) loadsInFlight.delete(loadKey)
+            return get().loadKind(kind, explicit !== undefined ? { zoneId: explicit } : undefined)
+          })
+          followUpLoads.set(loadKey, follow)
+        }
+        return follow
+      }
       if (running) return running
       const run = (async () => {
       set((s) => ({ isLoading: { ...s.isLoading, [kind]: true }, error: { ...s.error, [kind]: null } }))
@@ -640,6 +784,26 @@ export const useSpatialStore = create<SpatialState>((set, get) => {
         }
         console.warn(`[spatialStore] failed to load ${kind}/${id}`, err)
       }
+    },
+
+    async loadEntities(kind, ids) {
+      const table = apiDb[tablePath[kind]] as { get: (id: number) => Promise<CatalogEntity | undefined> }
+      const queue = [...new Set(ids)]
+      const worker = async () => {
+        for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+          try {
+            const row = await table.get(id)
+            stageServerRow(kind, id, row ?? null)
+          } catch (err) {
+            // 404 = deleted server-side; drop it so the UI reflects that.
+            if (err instanceof ApiError && err.status === 404) stageServerRow(kind, id, null)
+            else console.warn(`[spatialStore] failed to load ${kind}/${id}`, err)
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(LOAD_PARALLEL, queue.length) }, worker))
+      // Callers awaiting this see every row in the store.
+      applyServerStaged()
     },
 
     updateLocal<T extends CatalogEntity>(kind: EntityKind, rawId: number, patch: Partial<T>) {
@@ -748,25 +912,27 @@ export const useSpatialStore = create<SpatialState>((set, get) => {
     },
 
     applyServerEntity(kind, entity) {
-      const id = entity.id
-      if (id === undefined) return
-      const stateKey = kindStateKey[kind]
-      const list = (get()[stateKey] as CatalogEntity[]) ?? []
-      const idx = list.findIndex((r) => r.id === id)
-      // Late responses, SSE refetches and duplicate applies are no-ops.
-      if (idx >= 0 && !isNewer(list[idx], entity)) return
-      const next = idx >= 0 ? [...list] : [...list, entity]
-      if (idx >= 0) next[idx] = entity
-      // Drafts are NOT cleared here — they're the user's unconfirmed edits
-      // and keep showing on top; `send` retires them once confirmed.
-      set({ [stateKey]: next } as Partial<SpatialState>)
+      get().applyServerEntities(kind, [entity])
     },
 
     removeServerEntity(kind, id) {
+      get().removeServerEntities(kind, [id])
+    },
+
+    applyServerEntities(kind, entities) {
+      if (entities.length === 0) return
       const stateKey = kindStateKey[kind]
-      const list = (get()[stateKey] as CatalogEntity[]) ?? []
-      if (!list.some((r) => r.id === id)) return
-      set({ [stateKey]: list.filter((r) => r.id !== id) } as Partial<SpatialState>)
+      const next = mergeServerRows((get()[stateKey] as CatalogEntity[]) ?? [], entities, null)
+      // Drafts are NOT cleared here — they're the user's unconfirmed edits
+      // and keep showing on top; `send` retires them once confirmed.
+      if (next) set({ [stateKey]: next } as Partial<SpatialState>)
+    },
+
+    removeServerEntities(kind, ids) {
+      if (ids.length === 0) return
+      const stateKey = kindStateKey[kind]
+      const next = mergeServerRows((get()[stateKey] as CatalogEntity[]) ?? [], [], new Set(ids))
+      if (next) set({ [stateKey]: next } as Partial<SpatialState>)
     },
   }
 })
@@ -813,6 +979,7 @@ export function resetSpatialSession(): void {
   flushTimer = null
   pending.clear()
   staged.clear()
+  serverStaged.clear()
   confirmedAt.clear()
   tempToServer.clear()
   retryAttempt.clear()
@@ -858,6 +1025,11 @@ export function getSpatialEntity<T extends CatalogEntity>(kind: EntityKind, rawI
   const row = ((s[kindStateKey[kind]] as CatalogEntity[]) ?? []).find((r) => r.id === id)
   if (!row) return id < 0 && draft ? (draft as unknown as T) : undefined
   return (draft ? { ...row, ...draft } : row) as T
+}
+
+/** How many server rows of a kind the store holds. */
+export function spatialRowCount(kind: EntityKind): number {
+  return ((useSpatialStore.getState()[kindStateKey[kind]] as CatalogEntity[]) ?? []).length
 }
 
 /** The server id for an id that may still be a temporary (negative) one. */

@@ -23,6 +23,7 @@ import {
   difference as turfDifference,
   featureCollection as turfFC,
   lineString as turfLineString,
+  multiLineString as turfMultiLineString,
   polygon as turfPolygon,
   union as turfUnion,
 } from '@turf/turf'
@@ -38,8 +39,15 @@ const SAME_LEVEL_M = 0.5
 /** Gap kept under the floor image (m) — closer and the base covers the
  *  image at grazing angles (the image draws pushed back in depth). */
 const IMAGE_CLEARANCE_M = 0.3
-/** Wall outline closing distance (m): bridges door gaps in exterior walls. */
+/** Wall outline closing distance (m): seals small gaps and wall joints. */
 const CLOSE_M = 1.5
+/** Widest opening bridged as a doorway (m) — main entrances, loading bays.
+ *  Openings wider than 2 × CLOSE_M aren't sealed by the closing step, and
+ *  an unsealed opening lets "outside" leak into the room behind it. */
+const MAX_OPENING_M = 8
+/** A wall end faces an opening when the gap runs within this angle (°) of
+ *  the wall's own direction — i.e. the two ends sit on one wall line. */
+const OPENING_ALIGN_DEG = 15
 /** Band thickness and outset (m). */
 const BAND_HALF_M = 0.06
 const BAND_OUTSET_M = 0.05
@@ -85,13 +93,33 @@ function elevationOf(f: ImageShape): number {
 
 type Area = Feature<Polygon | MultiPolygon>
 
+/**
+ * Union with a fallback. The one-shot union can throw on many overlapping
+ * buffers with exactly collinear edges ("Unable to complete output ring");
+ * returning one part then would shrink a whole floor to a single wall. So
+ * on failure merge part by part, nudging a part that still won't merge by
+ * a couple of centimetres, and only skip it if that fails too.
+ */
 function unionAll(parts: Area[]): Area | null {
   if (parts.length === 0) return null
   if (parts.length === 1) return parts[0]
   try {
     return (turfUnion(turfFC(parts)) as Area | null) ?? null
   } catch {
-    return parts[0]
+    let acc: Area = parts[0]
+    for (const p of parts.slice(1)) {
+      try {
+        acc = (turfUnion(turfFC([acc, p])) as Area | null) ?? acc
+      } catch {
+        try {
+          const nudged = turfBuffer(p, 0.02, { units: 'meters' }) as Area | undefined
+          if (nudged) acc = (turfUnion(turfFC([acc, nudged])) as Area | null) ?? acc
+        } catch {
+          /* skip a part that can't be merged */
+        }
+      }
+    }
+    return acc
   }
 }
 
@@ -109,19 +137,120 @@ function fillHoles(a: Area): Area {
  */
 export function wallOutline(lines: ReadonlyArray<LineShape>): Feature<Polygon | MultiPolygon> | null {
   const walls = lines.filter((l) => l.visible !== false && ((l.config.height ?? 0) > 0 || (l.config.elevation ?? 0) > 0))
-  return walls.length > 0 ? wallFootprint(walls) : null
+  if (walls.length === 0) return null
+  // Building an outline costs 50–250 ms. Callers re-run whenever any shape
+  // in the facility changes (new arrays, same walls), so cache by the
+  // walls' geometry: an opacity tweak or an area drag must not rebuild it.
+  const key = walls.map((l) => `${l.config.wallThickness ?? 0.3}:${l.vertices.flat().join(',')}`).join('|')
+  const hit = outlineCache.get(key)
+  if (hit !== undefined) return hit
+  const out = wallFootprint(walls)
+  outlineCache.set(key, out)
+  if (outlineCache.size > OUTLINE_CACHE_MAX) outlineCache.delete(outlineCache.keys().next().value as string)
+  return out
+}
+
+const OUTLINE_CACHE_MAX = 16
+const outlineCache = new Map<string, Area | null>()
+
+interface WallSegment {
+  vertices: [number, number][]
+  /** Wall thickness, metres. */
+  thickness: number
+}
+
+/**
+ * Door openings as extra wall segments. A doorway is a gap between two
+ * wall ends that point at each other along one wall line (both ends'
+ * directions within OPENING_ALIGN_DEG of the gap) and no wider than
+ * MAX_OPENING_M. Each end bridges to its nearest such partner only.
+ *
+ * Without this, a main entrance wider than 2 × CLOSE_M stays open: the
+ * outline's outer ring runs in through it and the hall behind the door
+ * counts as outside the building.
+ */
+function doorwayBridges(walls: WallSegment[]): WallSegment[] {
+  if (walls.length === 0) return []
+  // Local metres around the first vertex — plenty accurate across a building.
+  const [lng0, lat0] = walls[0].vertices[0]
+  const kx = 111_320 * Math.cos((lat0 * Math.PI) / 180)
+  const ky = 110_540
+  const toM = ([lng, lat]: [number, number]) => [(lng - lng0) * kx, (lat - lat0) * ky]
+
+  interface End { wall: number; at: [number, number]; m: number[]; dir: number[]; thickness: number }
+  const ends: End[] = []
+  walls.forEach((w, i) => {
+    const v = w.vertices
+    if (v.length < 2) return
+    for (const [tip, prev] of [[v[0], v[1]], [v[v.length - 1], v[v.length - 2]]] as const) {
+      const a = toM(tip), b = toM(prev)
+      const len = Math.hypot(a[0] - b[0], a[1] - b[1])
+      if (len < 1e-6) continue
+      ends.push({ wall: i, at: tip, m: a, dir: [(a[0] - b[0]) / len, (a[1] - b[1]) / len], thickness: w.thickness })
+    }
+  })
+
+  const cosMax = Math.cos((OPENING_ALIGN_DEG * Math.PI) / 180)
+  const bridges: WallSegment[] = []
+  const seen = new Set<string>()
+  for (let i = 0; i < ends.length; i++) {
+    const a = ends[i]
+    let best = -1
+    let bestDist = Infinity
+    for (let j = 0; j < ends.length; j++) {
+      const b = ends[j]
+      if (j === i || b.wall === a.wall) continue
+      const dx = b.m[0] - a.m[0], dy = b.m[1] - a.m[1]
+      const dist = Math.hypot(dx, dy)
+      // Touching ends are already one wall; too wide isn't a door.
+      if (dist < 0.05 || dist > MAX_OPENING_M || dist >= bestDist) continue
+      const ux = dx / dist, uy = dy / dist
+      if (a.dir[0] * ux + a.dir[1] * uy < cosMax) continue
+      if (-(b.dir[0] * ux + b.dir[1] * uy) < cosMax) continue
+      best = j
+      bestDist = dist
+    }
+    if (best < 0) continue
+    const key = i < best ? `${i}:${best}` : `${best}:${i}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    bridges.push({ vertices: [a.at, ends[best].at], thickness: Math.min(a.thickness, ends[best].thickness) })
+  }
+  return bridges
 }
 
 function wallFootprint(lines: LineShape[]): Area | null {
+  const walls: WallSegment[] = lines
+    .filter((l) => l.vertices.length >= 2)
+    .map((l) => ({ vertices: l.vertices as [number, number][], thickness: Math.max(0.05, l.config.wallThickness ?? 0.3) }))
+  // One buffer per wall thickness, over a MultiLineString of all its walls:
+  // the buffer merges its own lines robustly, so only a handful of parts
+  // reach the union. Buffering wall by wall and union-ing ~100 parts took
+  // >1 s on an 87-wall floor (the one-shot union throws on collinear
+  // edges and the part-by-part fallback is slow).
+  const groups = new Map<number, [number, number][][]>()
+  for (const w of [...walls, ...doorwayBridges(walls)]) {
+    const t = Math.round(w.thickness * 1000) / 1000
+    const g = groups.get(t)
+    if (g) g.push(w.vertices)
+    else groups.set(t, [w.vertices])
+  }
   const parts: Area[] = []
-  for (const l of lines) {
-    if (l.vertices.length < 2) continue
+  for (const [thickness, lines] of groups) {
+    const radius = thickness / 2 + CLOSE_M
     try {
-      const half = Math.max(0.05, l.config.wallThickness ?? 0.3) / 2
-      const b = turfBuffer(turfLineString(l.vertices), half + CLOSE_M, { units: 'meters' }) as Area | undefined
+      const b = turfBuffer(turfMultiLineString(lines), radius, { units: 'meters' }) as Area | undefined
       if (b) parts.push(b)
     } catch {
-      /* degenerate line */
+      // A degenerate line can sink the whole group — fall back to one by one.
+      for (const l of lines) {
+        try {
+          const b = turfBuffer(turfLineString(l), radius, { units: 'meters' }) as Area | undefined
+          if (b) parts.push(b)
+        } catch {
+          /* degenerate line */
+        }
+      }
     }
   }
   const merged = unionAll(parts)

@@ -29,6 +29,8 @@ export type Tool =
   | 'magic-wall'
   | 'ai-map'
   | 'route-preview'
+  | 'measure'
+  | 'calibrate-image'
   | 'zones'
 
 /** Keys that create geometry — hidden in preview mode. */
@@ -82,6 +84,11 @@ export const TOOL_SHORTCUTS: Record<Tool, ToolBinding> = {
   // Route-preview — click A then B to visualise a wayfinding path
   // through the current scene. `n` for "navigate".
   'route-preview': { letters: ['n'] },
+  // Measure — ruler that leaves guides. `u` for "rUler"; e/j/k/u/x were
+  // the only free letters.
+  measure: { letters: ['u'] },
+  // Calibrate scale — entered from a selected image's side panel only.
+  'calibrate-image': { letters: [] },
   zones: { letters: ['z'] },
 }
 
@@ -190,6 +197,7 @@ export const SHORTCUT_GROUPS: ReadonlyArray<ShortcutGroup> = [
       { keys: 'L', labelKey: 'kb.toolLine', fallback: 'Line / aisle' },
       { keys: 'Y', labelKey: 'kb.toolRoute', fallback: 'Route / wayfinding path' },
       { keys: 'N', labelKey: 'kb.toolRoutePreview', fallback: 'Preview a route between two points' },
+      { keys: 'U', labelKey: 'kb.toolMeasure', fallback: 'Measure distances and areas (keeps guides)' },
       { keys: 'I', labelKey: 'kb.toolImage', fallback: 'Image / floor plan' },
       { keys: 'B', labelKey: 'kb.toolModel', fallback: '3D model' },
       { keys: 'F', labelKey: 'kb.toolImagePlane', fallback: 'Image plane (when nothing is selected)' },
@@ -207,6 +215,8 @@ export const SHORTCUT_GROUPS: ReadonlyArray<ShortcutGroup> = [
     titleFallback: 'Drawing',
     rows: [
       { keys: '⇧', labelKey: 'kb.drawConstrain', fallback: 'Constrain to square / 45° / perfect circle' },
+      { keys: '⇧', labelKey: 'kb.drawAngleLock', fallback: 'Walls, polygons, measure: flip the angle lock while held' },
+      { keys: '0–9 Enter', labelKey: 'kb.drawTypedLength', fallback: 'Type a length (3.5, 350cm, 12\'6) then Enter to place the next point' },
       { keys: '⌥', labelKey: 'kb.drawFromCenter', fallback: 'Draw outward from click point' },
       { keys: 'Enter', labelKey: 'kb.drawCommit', fallback: 'Finish polygon / line / stair' },
       { keys: 'Backspace', labelKey: 'kb.drawUndoVertex', fallback: 'Remove last vertex' },

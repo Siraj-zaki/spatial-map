@@ -6,11 +6,12 @@ import type { TFunction } from 'i18next'
 import { apiDb } from '@/lib/api-db'
 import { type Tool } from '@/lib/keyboard-shortcuts'
 import { resolveLineSnap, type LineSnap } from '@/lib/line-snap'
+import { activeLock, assistedPoint, type DrawAssist } from '@/lib/measure/geometry'
 import { type LineShapeConfig, type ImageShape, type LineShape } from '@/lib/shapes'
 import { type LengthUnit } from '@/lib/units'
 import { queryCache } from '@/lib/useApiQuery'
 
-import { unprojectAtAltitude } from './unproject-at-altitude'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 /**
  * Line/wall draw tool. Click N times to add vertices, double-click
@@ -21,10 +22,12 @@ import { unprojectAtAltitude } from './unproject-at-altitude'
  * current chain, every saved wall's endpoints, and the
  * floor-plan-relative cardinal axes. The overlay reads the snap
  * object to swap chain colour + render the green ring / axis guide.
- * The committed vertex is always the RAW cursor — the snap engine is
- * a visual hint, not a position lock — which lets users draw at any
- * angle without a modifier key. This matches the "free-hand always"
- * decision documented in ARCHITECTURE.md.
+ * The committed vertex is the RAW cursor — the snap engine is a visual
+ * hint, not a position lock — which lets users draw at any angle without
+ * a modifier key ("free-hand always", CONTEXT.md). The one exception is
+ * the opt-in angle lock (`drawAssistRef`: the drafting bar's toggle,
+ * flipped while Shift is held), which does move the vertex onto the
+ * nearest locked angle off the previous one.
  *
  * `savedLines` + `defaultFloorPlanId` / `savedImagesRawAll` are
  * mirrored into refs internally so the draw effect doesn't tear down
@@ -42,6 +45,7 @@ export function useLineDrawTool({
   activeWarehouseIdRef,
   defaultFloorPlanIdRef,
   lineVerticesRef,
+  drawAssistRef,
   pinWarehouseCenterIfNeeded,
   setLineDraftVertices,
   setLineDraftCursor,
@@ -64,6 +68,7 @@ export function useLineDrawTool({
   activeWarehouseIdRef: MutableRefObject<number | null>
   defaultFloorPlanIdRef: MutableRefObject<number | null>
   lineVerticesRef: MutableRefObject<[number, number][]>
+  drawAssistRef: MutableRefObject<DrawAssist>
   pinWarehouseCenterIfNeeded: (
     zoneId: number | null,
     center: [number, number],
@@ -156,9 +161,15 @@ export function useLineDrawTool({
       // vertex is always the raw cursor: the snap engine paints green
       // as a visual hint but never overrides where the vertex lands.
       // This keeps hand-drawn walls truly free-hand at every angle.
-      const hit = unprojectAtAltitude(map, e.point, lineConfig.elevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, lineConfig.elevation ?? 0)
       const rawHit: [number, number] = [hit.lng, hit.lat]
-      setLineDraftVertices((prev) => [...prev, rawHit])
+      const placed = assistedPoint(
+        drawAssistRef.current,
+        e.originalEvent.shiftKey,
+        lineVerticesRef.current,
+        rawHit,
+      )
+      setLineDraftVertices((prev) => [...prev, placed])
       // Refresh the snap state against the NEW chain (so the guide
       // recomputes from the just-placed vertex on the next paint,
       // before the mouse actually moves).
@@ -181,8 +192,16 @@ export function useLineDrawTool({
       const e = pendingMove
       pendingMove = null
       if (!e) return
-      const hit = unprojectAtAltitude(map, e.point, lineConfig.elevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, lineConfig.elevation ?? 0)
       const rawHit: [number, number] = [hit.lng, hit.lat]
+      // Angle lock replaces the free-hand position outright; the snap
+      // hint is then irrelevant (the lock already is the constraint).
+      if (activeLock(drawAssistRef.current, e.originalEvent.shiftKey) && lineVerticesRef.current.length > 0) {
+        const locked = assistedPoint(drawAssistRef.current, e.originalEvent.shiftKey, lineVerticesRef.current, rawHit)
+        setLineDraftCursor(locked)
+        setLineDraftSnap({ kind: 'none', position: locked })
+        return
+      }
       const snap = computeSnap(rawHit)
       // Free-hand semantics: the chain / trailing vertex ALWAYS follow
       // the raw cursor so users can draw at any angle. The snap kind
@@ -241,6 +260,7 @@ export function useLineDrawTool({
     activeWarehouseIdRef,
     defaultFloorPlanIdRef,
     lineVerticesRef,
+    drawAssistRef,
     setLineDraftVertices,
     setLineDraftCursor,
     setLineDraftSnap,

@@ -23,6 +23,8 @@ i18n
     supportedLngs: ['en', 'es', 'fr', 'de', 'zh', 'ar'],
     interpolation: {
       escapeValue: false,
+      // {{product}} in any string → the product name (lib/site.ts).
+      defaultVariables: { product: 'Spatial Map' },
     },
     backend: {
       loadPath: '/locales/{{lng}}/{{ns}}.json',

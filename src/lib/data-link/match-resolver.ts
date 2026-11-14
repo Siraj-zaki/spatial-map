@@ -208,6 +208,30 @@ function shapesForKind(
   }
 }
 
+// ------------------------------------------ explicit-shape id lookup
+
+/**
+ * `id → shape` per shapes array, so an explicit-shape config costs one
+ * Map lookup per row instead of a scan of the whole slice. First match
+ * wins, exactly like the `Array.find` it replaces. Keyed on the array
+ * reference (Zustand replaces it on every mutation).
+ */
+const shapeByIdCache = new WeakMap<readonly MatchableShape[], Map<number, MatchableShape>>()
+
+function shapeById(shapes: readonly MatchableShape[], id: number): MatchableShape | undefined {
+  // Map keys compare NaN equal to NaN; `===` doesn't. Keep the old answer.
+  if (Number.isNaN(id)) return shapes.find((s) => s.id === id)
+  let byId = shapeByIdCache.get(shapes)
+  if (!byId) {
+    byId = new Map()
+    for (const s of shapes) {
+      if (s.id !== undefined && !byId.has(s.id)) byId.set(s.id, s)
+    }
+    shapeByIdCache.set(shapes, byId)
+  }
+  return byId.get(id)
+}
+
 // ---------------------------------------------- bin lookup by shape id
 
 /**
@@ -266,8 +290,11 @@ function getJoinIndex(
     joinIndexCache.set(shapes, perShapesCache)
   }
 
+  // Only a `bin.*` shape side reads bins, so only then does a new bins
+  // array (every bin SSE event) make the index stale.
+  const readsBins = join.shapeFieldSource.startsWith('bin.')
   const existing = perShapesCache.get(cacheKey)
-  if (existing && existing.binsRef === snapshot.bins) return existing
+  if (existing && (!readsBins || existing.binsRef === snapshot.bins)) return existing
 
   // Rebuild.
   const byValue = new Map<JoinKey, MatchableShape[]>()
@@ -366,8 +393,16 @@ export function resolveMatchTargets(
       if (!c?.lng || !c?.lat) {
         return { kind: 'none', reason: 'coord mode: coordFields.lng/lat unset' }
       }
-      const lng = Number(readPayloadPath(payload, c.lng))
-      const lat = Number(readPayloadPath(payload, c.lat))
+      // `Number(null)` and `Number('')` are 0, which would pin the row at
+      // 0,0 (the Gulf of Guinea). Report rows carry every schema column, so
+      // a record with no position arrives with null lat / lng — treat that
+      // as "no position", like a missing key.
+      const coordOf = (path: string) => {
+        const v = readPayloadPath(payload, path)
+        return v === null || v === undefined || (typeof v === 'string' && v.trim() === '') ? NaN : Number(v)
+      }
+      const lng = coordOf(c.lng)
+      const lat = coordOf(c.lat)
       if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
         return {
           kind: 'none',
@@ -383,7 +418,7 @@ export function resolveMatchTargets(
         return { kind: 'none', reason: 'explicit-shape: targetShapeId unset' }
       }
       const shapes = shapesForKind(config.targetKind, snapshot)
-      const hit = shapes.find((s) => s.id === id)
+      const hit = shapeById(shapes, id)
       return hit
         ? { kind: 'shapes', shapes: [hit] }
         : { kind: 'none', reason: `explicit-shape: id ${id} not in store` }
@@ -453,13 +488,32 @@ export function resolvePayloadCoord(
   payload: unknown,
   config: DataLinkConfig,
 ): [number, number] | null {
-  const result = resolveMatchTargets(payload, config, {
-    // Coord mode doesn't touch the store; empty snapshot is fine.
-    bins: [], polygons: [], markers: [], circles: [], lines: [],
-    stairs: [], doors: [], images: [], imagePlanes: [], models: [], textLabels: [],
-  })
+  // Coord mode doesn't touch the store; empty snapshot is fine.
+  const result = resolveMatchTargets(payload, config, EMPTY_MATCH_SNAPSHOT)
   return result.kind === 'coord' ? result.position : null
 }
+
+const EMPTY_SHAPES: readonly never[] = Object.freeze([])
+
+/**
+ * A snapshot with nothing in it. Shared so `resolvePayloadCoord` (called
+ * per row, per push) stops allocating eleven arrays a call — and so the
+ * join-index cache, keyed on the shapes array, sees one array, not a new
+ * one every time.
+ */
+export const EMPTY_MATCH_SNAPSHOT: MatchStoreSnapshot = Object.freeze({
+  bins: EMPTY_SHAPES,
+  polygons: EMPTY_SHAPES,
+  markers: EMPTY_SHAPES,
+  circles: EMPTY_SHAPES,
+  lines: EMPTY_SHAPES,
+  stairs: EMPTY_SHAPES,
+  doors: EMPTY_SHAPES,
+  images: EMPTY_SHAPES,
+  imagePlanes: EMPTY_SHAPES,
+  models: EMPTY_SHAPES,
+  textLabels: EMPTY_SHAPES,
+})
 
 // -------------------------------------------------------- introspect
 

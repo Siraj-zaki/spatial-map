@@ -6,12 +6,25 @@ import {
 } from '@turf/turf'
 import type { Feature, FeatureCollection, Polygon } from 'geojson'
 import type { LengthUnit } from './units'
+import {
+  arcStops,
+  cellRingFromStops,
+  isPathGrid,
+  makeArc,
+  pathGridDepth,
+  pathGridDimensions,
+  pathGridFrame,
+  pathGridVertices,
+  pathPolylineMetres,
+  type ArcStop,
+  type GridPathFields,
+} from './grid-path'
 
 export type GridType = 'square' | 'triangle' | 'hexagon'
 export type HexOrientation = 'pointy' | 'flat'
 export type LabelDirection = 'x' | 'y'
 
-export interface GridConfig {
+export interface GridConfig extends GridPathFields {
   type: GridType
   /** Cell width in meters. */
   xSize: number
@@ -364,9 +377,14 @@ export function isCellAddress(
 export function estimateGridDimensions(
   start: [number, number],
   current: [number, number],
-  config: Pick<GridConfig, 'xSize' | 'ySize' | 'type'>,
+  config: Pick<GridConfig, 'xSize' | 'ySize' | 'type'> & Partial<Pick<GridConfig, 'cellGap' | 'levels'>> & GridPathFields,
 ): { rows: number; cols: number } | null {
   if (config.type !== 'square') return null
+  if (isPathGrid(config)) {
+    if (config.xSize <= 0 || config.ySize <= 0) return null
+    const { rows, cols } = pathGridDimensions(start, current, config)
+    return { rows, cols }
+  }
   const widthM = distanceMeters([start[0], start[1]], [current[0], start[1]])
   const heightM = distanceMeters([start[0], start[1]], [start[0], current[1]])
   if (config.xSize <= 0 || config.ySize <= 0) return null
@@ -382,6 +400,17 @@ export function estimateGridDimensions(
  * allowed. Returns the input unchanged if it isn't a recognizable hex.
  */
 function hexToRgba(hex: string, alpha: number): string {
+  // Every cell of a grid asks for the same colour; answer repeats from a
+  // one-entry memo instead of re-running the regex per cell.
+  const memo = lastRgba
+  if (memo && memo.hex === hex && Object.is(memo.alpha, alpha)) return memo.out
+  const out = hexToRgbaUncached(hex, alpha)
+  lastRgba = { hex, alpha, out }
+  return out
+}
+let lastRgba: { hex: string; alpha: number; out: string } | null = null
+
+function hexToRgbaUncached(hex: string, alpha: number): string {
   const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex)
   if (!m) return hex
   let h = m[1]
@@ -1136,7 +1165,21 @@ function markFuture(cells: GridCell[], current: [number, number], committed = fa
       if (fc) fc.properties.future = true
     }
   }
-  // Compute bbox
+  // The bbox walks every vertex of every cell, and most callers (the map
+  // overlays, occlusion, export) never read it — so it is computed on first
+  // read and remembered. Same value, same enumerable key.
+  let bbox: [number, number, number, number] | null | undefined
+  return {
+    cells,
+    futureId: null,
+    get bbox() {
+      if (bbox === undefined) bbox = cellsBbox(cells)
+      return bbox
+    },
+  }
+}
+
+function cellsBbox(cells: GridCell[]): [number, number, number, number] | null {
   let minLng = Infinity
   let minLat = Infinity
   let maxLng = -Infinity
@@ -1149,11 +1192,7 @@ function markFuture(cells: GridCell[], current: [number, number], committed = fa
       if (lat > maxLat) maxLat = lat
     }
   }
-  return {
-    cells,
-    futureId: null,
-    bbox: minLng === Infinity ? null : [minLng, minLat, maxLng, maxLat],
-  }
+  return minLng === Infinity ? null : [minLng, minLat, maxLng, maxLat]
 }
 
 /**
@@ -1181,6 +1220,12 @@ export function buildGridFromLine(
   if (distanceMeters(start, current) < 0.01) {
     return { cells: [], futureId: null, bbox: null }
   }
+  if (config.type === 'square' && isPathGrid(config)) {
+    const cells = buildPathGrid(start, current, config, options.gridId)
+    for (const cell of cells) cell.id = options.gridId ?? GRID_PREVIEW_FEATURE_ID
+    const tail = cells[cells.length - 1]
+    return markFuture(cells, tail ? cellCentroid(tail) : current, options.committed)
+  }
 
   const minLng = Math.min(start[0], current[0])
   const maxLng = Math.max(start[0], current[0])
@@ -1189,6 +1234,279 @@ export function buildGridFromLine(
   const bbox: [number, number, number, number] = [minLng, minLat, maxLng, maxLat]
   const fc = buildGrid(bbox, config, start, options.gridId)
   return markFuture(fc.features as GridCell[], current, options.committed)
+}
+
+/**
+ * Square cells laid along `config.path` (see grid-path.ts): columns along the
+ * path, `pathRows` rows across it, same ids / props / level stacking as
+ * `buildSquareGrid`, rotated around `start` by `config.rotation`. Each row sits
+ * `pathRowRise` m above the one before it (raked seating).
+ */
+function buildPathGrid(
+  start: [number, number],
+  current: [number, number],
+  config: GridConfig,
+  gridId?: number,
+): GridCell[] {
+  const frame = pathGridFrame(start, current)
+  const arc = makeArc(pathPolylineMetres(start, current, config.path ?? [], !!config.pathSmooth))
+  if (!arc.valid) return []
+  const { rows, cols } = pathGridDimensions(start, current, config)
+  const gap = Math.max(0, config.cellGap ?? 0)
+  const pitchX = config.xSize + gap
+  const pitchY = config.ySize + gap
+  const depth = pathGridDepth(config)
+  // Row bands across the path (left-hand offsets positive). Row 0 is the
+  // band nearest the path on a one-sided grid, the right-most when centred.
+  const align = config.pathAlign ?? 'center'
+  const band = (r: number): [number, number] => {
+    if (align === 'left') return [r * pitchY, r * pitchY + config.ySize]
+    if (align === 'right') return [-(r * pitchY + config.ySize), -r * pitchY]
+    const a = -depth / 2 + r * pitchY
+    return [a, a + config.ySize]
+  }
+  const insetX = gap > 0 ? 0 : config.xSize * CELL_INSET_FRACTION
+  const insetY = gap > 0 ? 0 : config.ySize * CELL_INSET_FRACTION
+  const totalLevels = Math.max(1, Math.floor(config.levels ?? 1))
+  const levelHeight = Math.max(0, config.levelHeight ?? 0)
+  const levelGap = Math.max(0, config.levelGap ?? 0)
+  const perLevelHeight = totalLevels > 1 ? levelHeight : config.height
+  const rowRise = Math.max(0, config.pathRowRise ?? 0)
+  // A column's stops along the arc don't depend on the row (rows only
+  // change the offsets across it), so look each column's up once instead
+  // of once per row.
+  // (Pushed, not pre-sized: a corrupt size makes `cols` NaN, which must
+  // yield no cells rather than throw.)
+  const colStops: ArcStop[][] = []
+  for (let c = 0; c < cols; c++) {
+    const s0 = c * pitchX
+    colStops.push(arcStops(arc, s0 + insetX, s0 + config.xSize - insetX))
+  }
+  const cells: GridCell[] = []
+  let index = 0
+  for (let r = 0; r < rows; r++) {
+    const [a, b] = band(r)
+    const rowBase = config.elevation + r * rowRise
+    for (let c = 0; c < cols; c++) {
+      const ring = cellRingFromStops(colStops[c], a + insetY, b - insetY).map(frame.toLngLat)
+      for (let lvl = 0; lvl < totalLevels; lvl++) {
+        const cellElevation = totalLevels > 1 ? rowBase + lvl * (levelHeight + levelGap) : rowBase
+        cells.push(
+          turfPolygon(
+            [ring],
+            makeCellProps(
+              totalLevels > 1 ? `${r}-${c}-l${lvl}` : `${r}-${c}`,
+              gridId,
+              r,
+              c,
+              index,
+              cellElevation,
+              perLevelHeight,
+              rows,
+              cols,
+              config,
+              lvl,
+              totalLevels,
+            ),
+          ) as GridCell,
+        )
+        index++
+      }
+    }
+  }
+  return rotateCells(cells, start, config.rotation)
+}
+
+/**
+ * A path grid's vertices as they sit on the map ([lng, lat], with the grid's
+ * rotation applied) — what Re-draw seeds the draw mode with so the user
+ * continues the existing path.
+ */
+export function pathGridDrawnVertices(
+  start: [number, number],
+  current: [number, number],
+  config: GridConfig,
+): [number, number][] {
+  if (!isPathGrid(config)) return []
+  const verts = pathGridVertices(start, current, config.path ?? [])
+  if (!config.rotation) return verts
+  return verts.map(([x, y]) => rotatePointAroundPivot(x, y, start[0], start[1], config.rotation))
+}
+
+/**
+ * Outline of a path-layout grid's whole strip (all rows, full length) as one
+ * [lng, lat] ring, rotated like the cells. Used where a single footprint is
+ * enough (report thumbnails, extents); empty for non-path grids.
+ */
+export function pathGridOutline(
+  start: [number, number],
+  current: [number, number],
+  config: GridConfig,
+): [number, number][] {
+  const strip = pathGridStrip(start, current, config)
+  if (!strip) return []
+  const ring = cellRingFromStops(strip.stops, strip.a, strip.b).map(strip.frame.toLngLat)
+  if (!config.rotation) return ring
+  return ring.map(([x, y]) => rotatePointAroundPivot(x, y, start[0], start[1], config.rotation))
+}
+
+/**
+ * A path grid's whole strip in local metres, unrotated: the stops along the
+ * arc from 0 to the end of the last column, and the offsets of its two long
+ * edges. Null for non-path grids or an unusable path.
+ */
+function pathGridStrip(start: [number, number], current: [number, number], config: GridConfig) {
+  if (config.type !== 'square' || !isPathGrid(config)) return null
+  const frame = pathGridFrame(start, current)
+  const arc = makeArc(pathPolylineMetres(start, current, config.path ?? [], !!config.pathSmooth))
+  if (!arc.valid) return null
+  const { cols } = pathGridDimensions(start, current, config)
+  const gap = Math.max(0, config.cellGap ?? 0)
+  const depth = pathGridDepth(config)
+  const align = config.pathAlign ?? 'center'
+  const [a, b] = align === 'left' ? [0, depth] : align === 'right' ? [-depth, 0] : [-depth / 2, depth / 2]
+  return { frame, stops: arcStops(arc, 0, cols * (config.xSize + gap) - gap), a, b }
+}
+
+// ---- Basemap clip footprint -------------------------------------------------
+
+/**
+ * The footprint(s) a grid hands the map overlay's basemap `clip` layer —
+ * an area that contains every cell, so whatever a per-cell footprint would
+ * erase from the basemap (3D buildings, landmarks, POI symbols) is still
+ * erased. Mapbox pays for clip footprints on EVERY frame (each one is a
+ * replacement region it re-sorts and re-tests), so one ring per grid
+ * instead of one per cell is the difference between ~50 regions and ~30k
+ * on a stadium.
+ *
+ *   - Path grids: the strip outline (all rows, full length, including the
+ *     gaps between cells and rows), rotated exactly like the cells
+ *     (`transformRotate` around `start`). Used only when the strip map is
+ *     provably one-to-one — each strip segment keeps its orientation at
+ *     all four corners and the outline doesn't cross itself — which makes
+ *     every cell (the image of a sub-rectangle of the strip) lie inside it.
+ *     A switch-back or an over-tight bend falls back to per-cell rings.
+ *   - Every other grid: the convex hull of all cell vertices (for a square
+ *     or triangle grid that is its rotated rectangle).
+ *
+ * `cells` is the grid's own `buildGridFromLine` output for the same inputs.
+ */
+export function gridClipRings(
+  start: [number, number],
+  current: [number, number],
+  config: GridConfig,
+  cells: ReadonlyArray<GridCell>,
+): [number, number][][] {
+  if (cells.length === 0) return []
+  const perCell = () =>
+    cells.map((c) => c.geometry.coordinates[0] as [number, number][]).filter((r) => r.length >= 4)
+  if (config.type === 'square' && isPathGrid(config)) {
+    const strip = pathGridStrip(start, current, config)
+    if (!strip || !stripIsOneToOne(strip.stops, strip.a, strip.b)) return perCell()
+    const ring = cellRingFromStops(strip.stops, strip.a, strip.b).map(strip.frame.toLngLat)
+    if (ring.length < 4 || ringSelfIntersects(ring)) return perCell()
+    const degrees = config.rotation
+    if (!degrees || Math.abs(degrees) < 1e-6) return [ring]
+    const rotated = transformRotate(turfPolygon([ring]), degrees, { pivot: start, mutate: false })
+    return [rotated.geometry.coordinates[0] as [number, number][]]
+  }
+  const hull = convexHull(cells)
+  return hull ? [hull] : perCell()
+}
+
+/**
+ * True when the strip map (s, o) → p(s) + n(s)·o has a positive Jacobian
+ * on every segment between consecutive stops, for o across [a, b]. On a
+ * segment the map is bilinear in (t, o), so its Jacobian is bilinear too
+ * and positive everywhere iff it is positive at the four corners.
+ */
+function stripIsOneToOne(stops: ReadonlyArray<ArcStop>, a: number, b: number): boolean {
+  for (let i = 1; i < stops.length; i++) {
+    const p0 = stops[i - 1].p
+    const p1 = stops[i].p
+    const n0 = stops[i - 1].n
+    const n1 = stops[i].n
+    for (const o of [a, b]) {
+      // ∂F/∂t at offset o (constant along the segment).
+      const cx = p1[0] - p0[0] + o * (n1[0] - n0[0])
+      const cy = p1[1] - p0[1] + o * (n1[1] - n0[1])
+      // ∂F/∂o at t = 0 and t = 1.
+      if (!(cx * n0[1] - cy * n0[0] > 0)) return false
+      if (!(cx * n1[1] - cy * n1[0] > 0)) return false
+    }
+  }
+  return true
+}
+
+/** Above this many edges the O(n²) self-intersection test isn't worth it. */
+const MAX_OUTLINE_EDGES = 4000
+
+/**
+ * True when two non-adjacent edges of the closed ring touch or cross.
+ * Collinear overlaps count as crossings (when in doubt, report one).
+ */
+function ringSelfIntersects(ring: ReadonlyArray<[number, number]>): boolean {
+  const m = ring.length - 1 // edges; ring[m] repeats ring[0]
+  if (m > MAX_OUTLINE_EDGES) return true
+  const orient = (ax: number, ay: number, bx: number, by: number, cx: number, cy: number) =>
+    Math.sign((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+  const onSeg = (ax: number, ay: number, bx: number, by: number, px: number, py: number) =>
+    Math.min(ax, bx) <= px && px <= Math.max(ax, bx) && Math.min(ay, by) <= py && py <= Math.max(ay, by)
+  for (let i = 0; i < m; i++) {
+    const [ax, ay] = ring[i]
+    const [bx, by] = ring[i + 1]
+    const minX = Math.min(ax, bx)
+    const maxX = Math.max(ax, bx)
+    const minY = Math.min(ay, by)
+    const maxY = Math.max(ay, by)
+    for (let j = i + 2; j < m; j++) {
+      if (i === 0 && j === m - 1) continue // share ring[0]
+      const [cx, cy] = ring[j]
+      const [dx, dy] = ring[j + 1]
+      if (Math.max(cx, dx) < minX || Math.min(cx, dx) > maxX || Math.max(cy, dy) < minY || Math.min(cy, dy) > maxY) continue
+      const o1 = orient(ax, ay, bx, by, cx, cy)
+      const o2 = orient(ax, ay, bx, by, dx, dy)
+      const o3 = orient(cx, cy, dx, dy, ax, ay)
+      const o4 = orient(cx, cy, dx, dy, bx, by)
+      if (o1 !== o2 && o3 !== o4) return true
+      if (o1 === 0 && onSeg(ax, ay, bx, by, cx, cy)) return true
+      if (o2 === 0 && onSeg(ax, ay, bx, by, dx, dy)) return true
+      if (o3 === 0 && onSeg(cx, cy, dx, dy, ax, ay)) return true
+      if (o4 === 0 && onSeg(cx, cy, dx, dy, bx, by)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Convex hull (closed, counter-clockwise) of every vertex of every cell —
+ * Andrew's monotone chain. Null when the cells span no area.
+ */
+function convexHull(cells: ReadonlyArray<GridCell>): [number, number][] | null {
+  const pts: [number, number][] = []
+  for (const cell of cells) {
+    const ring = cell.geometry.coordinates[0]
+    for (let i = 0; i < ring.length - 1; i++) pts.push([ring[i][0], ring[i][1]])
+  }
+  if (pts.length < 3) return null
+  pts.sort((p, q) => p[0] - q[0] || p[1] - q[1])
+  const cross = (o: [number, number], p: [number, number], q: [number, number]) =>
+    (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+  const lower: [number, number][] = []
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop()
+    lower.push(p)
+  }
+  const upper: [number, number][] = []
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop()
+    upper.push(p)
+  }
+  const hull = lower.slice(0, -1).concat(upper.slice(0, -1))
+  if (hull.length < 3) return null
+  hull.push(hull[0])
+  return hull
 }
 
 export function buildGridFromCenter(

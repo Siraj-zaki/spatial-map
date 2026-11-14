@@ -23,7 +23,7 @@ import { fitBoundsIfOffscreen } from './fitToShapeOnSelect'
  *
  * `handleToggleTextLabelVisible` uses the `text-labels` (hyphenated)
  * key for both `patchSpatialEntity` and `queryCache.invalidate` — the
- * spatial-store's kind literal is `text-labels`, matching ARCHITECTURE.md's
+ * spatial-store's kind literal is `text-labels`, matching CONTEXT.md's
  * pluralised-hyphenated convention.
  */
 export function useTextLabelHandlers({

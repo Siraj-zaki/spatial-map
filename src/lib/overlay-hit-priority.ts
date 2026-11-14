@@ -62,7 +62,8 @@ const PRIORITY: OverlayHitKind[] = [
  *   polygon-extrude-layer-op<N>
  *   circle-fill-layer, circle-extrude-layer-op<N>
  *   line-line-layer, line-wall-extrude-layer-op<N>
- *   stair-fill-layer, stair-extrude-layer
+ *   stair-step-layer, stair-step-border-layer, and focus mode's
+ *     stair-step-near-layer / stair-step-ghost-layer
  *   door-fill-layer, door-outline-layer (NOT door-tool-preview-* which are
  *     draft layers)
  *   model-shapes-shape-<id>
@@ -96,7 +97,10 @@ function kindOfLayer(layerId: string): OverlayHitKind | null {
   }
   if (
     layerId === 'stair-step-layer' ||
-    layerId === 'stair-step-border-layer'
+    layerId === 'stair-step-border-layer' ||
+    // Focus mode's faded-stair tier layers draw the same steps.
+    layerId === 'stair-step-near-layer' ||
+    layerId === 'stair-step-ghost-layer'
   ) {
     return 'stair'
   }
@@ -135,6 +139,16 @@ function kindOfLayer(layerId: string): OverlayHitKind | null {
     return 'image'
   }
   return null
+}
+
+/**
+ * The overlay kind a layer belongs to (same table `higherPriorityAt`
+ * uses), or null for non-interactive layers. Focus mode's empty-click
+ * exit (`src/lib/focus/use-focus-exit.ts`) treats a hit on any layer with
+ * a kind as "the click landed on something".
+ */
+export function overlayKindOfLayer(layerId: string): OverlayHitKind | null {
+  return kindOfLayer(layerId)
 }
 
 const DEFAULT_HIT_BUFFER_PX = 4

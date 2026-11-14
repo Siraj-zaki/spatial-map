@@ -62,18 +62,15 @@ const IMAGE_NAME_PREFIX = 'dl-icon-'
 const DEFAULT_STROKE = '#111827'
 
 /**
- * Compute the mapbox image id for an icon. When `color` is supplied,
- * the stroke colour is baked into the sprite name so multiple configs
- * can request the same icon in different colours without stomping on
- * each other's bitmap.
- *
- * Both forms are valid inputs to `map.hasImage()` / `icon-image`.
+ * Compute the mapbox image id for an icon. The stroke colour is baked
+ * into the sprite name so multiple configs can request the same icon in
+ * different colours without stomping on each other's bitmap. No colour
+ * means the default stroke — the same default `ensureDataLinkSpritesFor`
+ * registers under, so a link saved without `iconColor` still finds its
+ * sprite (it used to ask for a colour-less name nothing registered).
  */
 export function mapboxImageIdFor(iconId: string, color?: string): string {
-  const c = normalizeColorForKey(color)
-  return c
-    ? `${IMAGE_NAME_PREFIX}${iconId}-${c}`
-    : `${IMAGE_NAME_PREFIX}${iconId}`
+  return `${IMAGE_NAME_PREFIX}${iconId}-${normalizeColorForKey(color ?? DEFAULT_STROKE)}`
 }
 
 function normalizeColorForKey(color: string | undefined): string {

@@ -8,7 +8,7 @@ import { type Tool } from '@/lib/keyboard-shortcuts'
 import { type StairShapeConfig } from '@/lib/shapes'
 import { type LengthUnit } from '@/lib/units'
 
-import { unprojectAtAltitude } from './unproject-at-altitude'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 /**
  * Stair placement tool ("Stairs & lifts"). Click flow depends on
@@ -101,7 +101,7 @@ export function useStairPlacementTool({
 
     const onClick = (e: MapMouseEvent) => {
       if (e.originalEvent?.defaultPrevented) return
-      const hit = unprojectAtAltitude(map, e.point, stairConfig.baseElevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, stairConfig.baseElevation ?? 0)
       const lngLat: [number, number] = [hit.lng, hit.lat]
       // Read the freshest anchor list from the ref so we don't depend
       // on a stale closure. We must NOT do the async commit inside the
@@ -185,7 +185,7 @@ export function useStairPlacementTool({
       })
     }
     const onMove = (e: MapMouseEvent) => {
-      const hit = unprojectAtAltitude(map, e.point, stairConfig.baseElevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, stairConfig.baseElevation ?? 0)
       pendingLngLat = [hit.lng, hit.lat]
       if (moveRafId === 0) moveRafId = requestAnimationFrame(flushMove)
     }

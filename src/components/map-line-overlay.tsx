@@ -3,15 +3,18 @@ import {
   buildLineChainFeature,
   buildLineFeature,
   buildLineFeatureCollection,
+  buildLineWallBorderCollection,
   buildLineWallCollection,
   buildLineWallFeature,
   buildSnapTargetFeature,
   lineCentroid,
   lineLabelAnchor,
   type LineProps,
+  rotateLine,
 } from '@/lib/line-generators'
+import { leaningWallMeshes } from '@/lib/sloped-mesh'
+import { useShapeMeshLayers } from '@/hooks/useShapeMeshLayers'
 import type { LineSnap } from '@/lib/line-snap'
-import { chainLengthMeters, inFlightSegmentMeters } from '@/lib/line-snap'
 import { higherPriorityAt } from '@/lib/overlay-hit-priority'
 import { rotatePointAround } from '@/lib/image-generators'
 import {
@@ -22,10 +25,26 @@ import {
   subscribeThemeChanges,
 } from '@/lib/map-transform-handles'
 import type { LineShape, LineShapeConfig } from '@/lib/shapes'
-import { formatLength, type LengthUnit } from '@/lib/units'
+import { registerLayerFeaturePredicate, type LayerFeaturePredicate } from '@/lib/empty-layer-gate'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
+import { patchFeatureCollection } from '@/lib/focus/focus-fade'
+import {
+  cutRegionContains,
+  focusCutRegion,
+  focusFadeCollection,
+  focusFadeLineCollection,
+  meshCutAway,
+  type FocusPiece,
+} from '@/lib/focus/focus-cutaway'
+import {
+  blockerIdsOf,
+  blockerPierceOf,
+  focusFactor,
+  useFocusBlockers,
+  useFocusScene,
+} from '@/lib/focus/focus-scene'
 import type { GeoJSONSource, Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal as ReactDOMCreatePortal } from 'react-dom'
 
 interface MapLineOverlayProps {
   map: MapboxMapInstance | null
@@ -60,13 +79,6 @@ interface MapLineOverlayProps {
    * indicators. `null` = tool not active OR no chain yet.
    */
   liveSnap?: LineSnap | null
-  /**
-   * Global display unit (meters / feet / …). Used for the on-screen
-   * measurement HUD that follows the cursor during drawing. When
-   * omitted the HUD is not rendered — auth-time callers pass the
-   * user's persisted default via `getDisplayUnit()`.
-   */
-  liveUnit?: LengthUnit
 }
 
 const LINE_SOURCE = 'line-source'
@@ -91,14 +103,29 @@ const OPACITY_BUCKETS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] as const
 const WALL_LAYER_BASE = 'line-wall-layer'
 const WALL_LAYER_IDS = OPACITY_BUCKETS.map((b) => `${WALL_LAYER_BASE}-op${b}`)
 const wallLayerId = (bucket: number) => `${WALL_LAYER_BASE}-op${bucket}`
-// Outline traced around the wall footprint polygon at the wall's roof
-// height. Reads borderColor + borderWidth from feature properties so
-// 3D walls get a proper box outline (mirrors the border pattern racks
-// and polygons use). WALL_SOURCE is empty for flat lines, so this
-// layer paints nothing for those.
+// Outline traced round the walls at their roof height, from its own
+// source: one border round each group of touching walls of the same
+// height (`buildLineWallBorderCollection`), so a joint draws one line,
+// not each wall's own crossing outline. Each stretch reads the
+// borderColor + borderWidth of the wall it runs along. Empty for flat
+// lines, so this layer paints nothing for those.
+const WALL_BORDER_SOURCE = 'line-wall-border-source'
 const WALL_BORDER_LAYER = 'line-wall-border-layer'
+// Leaning walls are drawn as meshes (useShapeMeshLayers); their extruded
+// feature stays in the zero-opacity bucket as the click target, so the
+// roof outline and the extruded selection wash must skip it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const NOT_MESHED: any = ['!=', ['get', 'meshed'], true]
+// Height of the wall roof the stroke rides on — a leaning wall's top isn't
+// above its line, so its stroke stays at the base.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const ROOF_HEIGHT: any = ['case', ['==', ['get', 'meshed'], true], 0, ['coalesce', ['get', 'height'], 0]]
 const LABEL_SOURCE = 'line-label-source'
 const LABEL_LAYER = 'line-label-layer'
+// Focus mode (src/lib/focus): a faded line's label carries the fade factor
+// as `focusFade`, so it fades with its stroke and wall. No label carries it
+// while nothing is focused, so `text-opacity` stays 1, its old default.
+const FOCUS_FADE_PROP = 'focusFade'
 const CHAIN_SOURCE = 'line-chain-source'
 const CHAIN_LINE_LAYER = 'line-chain-line-layer'
 const CHAIN_VERTEX_LAYER = 'line-chain-vertex-layer'
@@ -139,6 +166,296 @@ const WALL_INFLIGHT_BORDER_LAYER = 'line-wall-inflight-border-layer'
 const SELECTION_INFLIGHT_LAYER = 'line-selection-inflight-layer'
 const SELECTION_TINT_INFLIGHT_LAYER = 'line-selection-tint-inflight-layer'
 
+// ---- Empty-layer gate predicates (lib/empty-layer-gate.ts) ----------------
+// Each one is a JS transcription of a layer filter this overlay sets, so the
+// gate can hide a layer whose filter passes nothing (empty opacity buckets,
+// the selection layers with nothing selected) — Mapbox re-evaluates every
+// visible layer each frame even when it draws nothing. Registered right
+// after every `addLayer` / `setFilter` of that layer, with the same inputs.
+// Mapbox `get` reads a missing property as null and `==` / `!=` / `in` are
+// strict, so `?.` + `??` + `===` match it value for value.
+
+/** WALL_LAYER_op<bucket>: `['==', ['coalesce', ['get', 'opacityBucket'], 100], bucket]`, plus `['!=', ['get', 'lineId'], excludeId]` while a transform is active. */
+export function lineWallBucketPredicate(bucket: number, excludeId?: number | null): LayerFeaturePredicate {
+  return (f) => {
+    const p = f.properties
+    if ((p?.opacityBucket ?? 100) !== bucket) return false
+    return excludeId == null || p?.lineId !== excludeId
+  }
+}
+
+/** WALL_BORDER_LAYER: NOT_MESHED, plus the transform exclusion while one is active. */
+export function lineWallBorderPredicate(excludeId?: number | null): LayerFeaturePredicate {
+  return (f) => {
+    const p = f.properties
+    if (p?.meshed === true) return false
+    return excludeId == null || p?.lineId !== excludeId
+  }
+}
+
+/** SELECTION_LAYER: `['in', ['get', 'lineId'], ['literal', ids]]`, plus the transform exclusion while one is active. */
+export function lineSelectionPredicate(ids: ReadonlyArray<number>, excludeId?: number | null): LayerFeaturePredicate {
+  const selected = new Set<unknown>(ids)
+  return (f) => {
+    const id = f.properties?.lineId
+    if (!selected.has(id)) return false
+    return excludeId == null || id !== excludeId
+  }
+}
+
+/** SELECTION_TINT_LAYER: the selection filter AND NOT_MESHED. */
+export function lineSelectionTintPredicate(ids: ReadonlyArray<number>, excludeId?: number | null): LayerFeaturePredicate {
+  const selection = lineSelectionPredicate(ids, excludeId)
+  return (f) => f.properties?.meshed !== true && selection(f)
+}
+
+/** The selection layers' addLayer filter, `['==', ['get', 'lineId'], -1]`. */
+export const lineSelectionSentinelPredicate: LayerFeaturePredicate = (f) => f.properties?.lineId === -1
+
+// ---- Empty-layer gate: hide deferral + shadow-pass parity -----------------
+
+/** A layer an overlay gates with a predicate (see GatedLayerHold). */
+export interface GatedLayerSpec {
+  sourceId: string
+  /** The layer's `fill-extrusion-cast-shadows` (spec default `true`); false for line / symbol layers. */
+  castsShadows: boolean
+}
+
+type GateFeature = Parameters<LayerFeaturePredicate>[0]
+
+interface GatedLayerState {
+  spec: GatedLayerSpec
+  /** JS mirror of the filter currently set on the layer. */
+  test: LayerFeaturePredicate
+  /** Held, or a shadow caster while shadows are on: the gate must count every feature. */
+  pinned: boolean
+  /** What the gate counts. One stable function per layer; reads `pinned` / `test` at count time. */
+  predicate: LayerFeaturePredicate
+}
+
+/**
+ * Wraps `registerLayerFeaturePredicate` for one overlay instance so that a
+ * predicate never hides a layer that may still be drawing, and never moves
+ * the ground-shadow pass. Used by the line, stair, door and text-label
+ * overlays; map-polygon-overlay.tsx carries the same hold as its GateHold.
+ *
+ * Hide deferral. Mapbox GL 3.25 builds no bucket for a layer whose
+ * visibility is 'none', so the gate's synchronous show only draws once the
+ * source has re-tiled, while a hide applies on the very next frame. When a
+ * feature leaves the last member of a gated layer (a wall from bucket 50 to
+ * 60, a label switching alignment, the transform exclusion, a cleared
+ * selection), the old layer would vanish a worker round trip before the new
+ * tiles draw the feature anywhere else. Before the predicates, the old tiles
+ * kept drawing it in its old layer until the new ones replaced them. So a
+ * layer whose filter stops matching is HELD visible until the first
+ * `render` in which its source is loaded again, and only then re-counted
+ * (and hidden). Shows stay synchronous, so a new selection never lags.
+ *
+ * Shadow pass. With Graphics > Shadows on, Mapbox draws the ground-shadow
+ * pass right after the last visible shadow-casting layer in style order
+ * (ShadowRenderer.updateShadowParameters), and the 2D layers ordered before
+ * it get shaded by it. Hiding an empty caster would move that pass, so
+ * while shadows are on a caster keeps the gate's source-count rule
+ * (visible whenever its source has a feature), exactly as before the
+ * predicates.
+ *
+ * Call `register` (in place of `registerLayerFeaturePredicate`) right after
+ * every `addLayer` / `setFilter` of a gated layer, `push` right BEFORE
+ * every `setData` of a gated source, `resetSource` when that source is
+ * (re)created empty, and `attach` once per map.
+ */
+export class GatedLayerHold {
+  private readonly specs: ReadonlyMap<string, GatedLayerSpec>
+  private readonly layers = new Map<string, GatedLayerState>()
+  /** Layers whose test passed ≥1 feature at their last push / register. */
+  private readonly matched = new Set<string>()
+  /** Layers kept visible until their source has re-tiled the change that emptied them. */
+  private readonly held = new Set<string>()
+  /** source id → features of its last push. */
+  private readonly features = new Map<string, ReadonlyArray<GateFeature>>()
+  private shadows = false
+  private armed: { map: MapboxMapInstance; onRender: () => void } | null = null
+
+  constructor(specs: ReadonlyMap<string, GatedLayerSpec>) {
+    this.specs = specs
+  }
+
+  /** Follow the Graphics > Shadows setting. Returns the unmount cleanup. */
+  attach(map: MapboxMapInstance): () => void {
+    const sync = () => this.setShadows(map, useGraphicsSettings.getState().shadows)
+    sync()
+    const unsubscribe = useGraphicsSettings.subscribe(sync)
+    return () => {
+      unsubscribe()
+      this.disarm()
+    }
+  }
+
+  /** The source was (re)created empty, so none of its old tiles are on screen. */
+  resetSource(sourceId: string): void {
+    this.features.delete(sourceId)
+    for (const [layerId, layer] of this.layers) {
+      if (layer.spec.sourceId !== sourceId) continue
+      this.matched.delete(layerId)
+      this.held.delete(layerId)
+      this.pin(layerId, layer)
+    }
+  }
+
+  /** Gate `layerId` on `test`, a JS mirror of the filter just set on it. */
+  register(map: MapboxMapInstance, layerId: string, test: LayerFeaturePredicate): void {
+    const spec = this.specs.get(layerId)
+    if (!spec) {
+      registerLayerFeaturePredicate(map, layerId, test)
+      return
+    }
+    let layer = this.layers.get(layerId)
+    if (!layer) {
+      const state: GatedLayerState = {
+        spec,
+        test,
+        pinned: false,
+        predicate: (f) => state.pinned || state.test(f),
+      }
+      layer = state
+      this.layers.set(layerId, layer)
+    }
+    layer.test = test
+    this.track(layerId, layer)
+    registerLayerFeaturePredicate(map, layerId, layer.predicate)
+    this.arm(map)
+  }
+
+  /** Call right BEFORE `setData(fc)` on a gated source: the gate re-counts inside it. */
+  push(map: MapboxMapInstance, sourceId: string, fc: { features: ReadonlyArray<unknown> }): void {
+    this.features.set(sourceId, fc.features as ReadonlyArray<GateFeature>)
+    for (const [layerId, layer] of this.layers) {
+      if (layer.spec.sourceId === sourceId) this.track(layerId, layer)
+    }
+    this.arm(map)
+  }
+
+  /** A layer that matched before but not now may still be drawing the old tiles: hold it. */
+  private track(layerId: string, layer: GatedLayerState): void {
+    if (this.matches(layer)) this.matched.add(layerId)
+    else if (this.matched.delete(layerId)) this.held.add(layerId)
+    this.pin(layerId, layer)
+  }
+
+  private matches(layer: GatedLayerState): boolean {
+    const features = this.features.get(layer.spec.sourceId)
+    if (!features) return false
+    try {
+      return features.some((f) => layer.test(f))
+    } catch {
+      return true
+    }
+  }
+
+  private pin(layerId: string, layer: GatedLayerState): void {
+    layer.pinned = this.held.has(layerId) || (layer.spec.castsShadows && this.shadows)
+  }
+
+  private setShadows(map: MapboxMapInstance, on: boolean): void {
+    if (on === this.shadows) return
+    this.shadows = on
+    for (const [layerId, layer] of this.layers) {
+      if (!layer.spec.castsShadows) continue
+      this.pin(layerId, layer)
+      if (map.getLayer(layerId)) registerLayerFeaturePredicate(map, layerId, layer.predicate)
+    }
+  }
+
+  /**
+   * Release held layers on the first `render` in which their source is
+   * loaded. `render` fires after `style.update` has started any pending
+   * reload, so "loaded" there means the tiles on screen were built from
+   * the latest `setData` / filter.
+   */
+  private arm(map: MapboxMapInstance): void {
+    if (this.held.size === 0 || this.armed?.map === map) return
+    this.disarm()
+    const onRender = () => {
+      for (const layerId of [...this.held]) {
+        const layer = this.layers.get(layerId)
+        if (layer && !gatedSourceSettled(map, layer.spec.sourceId)) continue
+        this.held.delete(layerId)
+        if (!layer) continue
+        this.pin(layerId, layer)
+        if (map.getLayer(layerId)) registerLayerFeaturePredicate(map, layerId, layer.predicate)
+      }
+      if (this.held.size === 0) this.disarm()
+    }
+    map.on('render', onRender)
+    this.armed = { map, onRender }
+  }
+
+  private disarm(): void {
+    if (!this.armed) return
+    this.armed.map.off('render', this.armed.onRender)
+    this.armed = null
+  }
+}
+
+/** True once `sourceId`'s tiles reflect its latest data and filters (or the source is gone). */
+function gatedSourceSettled(map: MapboxMapInstance, sourceId: string): boolean {
+  try {
+    return !map.getSource(sourceId) || map.isSourceLoaded(sourceId)
+  } catch {
+    return true
+  }
+}
+
+// ---- Focus mode: stable derived collections --------------------------------
+
+/** base collection → its last focus-derived copy (see stableDerivedCollection). */
+const lastDerived = new WeakMap<object, { features: ReadonlyArray<unknown> }>()
+
+function sameItems(a: ReadonlyArray<unknown>, b: ReadonlyArray<unknown>): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+/**
+ * `next`, a copy-on-write derivative of `base` (a focus fade or tier stamp
+ * from `@/lib/focus/focus-fade`), or the previous derivative of the same
+ * `base` when it holds the very same feature objects. The fade helpers
+ * cache each faded feature, but always return a NEW collection object when
+ * anything is faded. So a focus change that leaves this overlay's fades as
+ * they were (a NEAR column that differs only in other kinds, a data-link
+ * anchor arriving, a camera settle that only changed other kinds'
+ * blockers) would otherwise
+ * re-push the whole source. Returning the earlier object keeps the push
+ * effect's dependency unchanged. `next === base` (nothing faded) passes
+ * straight through.
+ */
+export function stableDerivedCollection<T extends { features: ReadonlyArray<unknown> }>(base: T, next: T): T {
+  if (next === base) return base
+  const prev = lastDerived.get(base) as T | undefined
+  if (prev && sameItems(prev.features, next.features)) return prev
+  lastDerived.set(base, next)
+  return next
+}
+
+/** `line:<id>` / `line:<id>#cut` (a leaning-wall mesh key) → id. */
+function lineIdOfMeshKey(key: string): number | undefined {
+  if (!key.startsWith('line:')) return undefined
+  const hash = key.indexOf('#')
+  const id = Number(key.slice(5, hash < 0 ? undefined : hash))
+  return Number.isInteger(id) ? id : undefined
+}
+
+/** Every layer this overlay gates with a predicate. */
+const LINE_GATED_LAYERS: ReadonlyMap<string, GatedLayerSpec> = new Map<string, GatedLayerSpec>([
+  // The 0% bucket doesn't cast (see its paint); every other bucket does.
+  ...OPACITY_BUCKETS.map((b) => [wallLayerId(b), { sourceId: WALL_SOURCE, castsShadows: b > 0 }] as const),
+  [WALL_BORDER_LAYER, { sourceId: WALL_BORDER_SOURCE, castsShadows: false }],
+  // fill-extrusion without an explicit cast-shadows: the spec default, true.
+  [SELECTION_TINT_LAYER, { sourceId: WALL_SOURCE, castsShadows: true }],
+  [SELECTION_LAYER, { sourceId: LINE_SOURCE, castsShadows: false }],
+])
+
 /**
  * Polyline rendering — line stroke, optional 3D wall via buffered
  * polygon extrusion, selection halo with z-offset, label at
@@ -161,7 +478,6 @@ export function MapLineOverlay({
   shapeStyleOverrides = null,
   attachedDoorsByLineId = null,
   liveSnap = null,
-  liveUnit,
 }: MapLineOverlayProps) {
   const [styleLoaded, setStyleLoaded] = useState(false)
   // `styleGen` increments on each style.load — see matching note in
@@ -236,6 +552,139 @@ export function MapLineOverlay({
     () => buildLineWallCollection(lines ?? [], shapeStyleOverrides, attachedDoorsByLineId),
     [lines, shapeStyleOverrides, attachedDoorsByLineId]
   )
+
+  const wallBorderFc = useMemo(() => buildLineWallBorderCollection(wallFc), [wallFc])
+
+  // ---- Focus mode (src/lib/focus) ----------------------------------------
+  // While an item is focused, only two kinds of line fade: the walls
+  // between the camera and the item (blockers, FOCUS_FACTOR.ghost) and the
+  // ones right next to it (the NEAR column, FOCUS_FACTOR.near). Every other
+  // line keeps its feature objects. `fill-extrusion-opacity` is a per-layer
+  // constant, so a faded wall MOVES to a lower bucket layer: a
+  // copy-on-write post-pass re-stamps `opacity` / `opacityBucket` (the
+  // stroke, casing and wall-roof outline read `opacity` directly). Kept out
+  // of the `fc` / `wallFc` memos, which run a turf buffer and the door
+  // cutouts per wall, so a blocker change at camera settle never rebuilds
+  // them. With nothing focused the memos below hand back `fc` / `wallFc` /
+  // `labelData` themselves, so no push re-runs. Selection, exclusion and
+  // transform logic stay on the originals.
+  //
+  // Local cut-away (focus-cutaway.ts): a near / blocker line much bigger
+  // than its region (a long wall, the stadium canopy) fades only inside it
+  // — the item column, plus the discs where the line of sight pierces a
+  // blocker. A wall polygon splits into an 'in' and an 'out' feature, a
+  // stroke at the region boundary; both keep the line's `lineId` and
+  // feature id, so clicks / selection (by `lineId`) still find it. The
+  // short cross edge WALL_BORDER draws at a cut is accepted.
+  // DOOR CHOICE: `wallFc` is already punched by the attached doors'
+  // opening footprints, and the split runs on that punched polygon, so a
+  // door opening stays exact on both pieces; lintels are door-overlay
+  // features and are unaffected. A leaning wall (meshed hit target) is
+  // never split into pieces: its built MESH is split per triangle instead
+  // (`meshCutAway`), so its lean — closed loop and 'in' side included — is
+  // untouched.
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  // Same Set / Map while the line blockers and their pierce discs are
+  // unchanged: other kinds' blocker changes don't re-push these sources.
+  const lineBlockers = blockerIdsOf(focusBlockers, 'lines')
+  const linePierce = blockerPierceOf(focusBlockers, 'lines')
+  /** Fade factor / cut region by line id, or null while nothing is focused. */
+  const lineFocus = useMemo(() => {
+    if (!focusScene.active) return null
+    return {
+      factorOf: (id: number | undefined): number =>
+        id === undefined ? 1 : focusFactor(focusScene, focusBlockers, 'lines', id),
+      regionOf: (id: number | undefined) =>
+        id === undefined ? null : focusCutRegion(focusScene, focusBlockers, 'lines', id),
+    }
+    // `focusBlockers` is read only through its line set and pierce map.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusScene, lineBlockers, linePierce])
+  const fadedFc = useMemo<
+    GeoJSON.FeatureCollection<GeoJSON.LineString | GeoJSON.MultiLineString, LineProps & { focusPiece?: FocusPiece }>
+  >(
+    () =>
+      lineFocus
+        ? stableDerivedCollection(
+            fc as GeoJSON.FeatureCollection<GeoJSON.LineString | GeoJSON.MultiLineString, LineProps & { focusPiece?: FocusPiece }>,
+            focusFadeLineCollection(
+              fc,
+              (f) => lineFocus.factorOf(f.properties.lineId),
+              (f) => lineFocus.regionOf(f.properties.lineId),
+            ),
+          )
+        : fc,
+    [fc, lineFocus],
+  )
+  // The roof outline fades with its walls, per stretch (each carries the
+  // `lineId` of the wall it runs along).
+  const fadedWallBorderFc = useMemo<
+    GeoJSON.FeatureCollection<GeoJSON.LineString | GeoJSON.MultiLineString, LineProps & { focusPiece?: FocusPiece }>
+  >(
+    () =>
+      lineFocus
+        ? stableDerivedCollection(
+            wallBorderFc as GeoJSON.FeatureCollection<GeoJSON.LineString | GeoJSON.MultiLineString, LineProps & { focusPiece?: FocusPiece }>,
+            focusFadeLineCollection(
+              wallBorderFc,
+              (f) => lineFocus.factorOf(f.properties.lineId),
+              (f) => lineFocus.regionOf(f.properties.lineId),
+            ),
+          )
+        : wallBorderFc,
+    [wallBorderFc, lineFocus],
+  )
+  const fadedWallFc = useMemo<
+    GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, LineProps & { focusPiece?: FocusPiece }>
+  >(
+    () =>
+      lineFocus
+        ? stableDerivedCollection(
+            wallFc as GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, LineProps & { focusPiece?: FocusPiece }>,
+            focusFadeCollection(
+              wallFc,
+              (f) => lineFocus.factorOf(f.properties.lineId),
+              (f) => lineFocus.regionOf(f.properties.lineId),
+            ),
+          )
+        : wallFc,
+    [wallFc, lineFocus],
+  )
+
+  // Leaning walls (sloped-mesh.ts). The one being moved / rotated shows as
+  // its in-flight extrusion until it's dropped. Built from `wallFc`
+  // (focus-independent), so leaving focus hands back the very same array.
+  // While focused they're built from `fadedWallFc` (a whole-faded leaning
+  // wall carries its faded `opacity` → translucent mesh layer), then
+  // `meshCutAway` splits a big near / blocker wall per triangle (inside:
+  // `line:<id>#cut` at the tier's alpha).
+  const baseWallMeshes = useMemo(
+    () =>
+      leaningWallMeshes(lines ?? [], wallFc.features, rotateLine, {
+        selectedIds: selectedLineIds,
+        tint: primaryHex,
+        skipId: transformState?.lineId ?? null,
+      }),
+    [lines, wallFc, selectedLineIds, primaryHex, transformState],
+  )
+  const wallMeshes = useMemo(() => {
+    if (!lineFocus) return baseWallMeshes
+    const built =
+      fadedWallFc === wallFc
+        ? baseWallMeshes
+        : leaningWallMeshes(lines ?? [], fadedWallFc.features, rotateLine, {
+            selectedIds: selectedLineIds,
+            tint: primaryHex,
+            skipId: transformState?.lineId ?? null,
+          })
+    return meshCutAway(
+      built,
+      (key) => lineFocus.regionOf(lineIdOfMeshKey(key)),
+      (key) => lineFocus.factorOf(lineIdOfMeshKey(key)),
+    )
+  }, [baseWallMeshes, lineFocus, fadedWallFc, wallFc, lines, selectedLineIds, primaryHex, transformState])
+  useShapeMeshLayers(map, styleLoaded, styleGen, 'line', wallMeshes, committedVisible)
 
   // Chain layer feeds two paint passes: a dashed line for the edges
   // and a symbol layer at each committed vertex. The chain LineString
@@ -403,9 +852,58 @@ export function MapLineOverlay({
     return { type: 'FeatureCollection', features }
   }, [lines])
 
+  // Focus mode: a faded line's label fades with it (FOCUS_FADE_PROP feeds
+  // LABEL_LAYER's `text-opacity`). A line drawn cut away (a split stroke,
+  // wall or mesh) fades its label only when the label's anchor lies in the
+  // cut region. `labelData` itself while nothing is focused.
+  const fadedLabelData = useMemo(() => {
+    if (!labelData || !lineFocus) return labelData
+    const cut = new Set<number>()
+    for (const f of fadedFc.features) {
+      if (f.properties.focusPiece && f.properties.lineId !== undefined) cut.add(f.properties.lineId)
+    }
+    for (const f of fadedWallFc.features) {
+      if (f.properties.focusPiece && f.properties.lineId !== undefined) cut.add(f.properties.lineId)
+    }
+    for (const m of wallMeshes) {
+      if (!m.key.endsWith('#cut')) continue
+      const id = lineIdOfMeshKey(m.key)
+      if (id !== undefined) cut.add(id)
+    }
+    return stableDerivedCollection(
+      labelData,
+      patchFeatureCollection(
+        labelData,
+        (f) => {
+          const id = f.properties.lineId
+          const factor = lineFocus.factorOf(id)
+          if (factor === 1) return null
+          if (id !== undefined && cut.has(id)) {
+            const region = lineFocus.regionOf(id)
+            const [lng, lat] = f.geometry.coordinates
+            if (!region || !cutRegionContains(region, lng, lat)) return null
+          }
+          return String(factor)
+        },
+        (props, tag) => ({ ...props, [FOCUS_FADE_PROP]: Number(tag) }),
+      ),
+    )
+  }, [labelData, lineFocus, fadedFc, fadedWallFc, wallMeshes])
+
+  // ---- Empty-layer gate --------------------------------------------------
+  // Every gate predicate goes through this hold (GatedLayerHold): a layer
+  // whose filter stops matching stays visible until its source re-tiles,
+  // and shadow casters keep the source-count rule while shadows are on.
+  const gateHoldRef = useRef(new GatedLayerHold(LINE_GATED_LAYERS))
+  useEffect(() => {
+    if (!map) return
+    return gateHoldRef.current.attach(map)
+  }, [map])
+
   // ---- Layer setup -------------------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
     try {
       if (!map.getSource(LINE_SOURCE)) {
         // `lineMetrics: true` — silences the "line-progress evaluation
@@ -417,12 +915,21 @@ export function MapLineOverlay({
           data: { type: 'FeatureCollection', features: [] },
           lineMetrics: true,
         })
+        gateHold.resetSource(LINE_SOURCE)
       }
       if (!map.getSource(WALL_SOURCE)) {
         map.addSource(WALL_SOURCE, {
           type: 'geojson',
           data: { type: 'FeatureCollection', features: [] },
         })
+        gateHold.resetSource(WALL_SOURCE)
+      }
+      if (!map.getSource(WALL_BORDER_SOURCE)) {
+        map.addSource(WALL_BORDER_SOURCE, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        })
+        gateHold.resetSource(WALL_BORDER_SOURCE)
       }
       if (!map.getSource(LABEL_SOURCE)) {
         map.addSource(LABEL_SOURCE, {
@@ -493,7 +1000,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.018,
             ],
           },
@@ -545,7 +1052,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.02,
             ],
           },
@@ -600,6 +1107,7 @@ export function MapLineOverlay({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any
         map.addLayer(tintLayerDef)
+        gateHold.register(map, SELECTION_TINT_LAYER, lineSelectionSentinelPredicate)
       }
       // Selection halo. Sits 0.5 cm above the regular stroke so the
       // outline lands cleanly on top of it without z-fighting.
@@ -617,7 +1125,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.025,
             ],
           },
@@ -629,6 +1137,7 @@ export function MapLineOverlay({
             'line-emissive-strength': 1,
           },
         })
+        gateHold.register(map, SELECTION_LAYER, lineSelectionSentinelPredicate)
       }
 
       // 3D wall — buffered polygon extruded. Only renders when at least
@@ -671,31 +1180,36 @@ export function MapLineOverlay({
               // A 5 cm wall placed on top of an elevated floor plan
               // would otherwise render as a shadow blob at low zoom.
               'fill-extrusion-vertical-gradient': false,
+              // The 0% bucket is invisible (incl. leaning walls' hit
+              // targets) — it must not cast a box-shaped shadow.
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              ['fill-extrusion-cast-shadows' as any]: true,
+              ['fill-extrusion-cast-shadows' as any]: bucket > 0,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               ['fill-extrusion-ambient-occlusion-intensity' as any]: 0.35,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               ['fill-extrusion-ambient-occlusion-radius' as any]: 2.5,
             },
           })
+          gateHold.register(map, layerId, lineWallBucketPredicate(bucket))
         } catch (err) {
           console.warn('[MapLineOverlay] failed to add wall bucket', bucket, err)
         }
       }
 
-      // 3D wall border — traces the roof of the extruded wall polygon
-      // so a shape with borderWidth > 0 gets a visible box outline
-      // (mirrors the polygon/rack border pattern). Sits 1 cm above the
-      // wall roof so it doesn't z-fight the fill-extrusion. Renders
-      // nothing when WALL_SOURCE is empty (i.e. all lines are flat).
+      // 3D wall border — traces the roof of the walls so a shape with
+      // borderWidth > 0 gets a visible outline (mirrors the polygon/rack
+      // border pattern). Sits 1 cm above the wall roof so it doesn't
+      // z-fight the fill-extrusion. A stretch ends where the next wall's
+      // side takes over, usually at a corner: square caps close that
+      // corner (a closed ring has no caps).
       if (!map.getLayer(WALL_BORDER_LAYER)) {
         map.addLayer({
           id: WALL_BORDER_LAYER,
           type: 'line',
-          source: WALL_SOURCE,
+          source: WALL_BORDER_SOURCE,
+          filter: NOT_MESHED,
           layout: {
-            'line-cap': 'butt',
+            'line-cap': 'square',
             'line-join': 'miter',
             'line-elevation-reference': 'sea',
             'line-z-offset': [
@@ -712,6 +1226,7 @@ export function MapLineOverlay({
             'line-emissive-strength': 1,
           },
         })
+        gateHold.register(map, WALL_BORDER_LAYER, lineWallBorderPredicate())
       }
 
       // Labels — placed at an absolute altitude via `symbol-z-offset`.
@@ -735,6 +1250,8 @@ export function MapLineOverlay({
           'text-halo-color': '#ffffff',
           'text-halo-width': 1.2,
           'text-emissive-strength': 1,
+          // Focus mode: 1 (the default) unless the line is faded.
+          'text-opacity': ['coalesce', ['get', FOCUS_FADE_PROP], 1],
           'symbol-z-offset': [
             '+',
             ['coalesce', ['get', 'elevation'], 0],
@@ -851,7 +1368,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.018,
             ],
           },
@@ -885,7 +1402,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.02,
             ],
           },
@@ -950,7 +1467,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.025,
             ],
           },
@@ -1014,7 +1531,7 @@ export function MapLineOverlay({
             'line-z-offset': [
               '+',
               ['coalesce', ['get', 'elevation'], 0],
-              ['coalesce', ['get', 'height'], 0],
+              ROOF_HEIGHT,
               0.02,
             ],
           },
@@ -1232,6 +1749,7 @@ export function MapLineOverlay({
       for (const id of [
         LINE_SOURCE,
         WALL_SOURCE,
+        WALL_BORDER_SOURCE,
         LABEL_SOURCE,
         CHAIN_SOURCE,
         TRANSFORM_SOURCE,
@@ -1253,20 +1771,51 @@ export function MapLineOverlay({
 
   // ---- Push committed data -----------------------------------------------
   // Split from live-draw so a mousemove during draw/transform doesn't
-  // re-run turf.buffer on every committed wall.
+  // re-run turf.buffer on every committed wall. One effect per source, fed
+  // the focus-faded collections (which ARE `fc` / `wallFc` / `labelData`
+  // while nothing is focused): a fade change pushes only the sources whose
+  // features it changed, and a style-rule tick no longer re-pushes the
+  // unchanged labels.
+  // gateHold.push before each gated source's setData: a layer the new
+  // data empties (a wall's last bucket mate re-bucketed, or a focus fade
+  // moving it to a lower bucket) is held visible until the source
+  // re-tiles, so the wall never drops out between them.
   useEffect(() => {
     if (!map || !styleLoaded) return
     const lineSrc = map.getSource(LINE_SOURCE) as GeoJSONSource | undefined
-    if (lineSrc) lineSrc.setData(fc as GeoJSON.FeatureCollection)
+    if (lineSrc) {
+      gateHoldRef.current.push(map, LINE_SOURCE, fadedFc)
+      lineSrc.setData(fadedFc as GeoJSON.FeatureCollection)
+    }
+  }, [map, styleLoaded, styleGen, fadedFc])
+
+  useEffect(() => {
+    if (!map || !styleLoaded) return
     const wallSrc = map.getSource(WALL_SOURCE) as GeoJSONSource | undefined
-    if (wallSrc) wallSrc.setData(wallFc as GeoJSON.FeatureCollection)
+    if (wallSrc) {
+      gateHoldRef.current.push(map, WALL_SOURCE, fadedWallFc)
+      wallSrc.setData(fadedWallFc as GeoJSON.FeatureCollection)
+    }
+  }, [map, styleLoaded, styleGen, fadedWallFc])
+
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const borderSrc = map.getSource(WALL_BORDER_SOURCE) as GeoJSONSource | undefined
+    if (borderSrc) {
+      gateHoldRef.current.push(map, WALL_BORDER_SOURCE, fadedWallBorderFc)
+      borderSrc.setData(fadedWallBorderFc as GeoJSON.FeatureCollection)
+    }
+  }, [map, styleLoaded, styleGen, fadedWallBorderFc])
+
+  useEffect(() => {
+    if (!map || !styleLoaded) return
     const labelSrc = map.getSource(LABEL_SOURCE) as GeoJSONSource | undefined
     if (labelSrc) {
       labelSrc.setData(
-        labelData ?? { type: 'FeatureCollection', features: [] }
+        fadedLabelData ?? { type: 'FeatureCollection', features: [] }
       )
     }
-  }, [map, styleLoaded, styleGen, fc, wallFc, labelData])
+  }, [map, styleLoaded, styleGen, fadedLabelData])
 
   // ---- Push live-draw data -----------------------------------------------
   useEffect(() => {
@@ -1306,14 +1855,21 @@ export function MapLineOverlay({
       ? ['all', idFilter, ['!=', ['get', 'lineId'], excludeId]]
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       : (idFilter as unknown as any)
+    // The gate predicates are swapped in the same synchronous pass as the
+    // filters, so a new selection's halo shows from the very next frame; a
+    // cleared one is held until LINE_SOURCE / WALL_SOURCE re-tile, the
+    // moment its halo leaves the screen anyway (GatedLayerHold).
     try {
       if (map.getLayer(SELECTION_LAYER)) {
         map.setFilter(SELECTION_LAYER, filter)
+        gateHoldRef.current.register(map, SELECTION_LAYER, lineSelectionPredicate(ids, excludeId))
       }
     } catch { /* ignore */ }
     try {
       if (map.getLayer(SELECTION_TINT_LAYER)) {
-        map.setFilter(SELECTION_TINT_LAYER, filter)
+        // A leaning wall shows its selection on the mesh instead.
+        map.setFilter(SELECTION_TINT_LAYER, ['all', filter, NOT_MESHED])
+        gateHoldRef.current.register(map, SELECTION_TINT_LAYER, lineSelectionTintPredicate(ids, excludeId))
       }
     } catch { /* ignore */ }
   }, [map, styleLoaded, styleGen, selectedLineIds, transformState])
@@ -1323,6 +1879,9 @@ export function MapLineOverlay({
   // LINE_LAYER / WALL_LAYER_op* / LABEL_LAYER so it doesn't render twice
   // (once at its stale committed geometry, once on the in-flight source
   // at its live drag position). Cleared when no transform is active.
+  // A bucket / border layer the exclusion empties (the moving wall was its
+  // only member) is held visible by GatedLayerHold until WALL_SOURCE
+  // re-tiles, so the committed copy leaves on the same frame as before.
   useEffect(() => {
     if (!map || !styleLoaded) return
     const excludeId = transformState?.lineId
@@ -1339,9 +1898,12 @@ export function MapLineOverlay({
       if (map.getLayer(LINE_BORDER_LAYER)) map.setFilter(LINE_BORDER_LAYER, exclusion)
     } catch { /* ignore */ }
     try {
-      // Wall polygon border shares WALL_SOURCE with the extrusions; hide
-      // the transforming line's outline the same way the buckets do.
-      if (map.getLayer(WALL_BORDER_LAYER)) map.setFilter(WALL_BORDER_LAYER, exclusion)
+      // Hide the transforming line's stretches of the roof outline the
+      // same way the buckets hide its extrusion.
+      if (map.getLayer(WALL_BORDER_LAYER)) {
+        map.setFilter(WALL_BORDER_LAYER, exclusion ? ['all', exclusion, NOT_MESHED] : NOT_MESHED)
+        gateHoldRef.current.register(map, WALL_BORDER_LAYER, lineWallBorderPredicate(excludeId))
+      }
     } catch { /* ignore */ }
     try {
       if (map.getLayer(LABEL_LAYER)) map.setFilter(LABEL_LAYER, exclusion)
@@ -1356,6 +1918,7 @@ export function MapLineOverlay({
           ? ['all', bucketFilter, ['!=', ['get', 'lineId'], excludeId]]
           : bucketFilter
         map.setFilter(layerId, merged)
+        gateHoldRef.current.register(map, layerId, lineWallBucketPredicate(bucket, excludeId))
       } catch { /* ignore */ }
     }
   }, [map, styleLoaded, styleGen, transformState])
@@ -1885,140 +2448,7 @@ export function MapLineOverlay({
     }
   }, [map, styleLoaded, styleGen, transformState])
 
-  // ---- Live-draw measurement HUD -----------------------------------------
-  // A DOM element positioned via `map.project` that follows the cursor
-  // while the user is placing a wall. Shows current segment length,
-  // total chain length, and the active snap type. Repositions on
-  // Mapbox's `render` event (native paint speed) rather than per
-  // React setState, so pan/zoom don't lag.
-  return (
-    <LineDrawHUD
-      map={map}
-      vertices={liveVertices ?? []}
-      cursor={liveSnap?.position ?? liveCursor ?? null}
-      snap={liveSnap}
-      unit={liveUnit}
-    />
-  )
-}
-
-/**
- * Floating measurement HUD — mounted into the map container via a
- * React portal so it inherits the map's stacking context. Runs its
- * position update off Mapbox's `render` event which fires once per
- * paint — cheap, and coalesced through a single `requestAnimationFrame`
- * per frame regardless of how many events Mapbox emits.
- */
-function LineDrawHUD({
-  map,
-  vertices,
-  cursor,
-  snap,
-  unit,
-}: {
-  map: MapboxMapInstance | null
-  vertices: ReadonlyArray<[number, number]>
-  cursor: [number, number] | null
-  snap: LineSnap | null
-  unit: LengthUnit | undefined
-}) {
-  const hudRef = useRef<HTMLDivElement | null>(null)
-
-  const lengths = useMemo(() => {
-    if (vertices.length === 0) return null
-    const segment = inFlightSegmentMeters(vertices as [number, number][], cursor)
-    const total = chainLengthMeters(vertices as [number, number][]) + segment
-    return { segment, total }
-  }, [vertices, cursor])
-
-  useEffect(() => {
-    if (!map || !cursor) return
-    let raf = 0
-    const reposition = () => {
-      raf = 0
-      const el = hudRef.current
-      if (!el) return
-      const pt = map.project(cursor as [number, number])
-      // Offset up + right of the cursor so the HUD never covers the
-      // pixel being clicked and stays clear of the vertex dot.
-      el.style.transform = `translate(${Math.round(pt.x + 16)}px, ${Math.round(pt.y - 44)}px)`
-    }
-    reposition()
-    const onRender = () => {
-      if (raf === 0) raf = requestAnimationFrame(reposition)
-    }
-    map.on('render', onRender)
-    return () => {
-      map.off('render', onRender)
-      if (raf) cancelAnimationFrame(raf)
-    }
-  }, [map, cursor])
-
-  if (!map || !cursor || !lengths) return null
-
-  const snapKind = snap?.kind ?? 'none'
-  const snapLabel =
-    snapKind === 'endpoint' ? '⇢ CONNECT'
-      : snapKind === 'axis-horizontal' ? '↔ H-AXIS'
-        : snapKind === 'axis-vertical' ? '↕ V-AXIS'
-          : ''
-  const snapColor =
-    snapKind === 'none' ? '#fbbf24' : '#22c55e'
-
-  const activeUnit: LengthUnit = unit ?? 'm'
-
-  return ReactDOMCreatePortal(
-    <div
-      ref={hudRef}
-      className="sgv-line-hud"
-      style={{
-        position: 'absolute',
-        left: 0,
-        top: 0,
-        transform: 'translate(-9999px, -9999px)',
-        pointerEvents: 'none',
-        zIndex: 5,
-        padding: '6px 10px',
-        borderRadius: 8,
-        background: 'rgba(20, 20, 24, 0.86)',
-        color: '#f8fafc',
-        border: `1px solid ${snapColor}`,
-        fontSize: 12,
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        boxShadow: '0 4px 12px rgba(0,0,0,0.35)',
-        display: 'grid',
-        gap: 2,
-        minWidth: 120,
-        whiteSpace: 'nowrap',
-        userSelect: 'none',
-      }}
-    >
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-        <span style={{ color: '#94a3b8' }}>segment</span>
-        <span style={{ fontWeight: 600 }}>{formatLength(lengths.segment, activeUnit)}</span>
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-        <span style={{ color: '#94a3b8' }}>total</span>
-        <span style={{ fontWeight: 600 }}>{formatLength(lengths.total, activeUnit)}</span>
-      </div>
-      {snapLabel && (
-        <div
-          style={{
-            marginTop: 2,
-            padding: '2px 6px',
-            borderRadius: 4,
-            background: snapColor,
-            color: '#0f172a',
-            fontWeight: 700,
-            fontSize: 10,
-            letterSpacing: 0.5,
-            textAlign: 'center',
-          }}
-        >
-          {snapLabel}
-        </div>
-      )}
-    </div>,
-    map.getContainer(),
-  )
+  // The live-draw measurement readout (segment, total, angle, typed
+  // length) is drawn by `MapMeasureOverlay` for every vertex tool.
+  return null
 }

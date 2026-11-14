@@ -73,7 +73,7 @@ export function TableExternalSourcePanel({
   fields?: FieldDefinitionResponse[]
 }) {
   const { t, i18n } = useTranslation()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('data.manage')
   const [reloadToken, setReloadToken] = useState(0)
   const [loaded, setLoaded] = useState<{ key: string; cfg: ExternalSourceConfig; error: unknown } | null>(null)
   const [cfg, setCfg] = useState<ExternalSourceConfig>(EMPTY)

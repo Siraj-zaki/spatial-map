@@ -106,7 +106,7 @@ type Querier interface {
 	CreateDataLinkConfig(ctx context.Context, arg CreateDataLinkConfigParams) (DataLinkConfig, error)
 	// Column order below matches the auto-generated `db.DataSource` model
 	// struct so sqlc reuses that type for every RETURNING/SELECT (see the
-	// AGENTS.md note on column ordering).
+	// CLAUDE.md note on column ordering).
 	CreateDataSource(ctx context.Context, arg CreateDataSourceParams) (DataSource, error)
 	CreateDoor(ctx context.Context, arg CreateDoorParams) (Door, error)
 	CreateEntityReference(ctx context.Context, arg CreateEntityReferenceParams) (EntityReference, error)
@@ -148,6 +148,9 @@ type Querier interface {
 	// status is 'error' if any child errored, 'ok' otherwise. The header
 	// carries the full spec snapshot + resolved params applied.
 	CreateReportRunHeader(ctx context.Context, arg CreateReportRunHeaderParams) (ReportRun, error)
+	// A public link to one report. zone_id is the report's facility (NULL for
+	// a workspace-wide report) — kept for the audit trail and the cascade.
+	CreateReportShareLink(ctx context.Context, arg CreateReportShareLinkParams) (ShareLink, error)
 	CreateRoute(ctx context.Context, arg CreateRouteParams) (Route, error)
 	CreateShareLink(ctx context.Context, arg CreateShareLinkParams) (ShareLink, error)
 	CreateSolution(ctx context.Context, arg CreateSolutionParams) (Solution, error)
@@ -245,6 +248,10 @@ type Querier interface {
 	DeleteUserModel(ctx context.Context, arg DeleteUserModelParams) error
 	DeleteUserModelsByIDs(ctx context.Context, arg DeleteUserModelsByIDsParams) error
 	DeleteWebhookEventsForStream(ctx context.Context, arg DeleteWebhookEventsForStreamParams) error
+	// The facility's generated reports (the facility set and the data-link
+	// reports, `spec.origin.kind`) go with it, in the same statement. Left to the
+	// FK they'd become zone-less "Shared" reports, listed under every facility as
+	// duplicate Overview / Floors / … Reports a user made keep ON DELETE SET NULL.
 	DeleteZone(ctx context.Context, arg DeleteZoneParams) error
 	DrainWebhookEvents(ctx context.Context, arg DrainWebhookEventsParams) ([]DrainWebhookEventsRow, error)
 	// Idempotent: one row per workspace per entity key. A soft-deleted
@@ -282,6 +289,15 @@ type Querier interface {
 	GetPolygon(ctx context.Context, arg GetPolygonParams) (Polygon, error)
 	GetReport(ctx context.Context, arg GetReportParams) (Report, error)
 	GetReportRun(ctx context.Context, arg GetReportRunParams) (ReportRun, error)
+	// Public read for /public/report-share/{token}. Same gates as
+	// GetShareLinkByToken (revoked, expired, view cap → no rows → 404), and
+	// only report links answer.
+	GetReportShareLinkByToken(ctx context.Context, token string) (ShareLink, error)
+	// The data calls a shared report page makes after it opened (run, map
+	// rows, history). The view cap counts page opens, so the open that used
+	// the last view keeps working (view_count <= max_views); revoking or
+	// expiry stop it at once.
+	GetReportShareLinkForData(ctx context.Context, token string) (ShareLink, error)
 	GetRoute(ctx context.Context, arg GetRouteParams) (Route, error)
 	// Tenant-scoped read for the editor UI. Returns even revoked rows so the
 	// dashboard's Manage-Links table can render a "Revoked" badge and expose
@@ -297,6 +313,10 @@ type Querier interface {
 	// 403 — so an attacker can't distinguish an expired link from a fake
 	// one.
 	GetShareLinkByToken(ctx context.Context, token string) (ShareLink, error)
+	// The data calls a shared facility page makes after it opened (layer
+	// rows, history, live positions) — like GetReportShareLinkForData: the
+	// open that used the last view keeps working.
+	GetShareLinkForData(ctx context.Context, token string) (ShareLink, error)
 	GetSolution(ctx context.Context, arg GetSolutionParams) (Solution, error)
 	GetSourceFileBySource(ctx context.Context, arg GetSourceFileBySourceParams) (SourceFile, error)
 	GetStair(ctx context.Context, arg GetStairParams) (Stair, error)
@@ -409,8 +429,9 @@ type Querier interface {
 	ListDataLinkConfigsBySource(ctx context.Context, sourceID pgtype.Int8) ([]DataLinkConfig, error)
 	ListDataLinkConfigsByStream(ctx context.Context, streamID pgtype.Int8) ([]DataLinkConfig, error)
 	ListDataLinkConfigsByZone(ctx context.Context, zoneID int64) ([]DataLinkConfig, error)
-	// Windowed lookup for the recap / heatmap path. `since_ts` is the lower
-	// bound; pass e.g. `now() - interval '24 hours'` from the handler.
+	// Windowed lookup for the history player / heatmap: every event with
+	// since <= ts <= until, oldest first. A "last 24 h" window passes
+	// until = now(); a custom range passes both ends.
 	ListDataSourceRowEventsBySource(ctx context.Context, arg ListDataSourceRowEventsBySourceParams) ([]DataSourceRowEvent, error)
 	// Per-entity trail — the per-row history view the user opens from the
 	// map popup to see one item's life cycle.
@@ -553,6 +574,9 @@ type Querier interface {
 	ListRoutes(ctx context.Context, tenantID int64) ([]Route, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	ListRoutesByZone(ctx context.Context, zoneID pgtype.Int8) ([]Route, error)
+	// The report's Share dialog: every link issued for it, newest first,
+	// revoked ones included (shown greyed out).
+	ListShareLinksByReport(ctx context.Context, arg ListShareLinksByReportParams) ([]ShareLink, error)
 	// Tenant-scoped listing for the editor's "Manage share links" panel.
 	// Ordered newest-first so the most recently issued link is on top.
 	// Revoked rows are included and shown greyed-out in the UI so users
@@ -594,6 +618,9 @@ type Querier interface {
 	ListTextLabels(ctx context.Context, tenantID int64) ([]TextLabel, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	ListTextLabelsByZone(ctx context.Context, zoneID pgtype.Int8) ([]TextLabel, error)
+	// The local bounding boxes (inspector.bounds) of a facility's 3D models,
+	// for the facility envelope: the mobile app routes around their footprints.
+	ListUserModelBounds(ctx context.Context, arg ListUserModelBoundsParams) ([]ListUserModelBoundsRow, error)
 	// For every (user_model, warehouse) pair where the catalog entry has
 	// at least one placement, returns the warehouse id + name. The Files
 	// handler joins this against user_model file references to build the

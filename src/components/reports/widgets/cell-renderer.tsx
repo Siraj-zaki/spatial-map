@@ -9,9 +9,11 @@
  * leaving the report viewer.
  */
 import { useEffect, useState } from 'react'
-import { ExternalLink, X } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { ExternalLink, Radio, Video, X } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
+import { isWatchableStream, LiveStreamPlayer, streamKind } from '@/components/live-stream-player'
 import {
   formatReportValue,
   type ReportFieldType,
@@ -29,6 +31,7 @@ export type CellKind =
   | 'image'
   | 'video'
   | 'link'
+  | 'stream'
   | 'badge'
   | 'boolean'
   | 'json'
@@ -64,6 +67,9 @@ export function detectCellKind(
   if (typeof value !== 'string') return 'text'
   const trimmed = value.trim()
   if (!trimmed) return 'text'
+  // Camera streams (RTSP & co., HLS playlists) before plain links.
+  const sk = streamKind(trimmed)
+  if (sk === 'native-only' || sk === 'hls' || sk === 'mjpeg') return 'stream'
   // Sniff for URL / media before dates so a URL that starts with
   // "http" is never mistaken for a text.
   if (/^https?:\/\//i.test(trimmed)) {
@@ -101,6 +107,7 @@ export function CellRenderer({
     | { kind: 'image'; value: unknown }
     | { kind: 'json'; value: unknown }
     | { kind: 'text'; value: unknown; label: string }
+    | { kind: 'stream'; value: unknown }
     | null
   >(null)
   const explicit = config?.cellType
@@ -122,6 +129,7 @@ export function CellRenderer({
         onOpenImage: (v) => setPreview({ kind: 'image', value: v }),
         onOpenJson: (v) => setPreview({ kind: 'json', value: v }),
         onOpenText: (v, label) => setPreview({ kind: 'text', value: v, label }),
+        onOpenStream: (v) => setPreview({ kind: 'stream', value: v }),
       })}
       {preview && (
         <PreviewModal
@@ -145,6 +153,7 @@ function renderCell({
   onOpenImage,
   onOpenJson,
   onOpenText,
+  onOpenStream,
 }: {
   kind: CellKind
   value: unknown
@@ -155,9 +164,14 @@ function renderCell({
   onOpenImage: (v: string) => void
   onOpenJson: (v: unknown) => void
   onOpenText: (v: unknown, label: string) => void
+  onOpenStream: (v: string) => void
 }) {
   if (value === null || value === undefined || value === '') {
     return <span className="text-muted-foreground/60">—</span>
+  }
+
+  if (kind === 'stream' && typeof value === 'string') {
+    return <StreamCell value={value} onOpen={onOpenStream} />
   }
 
   if (kind === 'image' && typeof value === 'string') {
@@ -312,6 +326,33 @@ function renderCell({
   )
 }
 
+/** A camera stream cell: "Watch live" when the browser can show it, else the protocol. */
+function StreamCell({ value, onOpen }: { value: string; onOpen: (v: string) => void }) {
+  const { t } = useTranslation()
+  if (isWatchableStream(value)) {
+    return (
+      <button
+        type="button"
+        title={value}
+        onClick={(e) => {
+          e.stopPropagation()
+          onOpen(value)
+        }}
+        className="inline-flex items-center gap-1.5 rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-medium text-danger hover:bg-danger/15 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+      >
+        <Video className="h-3 w-3" aria-hidden />
+        {t('liveStream.watch', { defaultValue: 'Watch live' })}
+      </button>
+    )
+  }
+  return (
+    <span title={value} className="inline-flex max-w-full items-center gap-1 text-xs text-muted-foreground">
+      <Radio className="h-3 w-3 shrink-0" aria-hidden />
+      <span className="truncate font-mono">{value.split('://')[0].toUpperCase()} · {shortenUrl(value)}</span>
+    </span>
+  )
+}
+
 // ─────────────────────────────────────────────── modal
 
 function PreviewModal({
@@ -320,7 +361,7 @@ function PreviewModal({
   label,
   onClose,
 }: {
-  kind: 'image' | 'json' | 'text'
+  kind: 'image' | 'json' | 'text' | 'stream'
   value: unknown
   label?: string
   onClose: () => void
@@ -374,6 +415,11 @@ function PreviewModal({
               {value}
             </a>
           </>
+        )}
+        {kind === 'stream' && typeof value === 'string' && (
+          <div className="w-[min(90vw,60rem)]">
+            <LiveStreamPlayer src={value} autoFocus className="shadow-2xl" />
+          </div>
         )}
         {kind === 'json' && (
           <pre className="max-w-[80vw] max-h-[85vh] overflow-auto rounded bg-card border border-border p-4 text-xs text-foreground shadow-2xl">

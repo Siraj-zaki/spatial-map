@@ -14,6 +14,7 @@
  */
 
 import { apiDb } from '@/lib/api-db'
+import { formatFocusParam, parseFocusParam } from '@/lib/focus/focus-target'
 import i18n from '@/i18n'
 
 export const FACILITY_ENTITIES = [
@@ -152,4 +153,28 @@ export function facilityEditorHref(key: string, facilityId: number | null | unde
   const ref = parseFacilityKey(key)
   if (!ref || !facilityId) return null
   return `/create-grids?warehouseId=${facilityId}&select=${ref.kind}:${ref.id}`
+}
+
+/**
+ * Read-only viewer deep link that opens the facility focused on the shape
+ * (`?focus=`, src/lib/focus/focus-target.ts — the item is shown even when
+ * something stands in front of it). Any shape key the focus grammar reads
+ * ("markers:57", "images:3", "grids:5:2:3:0", …); null for anything else.
+ */
+export function facilityViewerHref(key: string, facilityId: number | null | undefined): string | null {
+  if (!facilityId || !(facilityId > 0)) return null
+  const target = parseFocusParam(key)
+  if (!target || target.kind === 'dl') return null
+  return `/view/${facilityId}?focus=${encodeURIComponent(formatFocusParam(target))}`
+}
+
+/** Viewer deep link focused on one linked-data record (its live symbol). */
+export function facilityViewerDataHref(
+  dataLinkId: number | null | undefined,
+  entityKey: string | null | undefined,
+  facilityId: number | null | undefined,
+): string | null {
+  if (!facilityId || !(facilityId > 0) || !dataLinkId || !(dataLinkId > 0) || !entityKey) return null
+  const param = formatFocusParam({ kind: 'dl', configId: dataLinkId, entityKey })
+  return `/view/${facilityId}?focus=${encodeURIComponent(param)}`
 }

@@ -1,9 +1,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 import { MapDoorOverlay } from '@/components/door/map-door-overlay'
 import { MapRoutePreviewOverlay } from '@/components/map-route-preview-overlay'
 import { RouteDirectionsPanel } from '@/components/route-directions-panel'
+import type { FacilityRoutingInput } from '@/lib/routing/floors'
 import { resolveStyleMaps } from '@/lib/style-rules'
 import { useMapRotation } from '@/routes/create-grids/hooks/useMapRotation'
 import { useRoutePreviewTool } from '@/routes/create-grids/hooks/useRoutePreviewTool'
@@ -23,12 +24,12 @@ import { MapPolygonOverlay } from '@/components/map-polygon-overlay'
 import { MapShapeTooltip } from '@/components/map-shape-tooltip'
 import { MapStairOverlay } from '@/components/map-stair-overlay'
 import { MapFloorBaseOverlay } from '@/components/map-floor-base-overlay'
+import { MapFocusOverlay } from '@/components/map-focus-overlay'
 import { MapTextLabelOverlay } from '@/components/map-text-label-overlay'
 import {
   MapboxMap,
   MAP_STYLE_IDS,
   DEFAULT_MAP_STYLE,
-  defaultStyleLabel,
   normalizeStyleId,
   type MapStyleId,
 } from '@/components/mapbox-map'
@@ -72,18 +73,15 @@ import {
   useSpatialZones,
 } from '@/hooks/useSpatialShapes'
 import { useCurrentTenantId } from '@/lib/data-link/tenant-service'
-import {
-  readPayloadPath,
-  resolveMatchTargets,
-  type MatchStoreSnapshot,
-  type MatchableShape,
-} from '@/lib/data-link/match-resolver'
+import { hasMapLayer, rootLayerOrder } from '@/lib/data-link/dl-layer-stack'
+import { useStableCallback } from '@/hooks/useStableCallback'
+import { resolveEntityFloor } from '@/lib/data-link/filter-evaluator'
+import { readPayloadPath } from '@/lib/data-link/match-resolver'
 import { resolveLabelTemplate } from '@/lib/data-link/style-rule-evaluator'
-import { polygonCentroid } from '@/lib/polygon-generators'
 import { imageCorners } from '@/lib/image-generators'
-import { lineCentroid } from '@/lib/line-generators'
 import type {
   Bin,
+  BindingKind,
   DataLinkConfig,
   DataLinkFilter,
   DataLinkFilterCondition,
@@ -91,6 +89,31 @@ import type {
   Grid,
   Zone,
 } from '@/lib/db'
+import { flyToFocus, isFocusFlying, type FocusCameraMode, type FocusPadding } from '@/lib/focus/focus-camera'
+import { useFollowEntity } from '@/lib/focus/use-follow-entity'
+import { FollowChip } from '@/components/follow-chip'
+import { useTrackFocusBlockers } from '@/lib/focus/focus-blockers'
+import { useFocusNear } from '@/lib/focus/focus-near'
+import { FocusBlockersContext, FocusSceneContext, useFocusSceneValue } from '@/lib/focus/focus-scene'
+import {
+  focusDlRef,
+  focusKey,
+  formatFocusParam,
+  parseFocusParam,
+  resolveFocus,
+  type DlAnchor,
+  type FocusShapeKind,
+  type FocusShapes,
+  type FocusTarget,
+} from '@/lib/focus/focus-target'
+import { useViewerMapTools } from '@/components/view/viewer-map-tools'
+import { ViewerItemsPanel } from '@/components/view/viewer-items-panel'
+import { STYLE_ICON, useStyleLabel } from '@/components/reports/layout/report-map-view'
+import { useFocusExit } from '@/lib/focus/use-focus-exit'
+import { buildOccluders, type OccluderPrism } from '@/lib/marker-occlusion'
+import { fetchSharedWarehouse, type ShareLayerKind } from '@/lib/share-link-client'
+import type { EntityKind } from '@/lib/spatial-store'
+import { toast } from '@/lib/toast-store'
 import {
   allLeavesValid,
   collectPromptLeaves,
@@ -98,22 +121,22 @@ import {
 } from '@/components/data-link/filter-tree-builder'
 import { useDoorStore } from '@/lib/door/store'
 import { fitMapToGrids } from '@/lib/export'
-import { useModelBoundingCenterMap, useModelUrlMap } from '@/lib/model-assets'
+import { useModelBoundingCenterMap, useModelBoundsMap, useModelInspectorMap, useModelUrlMap } from '@/lib/model-assets'
 import { classifyBin, classifyValue, type MediaItem, type PrimaryFieldRow } from '@/lib/rich-data'
+import { isWatchableStream, LiveStreamPlayer } from '@/components/live-stream-player'
 import {
   liftFloorPlanIds,
-  type CircleShape,
   type ImageShape,
-  type LineShape,
-  type MarkerShape,
   type ModelShape,
   type PolygonShape,
 } from '@/lib/shapes'
 import { useSpatialStore } from '@/lib/spatial-store'
 import { useSSE } from '@/lib/useSSE'
+import { setFacilityShare } from '@/lib/reports/report-share'
 import { cn } from '@/lib/utils'
 import { labelFromKey, classifyKeyValue } from '@/lib/value-classifier'
 import { FieldRow } from '@/components/bin-popup-content'
+import { Toaster } from '@/components/feedback/toaster'
 import {
   ArrowLeft,
   Braces,
@@ -140,12 +163,14 @@ import {
 } from 'lucide-react'
 import { ViewerLayersPanel, type ShapeLayerKind, type DataLinkLayerKind } from '@/components/view/viewer-layers-panel'
 import { inferLayerKind } from '@/components/view/view-layers-panel'
+import { ViewSearch, type SearchResult } from '@/components/view/view-search'
 import { ViewerFilterBar } from '@/components/view/viewer-filter-bar'
 import { TableHistoryPanel } from '@/components/view/table-history-panel'
 import { TableHistoryPlayer } from '@/components/view/table-history-player'
 import { ViewerGraphicsPanel } from '@/components/view/viewer-graphics-panel'
 import { DataLinkFullScreenLoader } from '@/components/data-link/data-link-loader'
-import type { Map as MapboxMapInstance } from 'mapbox-gl'
+import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { sitePath } from '@/lib/site'
 
 /**
  * v5.4 — multi-floor selection. `active` is either:
@@ -238,46 +263,467 @@ function applyPanelConfig(
   return { customProperties, header }
 }
 
-/**
- * Centroid for a single data-link matched shape. Mirrors the overlay's
- * `centroidForShape` (kept in map-data-linked-overlay.tsx) so the
- * Layers pill's "zoom to item" lands on the same anchor the marker
- * renders at. Only handles the kinds a DataLinkConfig can target.
- */
-function centroidForDataLinkShape(
-  shape: MatchableShape,
-  kind: DataLinkConfig['targetKind'],
-): [number, number] | null {
-  switch (kind) {
-    case 'polygon': {
-      const p = shape as PolygonShape
-      return p.vertices.length >= 3 ? polygonCentroid(p.vertices) : null
-    }
-    case 'circle': {
-      const c = shape as CircleShape
-      if (c.center) return c.center
-      if (c.start && c.current) {
-        return [(c.start[0] + c.current[0]) / 2, (c.start[1] + c.current[1]) / 2]
-      }
-      return null
-    }
-    case 'marker': return (shape as MarkerShape).position
-    case 'line': {
-      const l = shape as LineShape
-      return l.vertices.length >= 2 ? lineCentroid(l.vertices) : null
-    }
-    case 'model': return (shape as ModelShape).position
-    default: return null
-  }
+// ---- Focus mode helpers ------------------------------------------------
+//
+// Focus mode (src/lib/focus/): an item the viewer asks for — clicked,
+// searched, picked in the Layers pill, named by a `?focus=` link — is
+// always drawn (exempt from occlusion, pulse ring). Only two things fade:
+// the shapes standing between it and the camera, and its NEAR set
+// (`focus-near.ts`: solids it sits inside, volumetric shapes on its floor
+// within 5 m, anything overhead) — a large one only locally (cut-away).
+// Everything else stays exactly as drawn. The viewer owns the target in `useState` and hands it to the
+// overlays through FocusSceneContext / FocusBlockersContext.
+
+/** Share-link layer that has to be visible for a focus target to be allowed. */
+const SHARE_KIND_OF_FOCUS: Readonly<Record<FocusTarget['kind'], ShareLayerKind>> = {
+  markers: 'markers',
+  polygons: 'polygons',
+  circles: 'circles',
+  lines: 'lines',
+  stairs: 'stairs',
+  grids: 'racks',
+  images: 'images',
+  'image-planes': 'imagePlanes',
+  models: 'models',
+  doors: 'doors',
+  'text-labels': 'text',
+  dl: 'dataLinks',
+}
+
+/** The Layers-pill kind toggle that hides a focus kind (walls have none). */
+const HIDE_KEY_OF_FOCUS: Readonly<Partial<Record<FocusShapeKind, ShapeLayerKind>>> = {
+  markers: 'markers',
+  polygons: 'polygons',
+  circles: 'circles',
+  stairs: 'stairs',
+  grids: 'grids',
+  images: 'images',
+  'image-planes': 'imagePlanes',
+  models: 'models',
+  doors: 'doors',
+  'text-labels': 'textLabels',
+}
+
+/** Layers-pill kind → focus kind (bins resolve through their binding). */
+const FOCUS_KIND_OF_LAYER: Readonly<Record<Exclude<ShapeLayerKind, 'bins'>, FocusShapeKind>> = {
+  polygons: 'polygons',
+  circles: 'circles',
+  markers: 'markers',
+  models: 'models',
+  stairs: 'stairs',
+  doors: 'doors',
+  imagePlanes: 'image-planes',
+  textLabels: 'text-labels',
+  grids: 'grids',
+  images: 'images',
+}
+
+const FOCUS_KIND_OF_BINDING: Readonly<Partial<Record<BindingKind, FocusShapeKind>>> = {
+  polygon: 'polygons',
+  circle: 'circles',
+  line: 'lines',
+  marker: 'markers',
+  image: 'images',
+  model: 'models',
+}
+
+/** Store kind whose load a `?focus=` target waits for (signed-in viewer). Doors load through the door store. */
+const ENTITY_KIND_OF_FOCUS: Readonly<Record<FocusTarget['kind'], EntityKind | null>> = {
+  markers: 'markers',
+  polygons: 'polygons',
+  circles: 'circles',
+  lines: 'lines',
+  stairs: 'stairs',
+  grids: 'grids',
+  images: 'images',
+  'image-planes': 'image-planes',
+  models: 'models',
+  doors: null,
+  'text-labels': 'text-labels',
+  dl: 'data-link-configs',
+}
+
+/** English fallbacks for `view.focus.kind.*` (the chip's kind label). */
+const FOCUS_KIND_FALLBACK: Readonly<Record<string, string>> = {
+  markers: 'Marker',
+  polygons: 'Area',
+  circles: 'Circle',
+  lines: 'Wall',
+  stairs: 'Stairs',
+  grids: 'Rack',
+  cell: 'Bin',
+  images: 'Floor plan',
+  'image-planes': 'Image',
+  models: '3D model',
+  doors: 'Door',
+  'text-labels': 'Label',
+  dl: 'Live data',
+}
+
+/** Which shape drawer a focus kind opens (markers / areas have one). */
+function drawerForFocusKind(kind: FocusTarget['kind']): 'marker' | 'polygon' | null {
+  if (kind === 'markers') return 'marker'
+  if (kind === 'polygons') return 'polygon'
+  return null
 }
 
 /**
- * The viewer must be independent of any per-shape `visible` flag the
- * editor may have toggled — the editor's eye icon writes `visible=false`
- * to the DB, which would otherwise silently hide shapes here. We strip
- * that flag on the read path so the viewer's only visibility control is
- * its own floor dropdown.
+ * A bin row → what to focus: its rack cell, or the shape it is bound to.
+ * Null when the row points at nothing drawable.
  */
+function focusTargetForBin(bin: Bin | undefined): FocusTarget | null {
+  if (!bin) return null
+  if (bin.targetKind === 'grid-cell') {
+    if (bin.gridId === undefined || typeof bin.row !== 'number' || typeof bin.col !== 'number') return null
+    return { kind: 'grids', id: bin.gridId, cell: { row: bin.row, col: bin.col, level: bin.level ?? 0 } }
+  }
+  const kind = FOCUS_KIND_OF_BINDING[bin.targetKind]
+  if (!kind || typeof bin.shapeId !== 'number') return null
+  return { kind, id: bin.shapeId }
+}
+
+/** A feature's `payload` property (stringified by GeoJSON tiling), or every property. */
+function readFeaturePayload(props: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (!props) return {}
+  const raw = props['payload']
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      /* fall through */
+    }
+  }
+  if (raw && typeof raw === 'object') return raw as Record<string, unknown>
+  // No `payload` key — treat every property as the payload.
+  return props
+}
+
+/**
+ * The floor a data-link row is drawn on, the way the overlay's floor gate
+ * reads it (`passesFloorScope`): 'all' and multi-floor 'specific' scopes
+ * have no single floor; 'auto' resolves the payload, and an id that is no
+ * longer a floor plan counts as unknown.
+ */
+function dataLinkEntityFloor(
+  payload: Record<string, unknown>,
+  cfg: DataLinkConfig,
+  liveFloorIds: ReadonlySet<number>,
+): number | null {
+  const scope = cfg.fieldMapping?.floorScope
+  if (scope?.mode === 'all') return null
+  if (scope?.mode === 'specific') {
+    const ids = scope.floorPlanIds ?? []
+    return ids.length === 1 ? ids[0] : null
+  }
+  const floor = resolveEntityFloor(payload, null, { field: scope?.field, valueMap: scope?.valueMap })
+  return floor !== null && liveFloorIds.has(floor) ? floor : null
+}
+
+/** Where a clicked data-link point is drawn — its feature coordinates + `elevation`. */
+function dataLinkAnchorOf(
+  geometry: GeoJSON.Geometry | null | undefined,
+  props: Record<string, unknown> | null | undefined,
+  floorPlanId: number | null,
+): DlAnchor | undefined {
+  if (!geometry || geometry.type !== 'Point') return undefined
+  const [lng, lat] = geometry.coordinates
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return undefined
+  const elevation = Number(props?.['elevation'])
+  return { position: [lng, lat], elevationM: Number.isFinite(elevation) ? elevation : 0, floorPlanId }
+}
+
+/**
+ * A text label's display name: the text it draws on the map, else its row
+ * name (rows are mostly all called "Text", so the name alone can't tell
+ * them apart).
+ */
+function textLabelName(label: { name?: string; config?: { text?: string } } | undefined): string {
+  return (label?.config?.text ?? '').trim() || label?.name || ''
+}
+
+/** `params` without `?focus=` (every other param kept). */
+function withoutFocusParam(params: URLSearchParams): URLSearchParams {
+  const next = new URLSearchParams(params)
+  next.delete('focus')
+  return next
+}
+
+/**
+ * The `?focus=` link leaves the URL once it has been applied (`appliedTag`
+ * is this param's tag) and the focus moves off the item it names: to
+ * another item, or to nothing (`nextKey` ''). A param that names nothing
+ * (`paramKey` '') goes as soon as nothing is focused.
+ */
+function focusParamReleased(appliedTag: string | null, paramTag: string, paramKey: string, nextKey: string): boolean {
+  return paramTag !== '' && appliedTag === paramTag && (nextKey === '' || nextKey !== paramKey)
+}
+
+/** A data-link row's display name: its layer's label field, else the entity key. */
+function dataLinkLabelOf(cfg: DataLinkConfig, payload: Record<string, unknown>, entityKey: string): string {
+  const field = cfg.fieldMapping?.labelField
+  const v = field ? readPayloadPath(payload, field) : undefined
+  if (typeof v === 'string' && v.trim() !== '') return v
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  return entityKey
+}
+
+/** Detail drawer width per breakpoint (`ShapeDetailDrawer`: sm 420 / md 460 / lg 500; full width below sm). */
+function detailDrawerWidth(viewportWidth: number): number {
+  if (viewportWidth >= 1024) return 500
+  if (viewportWidth >= 768) return 460
+  if (viewportWidth >= 640) return 420
+  return 0
+}
+
+interface ScreenRect {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/**
+ * The part of `el` actually on screen: its box clipped by the viewport and
+ * by every ancestor that clips overflow. On `/view` the map fills the app
+ * shell's <main> (`absolute inset-0`); on `/share` it is the whole window.
+ * Kept as a guard: anything an ancestor clips is out of sight.
+ */
+function visibleRectOf(el: Element): ScreenRect {
+  const r = el.getBoundingClientRect()
+  const vis: ScreenRect = {
+    left: Math.max(r.left, 0),
+    top: Math.max(r.top, 0),
+    right: Math.min(r.right, window.innerWidth),
+    bottom: Math.min(r.bottom, window.innerHeight),
+  }
+  for (let a = el.parentElement; a !== null; a = a.parentElement) {
+    const cs = window.getComputedStyle(a)
+    const clipX = cs.overflowX !== 'visible'
+    const clipY = cs.overflowY !== 'visible'
+    if (!clipX && !clipY) continue
+    const ar = a.getBoundingClientRect()
+    if (clipX) {
+      vis.left = Math.max(vis.left, ar.left)
+      vis.right = Math.min(vis.right, ar.right)
+    }
+    if (clipY) {
+      vis.top = Math.max(vis.top, ar.top)
+      vis.bottom = Math.min(vis.bottom, ar.bottom)
+    }
+  }
+  return vis
+}
+
+/**
+ * Screen area a focused item must land in: on the visible part of the
+ * canvas, clear of the top / bottom chrome, and of the detail drawer when
+ * one is open. The drawer is on the logical end side — the right in LTR,
+ * the left in RTL (`ShapeDetailDrawer`). Below `sm` the drawer covers the
+ * whole map, so it adds nothing.
+ */
+function focusPaddingFor(map: MapboxMapInstance, drawerOpen: boolean, rtl: boolean): FocusPadding {
+  const pad: FocusPadding = { top: 64, right: 24, bottom: 48, left: 24 }
+  if (typeof window === 'undefined') return pad
+  const container = map.getContainer()
+  const rect = container.getBoundingClientRect()
+  const vis = visibleRectOf(container)
+  pad.top += Math.max(0, vis.top - rect.top)
+  pad.left += Math.max(0, vis.left - rect.left)
+  pad.right += Math.max(0, rect.right - vis.right)
+  pad.bottom += Math.max(0, rect.bottom - vis.bottom)
+  if (!drawerOpen) return pad
+  const vw = window.innerWidth
+  const w = detailDrawerWidth(vw)
+  if (w === 0) return pad
+  if (rtl) pad.left += Math.max(0, w - vis.left)
+  else pad.right += Math.max(0, vis.right - (vw - w))
+  return pad
+}
+
+/** A data-link drawer's cluster list entry. */
+interface DlClusterItem {
+  payload: Record<string, unknown>
+  position: [number, number]
+  /** The leaf's `entityKey` (focus + table history); absent on keyless streams. */
+  entityKey?: string
+  /** Where the leaf is drawn, when it is a point. */
+  anchor?: DlAnchor
+}
+
+/** The data-link widget drawer — one entity (`bin`) or a cluster list (`clusterItems`). */
+interface DlEntityDrawerState {
+  title: string
+  kindLabel: string
+  accentColor: string | undefined
+  bin?: Bin
+  clusterItems?: DlClusterItem[]
+  /** v4 — rendered above the field grid in the drawer. Resolved from
+   *  `config.tooltip.panel.template` against the payload. */
+  panelHeader?: string
+  /** v4 — ordered field paths the drawer should show. When set, the
+   *  synthetic bin's `customProperties` is pre-filtered so classifyBin
+   *  can only surface these keys, in this order. */
+  panelFields?: string[]
+  /** Raw (unresolved) template — kept so cluster-item drill-in can
+   *  re-resolve it against the leaf's payload. */
+  panelTemplateRaw?: string
+  /** v4 — labelField from the layer's fieldMapping. Used by the cluster
+   *  list to title each row (sku / external_code / etc.) instead of
+   *  falling back to the generic "Item" placeholder. */
+  labelField?: string
+  /** v5.4 — source id + entity key for table-backed layers. When both
+   *  are set the drawer surfaces the History panel; otherwise the
+   *  entity has no per-row event trail (streaming path uses
+   *  `entity_events`, which the replay flow reads, not this panel). */
+  sourceId?: number
+  entityKey?: string
+  /** The layer the drawer belongs to (cluster drill-in focuses its rows). */
+  configId?: number
+}
+
+/**
+ * The drawer for one data-link row (the shared map-click / "View more" /
+ * Layers-pill path). `assetLabel` is the translated generic kind
+ * (`view.drawer.kind.asset`); a layer's own name stays as data.
+ */
+function dataLinkDrawerFor(
+  cfg: DataLinkConfig,
+  payload: Record<string, unknown>,
+  entityKey: string | undefined,
+  assetLabel: string,
+): DlEntityDrawerState {
+  const { customProperties, header } = applyPanelConfig(payload, cfg)
+  return {
+    title: cfg.name || assetLabel,
+    kindLabel: assetLabel,
+    accentColor: cfg.style?.defaultColor,
+    bin: { targetKind: 'polygon', customProperties, updatedAt: new Date() },
+    panelHeader: header,
+    panelFields: cfg.tooltip.panel?.fields ?? cfg.tooltip.fields,
+    labelField: cfg.fieldMapping?.labelField,
+    sourceId: cfg.sourceId ?? undefined,
+    entityKey,
+    configId: cfg.id,
+  }
+}
+
+interface FocusItemOptions {
+  /**
+   * 'always' = list / search / link picks and area clicks; 'ifNeeded' =
+   * only when off-screen or hidden (cluster rows); 'reveal' = map clicks
+   * (pan just enough to keep the item clear of the drawer, zoom / pitch /
+   * bearing kept); 'none' = don't move.
+   */
+  camera: FocusCameraMode | 'none'
+  /** The shape drawer to open (exactly one drawer is ever open). */
+  drawer?: 'marker' | 'polygon' | null
+  /** Data-link drawer content (opens the data-link drawer instead). */
+  dlDrawer?: DlEntityDrawerState
+  /** Chip name when the rows can't supply one (data-link rows). */
+  label?: string | null
+}
+
+/** A camera move a focus action asked for; run once the item's floor is shown. */
+interface FocusCameraIntent {
+  key: string
+  mode: FocusCameraMode
+  /** The focus switched floors for this item — fold the new floor's rotation into the bearing. */
+  floorSwitched: boolean
+}
+
+/** What a focus request is checked against (share-link scope + what exists). */
+interface FocusScope {
+  layerVisible: (kind: ShareLayerKind) => boolean
+  /** Data-link layers the share link pins hidden. */
+  pinnedHiddenConfigIds: ReadonlySet<number>
+  /** The floor a share link locks the viewer to, or null. */
+  lockedFloorPlanId: number | null
+  configs: readonly DataLinkConfig[]
+  shapes: FocusShapes
+}
+
+/**
+ * Why a focus request must be refused, or null to allow it. Share links
+ * never reveal what they hide: a kind or data-link layer the link leaves
+ * out, or an item on a floor other than the one it locks to
+ * ('notInLink'). An id that isn't on the map, or a data-link layer that
+ * is gone or switched off, is 'notFound'. A data-link row without its
+ * drawn anchor yet is re-checked when the anchor arrives.
+ */
+function focusRefusal(target: FocusTarget, scope: FocusScope): 'notInLink' | 'notFound' | null {
+  if (!scope.layerVisible(SHARE_KIND_OF_FOCUS[target.kind])) return 'notInLink'
+  const dlRef = focusDlRef(target)
+  if (dlRef && scope.pinnedHiddenConfigIds.has(dlRef.configId)) return 'notInLink'
+  const locked = scope.lockedFloorPlanId
+  if (target.kind === 'dl') {
+    const cfg = scope.configs.find((c) => c.id === target.configId)
+    if (!cfg || cfg.enabled === false) return 'notFound'
+    const floor = target.anchor?.floorPlanId ?? null
+    return locked !== null && floor !== null && floor !== locked ? 'notInLink' : null
+  }
+  const resolved = resolveFocus(target, scope.shapes)
+  if (!resolved) return 'notFound'
+  if (locked === null || resolved.floorPlanId === null || resolved.floorPlanId === locked) return null
+  // A lift is drawn on every floor it links, not only its own.
+  const stair = target.kind === 'stairs' ? scope.shapes.stairs?.find((st) => st.id === target.id) : undefined
+  return stair && liftFloorPlanIds(stair.config).includes(locked) ? null : 'notInLink'
+}
+
+/**
+ * The floor-picker selection that shows `floor`: a single-floor pick
+ * switches to it, a multi-floor pick adds it, and a floor plan that no
+ * longer exists can only be shown by "All floors" (null). `undefined` =
+ * already shown, leave the selection alone.
+ */
+function floorSelectionShowing(
+  current: ReadonlySet<number> | null,
+  floor: number,
+  liveFloorIds: ReadonlySet<number>,
+): ReadonlySet<number> | null | undefined {
+  if (current === null) return undefined
+  if (!liveFloorIds.has(floor)) return null
+  if (current.has(floor)) return undefined
+  if (current.size <= 1) return new Set([floor])
+  const grown = new Set(current)
+  grown.add(floor)
+  return grown
+}
+
+/** The focused item's floor is on screen (or can't be switched to, so there is nothing to wait for). */
+function focusFloorShown(
+  selected: ReadonlySet<number> | null,
+  floor: number | null,
+  liveFloorIds: ReadonlySet<number>,
+  lockedFloorPlanId: number | null,
+): boolean {
+  if (floor === null || lockedFloorPlanId !== null || selected === null) return true
+  return liveFloorIds.has(floor) && selected.has(floor)
+}
+
+const NO_PRISMS: OccluderPrism[] = []
+/** A data-link focus whose row never gets drawn gives up after this long. */
+const DL_ANCHOR_TIMEOUT_MS = 30_000
+
+/**
+ * The editor's eye icon writes `visible=false`, and since 2026-11-11 the
+ * viewer honours it for every shape kind: hide something in the editor and
+ * it is gone from the preview, share links and report maps too. Only floor
+ * plans (images) and bins still ignore the flag — a hidden floor sheet is
+ * the editor's way of dimming a floor, while the viewer's own floor
+ * dropdown decides which floors show here.
+ */
+/**
+ * Share-link mode: open the link, then switch data-source row reads to the
+ * link's public routes (`/public/share/{token}/sources/…`) BEFORE any layer
+ * mounts and fetches — a signed-out visitor has no session for the
+ * signed-in routes. Legacy links (404 here) carry no row routes.
+ */
+async function fetchSharedWarehouseWithRows(key: string) {
+  const res = await fetchSharedWarehouse(key)
+  if (res) setFacilityShare(key)
+  return res
+}
+
 function forceVisible<T>(rows: ReadonlyArray<T>): T[] {
   return rows.map((r) => {
     if (r && typeof r === 'object' && (r as { visible?: boolean }).visible === false) {
@@ -302,11 +748,19 @@ function shouldShowImage(
   return img.id !== undefined && active.has(img.id)
 }
 
+/**
+ * `mode`: `id` — signed-in preview of the caller's own facility (spatial
+ * store); `token` — public share link.
+ */
 export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
-  const { warehouseId, token } = useParams<{ warehouseId?: string; token?: string }>()
-  const { t } = useTranslation()
-  const isAuthMode = mode !== 'token'
+  const params = useParams<{ warehouseId?: string; token?: string }>()
+  const warehouseId = params.warehouseId
+  const token = params.token
+  const { t, i18n } = useTranslation()
+  const isRtl = i18n.dir() === 'rtl'
+  const isAuthMode = mode === 'id'
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
 
   // Two-stage token resolution:
   //   1. Try the RICH share endpoint `/api/v1/share/{token}` which
@@ -316,9 +770,17 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   //      share_links existed), fall back to the plain public warehouse
   //      endpoint. Any legacy URL keeps working; any new URL benefits
   //      from the settings blob.
-  const shareTokenForLookup = mode === 'token' ? token : undefined
-  const shareResult = useShareLink(shareTokenForLookup)
+  const shareTokenForLookup = mode !== 'id' ? token : undefined
+  const shareResult = useShareLink(shareTokenForLookup, fetchSharedWarehouseWithRows)
   const shareSettings = shareResult.data?.link.settings
+  // Keep the public row routes on while this link is open (the fetcher set
+  // it first; this re-arms it after a StrictMode remount) and off after.
+  const shareOpen = mode === 'token' && Boolean(shareResult.data)
+  useEffect(() => {
+    if (!shareOpen || !token) return
+    setFacilityShare(token)
+    return () => setFacilityShare(null)
+  }, [shareOpen, token])
 
   // The legacy public warehouse hook is called for:
   //   * id mode (never touches share_links)
@@ -338,7 +800,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // reads; for the token path it's the zone id embedded in the
   // WarehouseView so overlays can compute `warehouseIdNum` correctly.
   const data = shareResult.data?.warehouse ?? publicResult.data ?? null
-  const id = mode === 'token'
+  const id = mode !== 'id'
     ? (shareResult.data?.warehouse.zone.id !== undefined
         ? String(shareResult.data.warehouse.zone.id)
         : token)
@@ -371,11 +833,23 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     void useSpatialStore.getState().loadAll()
   }, [isAuthMode, tenantId, id])
 
+  // Which facility's doors have finished loading (the door store keeps no
+  // loaded flag) — a `?focus=doors:<id>` link waits for it.
+  const [doorsLoadedFor, setDoorsLoadedFor] = useState<number | null>(null)
   useEffect(() => {
     if (!isAuthMode || id === undefined) return
     const warehouseIdNum = Number(id)
     if (!Number.isFinite(warehouseIdNum)) return
-    void useDoorStore.getState().loadForWarehouse(warehouseIdNum)
+    let live = true
+    void useDoorStore
+      .getState()
+      .loadForWarehouse(warehouseIdNum)
+      .finally(() => {
+        if (live) setDoorsLoadedFor(warehouseIdNum)
+      })
+    return () => {
+      live = false
+    }
   }, [isAuthMode, id])
 
   const { data: storePolygonsAll } = useSpatialPolygons()
@@ -412,31 +886,31 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // stay unmemoized — those arrays are only used for rendering and
   // React handles the diffs cheaply.
   const allPolygons = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storePolygonsAll) : data?.polygons ?? []),
-    [isAuthMode, storePolygonsAll, data?.polygons, warehouseIdNum],
+    () => (isAuthMode ? inWarehouse(storePolygonsAll) : data?.polygons ?? []),
+    [isAuthMode, storePolygonsAll, data?.polygons, inWarehouse],
   )
   const allLines = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeLinesAll) : data?.lines ?? []),
-    [isAuthMode, storeLinesAll, data?.lines, warehouseIdNum],
+    () => (isAuthMode ? inWarehouse(storeLinesAll) : data?.lines ?? []),
+    [isAuthMode, storeLinesAll, data?.lines, inWarehouse],
   )
   const allMarkers = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeMarkersAll) : data?.markers ?? []),
-    [isAuthMode, storeMarkersAll, data?.markers, warehouseIdNum],
+    () => (isAuthMode ? inWarehouse(storeMarkersAll) : data?.markers ?? []),
+    [isAuthMode, storeMarkersAll, data?.markers, inWarehouse],
   )
   const allStairs = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeStairsAll) : data?.stairs ?? []),
-    [isAuthMode, storeStairsAll, data?.stairs, warehouseIdNum],
+    () => (isAuthMode ? inWarehouse(storeStairsAll) : data?.stairs ?? []),
+    [isAuthMode, storeStairsAll, data?.stairs, inWarehouse],
   )
   const allGrids = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeGridsAll) : data?.grids ?? []),
-    [isAuthMode, storeGridsAll, data?.grids, warehouseIdNum],
+    () => (isAuthMode ? inWarehouse(storeGridsAll) : data?.grids ?? []),
+    [isAuthMode, storeGridsAll, data?.grids, inWarehouse],
   )
   const allDoors = useMemo(
-    () => forceVisible(isAuthMode ? storeDoors : data?.doors ?? []),
+    () => (isAuthMode ? storeDoors : data?.doors ?? []),
     [isAuthMode, storeDoors, data?.doors],
   )
 
-  // v4 — memoised. Fresh forceVisible() arrays every render leaked
+  // v4 — memoised. Fresh () arrays every render leaked
   // downstream: the MapDataLinkedOverlay's shapeProps ({polygons,
   // circles, markers, lines, models}) was rebuilt every parent render
   // even when the actual shape data hadn't changed. Every un-memoised
@@ -445,7 +919,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // was cascading a full overlay re-render. See the sibling useMemos
   // on polygons/markers/lines/stairs above for the pattern.
   const allCircles = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeCirclesAll) : data?.circles ?? []),
+    () => (isAuthMode ? inWarehouse(storeCirclesAll) : data?.circles ?? []),
     [isAuthMode, storeCirclesAll, inWarehouse, data?.circles],
   )
   const allImages = useMemo(
@@ -453,15 +927,15 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     [isAuthMode, storeImagesAll, inWarehouse, data?.images],
   )
   const allModels = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeModelsAll) : data?.models ?? []),
+    () => (isAuthMode ? inWarehouse(storeModelsAll) : data?.models ?? []),
     [isAuthMode, storeModelsAll, inWarehouse, data?.models],
   )
   const allTextLabels = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeTextLabelsAll) : data?.textLabels ?? []),
+    () => (isAuthMode ? inWarehouse(storeTextLabelsAll) : data?.textLabels ?? []),
     [isAuthMode, storeTextLabelsAll, inWarehouse, data?.textLabels],
   )
   const allImagePlanes = useMemo(
-    () => forceVisible(isAuthMode ? inWarehouse(storeImagePlanesAll) : data?.imagePlanes ?? []),
+    () => (isAuthMode ? inWarehouse(storeImagePlanesAll) : data?.imagePlanes ?? []),
     [isAuthMode, storeImagePlanesAll, inWarehouse, data?.imagePlanes],
   )
   const allBins = useMemo(
@@ -617,31 +1091,33 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // "shell is currently opaque" is done separately via the
   // `shellCoveringInterior` state below (sampled on zoomend to avoid
   // per-frame re-renders).
-  const emptyIfShellOnly = <T,>(arr: readonly T[]): readonly T[] =>
-    shellHidesInterior ? [] : arr
+  const emptyIfShellOnly = useCallback(
+    <T,>(arr: readonly T[]): readonly T[] => (shellHidesInterior ? [] : arr),
+    [shellHidesInterior],
+  )
 
   const polygons = useMemo(
     () => emptyIfShellOnly(allPolygons.filter((p) => onFloor(p, selectedFloorPlanIds))),
-    [allPolygons, selectedFloorPlanIds, shellHidesInterior],
+    [allPolygons, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const circles = useMemo(
     () => emptyIfShellOnly(allCircles.filter((c) => onFloor(c, selectedFloorPlanIds))),
-    [allCircles, selectedFloorPlanIds, shellHidesInterior],
+    [allCircles, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const lines = useMemo(
     () => emptyIfShellOnly(allLines.filter((l) => onFloor(l, selectedFloorPlanIds))),
-    [allLines, selectedFloorPlanIds, shellHidesInterior],
+    [allLines, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const markers = useMemo(
     () => emptyIfShellOnly(allMarkers.filter((m) => onFloor(m, selectedFloorPlanIds))),
-    [allMarkers, selectedFloorPlanIds, shellHidesInterior],
+    [allMarkers, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const images = useMemo(
     () =>
       emptyIfShellOnly(
         allImages.filter((img) => shouldShowImage(img, selectedFloorPlanIds)),
       ),
-    [allImages, selectedFloorPlanIds, shellHidesInterior],
+    [allImages, selectedFloorPlanIds, emptyIfShellOnly],
   )
   // v5.5 — model list branches on shellMode / shellHidesInterior:
   //   * shell-only OR (auto + zoom < shell fadeStart) →
@@ -687,19 +1163,19 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
               liftFloorPlanIds(s.config).some((id) => selectedFloorPlanIds.has(id))),
         ),
       ),
-    [allStairs, selectedFloorPlanIds, shellHidesInterior],
+    [allStairs, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const textLabels = useMemo(
     () => emptyIfShellOnly(allTextLabels.filter((lbl) => onFloor(lbl, selectedFloorPlanIds))),
-    [allTextLabels, selectedFloorPlanIds, shellHidesInterior],
+    [allTextLabels, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const imagePlanes = useMemo(
     () => emptyIfShellOnly(allImagePlanes.filter((p) => onFloor(p, selectedFloorPlanIds))),
-    [allImagePlanes, selectedFloorPlanIds, shellHidesInterior],
+    [allImagePlanes, selectedFloorPlanIds, emptyIfShellOnly],
   )
   const doors = useMemo(
     () => emptyIfShellOnly(allDoors.filter((d) => onFloor(d, selectedFloorPlanIds))),
-    [allDoors, selectedFloorPlanIds, shellHidesInterior],
+    [allDoors, selectedFloorPlanIds, emptyIfShellOnly],
   )
 
   // Mirror create-grids.tsx: map wallId → doors attached to that wall so
@@ -741,6 +1217,10 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
 
   const [mapInstance, setMapInstance] = useState<MapboxMapInstance | null>(null)
   const fittedRef = useRef(false)
+  // Focus mode's pending camera move (set by `focusItem`, consumed by the
+  // focus camera effect). While one is pending — or its flight is running —
+  // the floor-rotation ease and the first fit stand down.
+  const focusCameraIntentRef = useRef<FocusCameraIntent | null>(null)
   useEffect(() => {
     fittedRef.current = false
   }, [id])
@@ -806,72 +1286,6 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       return next
     })
   }, [])
-
-  const handleZoomToShape = useCallback(
-    (center: [number, number]) => {
-      if (!mapInstance) return
-      mapInstance.flyTo({ center, zoom: 19, duration: 600 })
-    },
-    [mapInstance],
-  )
-
-  const getShapeCenter = useCallback(
-    (kind: ShapeLayerKind, id: number): [number, number] | null => {
-      switch (kind) {
-        case 'polygons': {
-          const p = polygons.find((s) => s.id === id)
-          if (!p || p.vertices.length < 3) return null
-          return polygonCentroid(p.vertices)
-        }
-        case 'circles': {
-          const c = circles.find((s) => s.id === id)
-          if (!c) return null
-          if (c.center) return c.center
-          if (c.start && c.current) return [(c.start[0] + c.current[0]) / 2, (c.start[1] + c.current[1]) / 2]
-          return null
-        }
-        case 'markers': {
-          const m = markers.find((s) => s.id === id)
-          return m?.position ?? null
-        }
-        case 'models': {
-          const m = models.find((s) => s.id === id)
-          return m?.position ?? null
-        }
-        case 'stairs': {
-          const s = stairs.find((st) => st.id === id)
-          if (!s || s.vertices.length < 2) return null
-          return [(s.vertices[0][0] + s.vertices[1][0]) / 2, (s.vertices[0][1] + s.vertices[1][1]) / 2]
-        }
-        case 'doors': {
-          const d = doors.find((s) => s.id === id)
-          if (!d || d.vertices.length < 2) return null
-          return [(d.vertices[0][0] + d.vertices[1][0]) / 2, (d.vertices[0][1] + d.vertices[1][1]) / 2]
-        }
-        case 'imagePlanes': {
-          const ip = imagePlanes.find((s) => s.id === id)
-          return ip?.position ?? null
-        }
-        case 'textLabels': {
-          const tl = textLabels.find((s) => s.id === id)
-          return tl?.position ?? null
-        }
-        case 'grids': {
-          const g = grids.find((s) => s.id === id)
-          if (!g) return null
-          return g.config.rotation ? [g.start[0], g.start[1]] : [(g.start[0] + g.current[0]) / 2, (g.start[1] + g.current[1]) / 2]
-        }
-        case 'images': {
-          const img = images.find((s) => s.id === id)
-          if (!img) return null
-          return [(img.start[0] + img.current[0]) / 2, (img.start[1] + img.current[1]) / 2]
-        }
-        default:
-          return null
-      }
-    },
-    [polygons, circles, markers, models, stairs, doors, imagePlanes, textLabels, grids, images],
-  )
 
   // When `allowInteraction` is false (kiosk / embed style share links)
   // we lock the mapbox instance's user handlers so viewers can't
@@ -952,8 +1366,11 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // clockwise sweep of the camera around the current centre. Toggled
   // from the same bottom-left control cluster as "Navigate" so the
   // viewer stays a single-glance UI.
-  const { isRotating: isAutoRotating, toggleRotate: toggleAutoRotate } =
-    useMapRotation(mapInstance)
+  const {
+    isRotating: isAutoRotating,
+    toggleRotate: toggleAutoRotate,
+    stopRotate: stopAutoRotate,
+  } = useMapRotation(mapInstance)
 
   // ---- Route-preview (indoor wayfinding) ---------------------------------
   // End-user surface — a "Navigate" floating button flips the tool on;
@@ -961,17 +1378,6 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // uses draws a path + shows a directions panel. Toggle is local state
   // (not persisted) so refreshing the viewer resets the session.
   const [routePreviewActive, setRoutePreviewActive] = useState(false)
-  const routePreview = useRoutePreviewTool({
-    mapInstance,
-    // The hook only listens when activeTool === 'route-preview'. Pass a
-    // synthetic value so the editor's `Tool` union covers both call
-    // sites without a second code path.
-    activeTool: routePreviewActive ? 'route-preview' : 'pan',
-    walls: lines,
-    doors,
-    polygons,
-    grids,
-  })
 
   useEffect(() => {
     if (!mapInstance || fittedRef.current) return
@@ -1074,6 +1480,9 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       rotationSkipInitialRef.current = true
       return
     }
+    // A focus flight owns the camera: it folds this floor's rotation into
+    // its own bearing, and an ease here would cut it short.
+    if (focusCameraIntentRef.current !== null || isFocusFlying(mapInstance)) return
     const current = mapInstance.getBearing()
     if (Math.abs(current - selectedFloorRotation) < 0.5) return
     mapInstance.easeTo({ bearing: selectedFloorRotation, duration: 400 })
@@ -1081,11 +1490,56 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
 
   const modelUrlMap = useModelUrlMap()
   const modelBoundingCenters = useModelBoundingCenterMap()
+  // Full AABB per asset, as in the editor: the overlay rests each model's
+  // bottom on its elevation. Without it, it falls back to centre-based
+  // anchoring and scaled-up uploads (cm-authored GLBs at ×100) sink.
+  const modelBounds = useModelBoundsMap()
+  // Route planner input: every floor (the floor picker only decides what
+  // is shown — a route may pass through floors that aren't); clicks land
+  // on the shown floors.
+  const routeFacility = useMemo<FacilityRoutingInput>(
+    () => ({
+      images: allImages,
+      lines: allLines,
+      doors: allDoors,
+      polygons: allPolygons,
+      grids: allGrids,
+      stairs: allStairs,
+      circles: allCircles,
+      models: allModels,
+      modelBounds,
+    }),
+    [allImages, allLines, allDoors, allPolygons, allGrids, allStairs, allCircles, allModels, modelBounds],
+  )
+  const routePreview = useRoutePreviewTool({
+    mapInstance,
+    // The hook only listens when activeTool === 'route-preview'. Pass a
+    // synthetic value so the editor's `Tool` union covers both call
+    // sites without a second code path.
+    activeTool: routePreviewActive ? 'route-preview' : 'pan',
+    facility: routeFacility,
+    pickableFloorIds: selectedFloorPlanIds,
+  })
+  const routePortalLabel = useCallback(
+    (kind: 'stairs' | 'escalator' | 'lift', name: string, dir: 'up' | 'down' | null) =>
+      `${name || t(`routePanel.portal.${kind}`)}${dir === 'up' ? ' ↑' : dir === 'down' ? ' ↓' : ''}`,
+    [t],
+  )
+  // Bundled assets only carry bounds once their inspector is fetched —
+  // limit that to the assets placed in this facility.
+  const placedModelAssetIds = useMemo(() => {
+    const s = new Set<string>()
+    for (const m of allModels) if (m.config?.modelAssetId) s.add(m.config.modelAssetId)
+    return s
+  }, [allModels])
+  useModelInspectorMap(placedModelAssetIds)
 
   const [drawerPolygonId, setDrawerPolygonId] = useState<number | null>(null)
   const drawerPolygon: PolygonShape | undefined = useMemo(
-    () => (drawerPolygonId === null ? undefined : polygons.find((p) => p.id === drawerPolygonId)),
-    [drawerPolygonId, polygons],
+    // Every floor: a focus can open the drawer one render before the
+    // floor picker shows the area's floor.
+    () => (drawerPolygonId === null ? undefined : allPolygons.find((p) => p.id === drawerPolygonId)),
+    [drawerPolygonId, allPolygons],
   )
   const drawerBin: Bin | undefined = useMemo(() => {
     if (drawerPolygonId === null) return undefined
@@ -1158,7 +1612,6 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     if (shareSettings.themeMode) setTheme(shareSettings.themeMode)
     if (shareSettings.palette) setPalette(shareSettings.palette)
     if (shareSettings.hiddenDataLinkConfigIds?.length) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setHiddenConfigIds(new Set(shareSettings.hiddenDataLinkConfigIds))
     }
     if (shareSettings.dataLinkFilterPresets) {
@@ -1166,7 +1619,6 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     }
     if (shareSettings.defaultFloorPlanId !== undefined) {
       const pinned = shareSettings.defaultFloorPlanId
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedFloorPlanIds(pinned === null ? null : new Set([pinned]))
       floorInitializedRef.current = true
     }
@@ -1201,30 +1653,24 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     }
     return data?.dataLinkConfigs ?? []
   }, [isAuthMode, storeDataLinksAll, warehouseIdNum, data?.dataLinkConfigs])
+
   const activeStyleRules = useMemo(() => {
     if (isAuthMode) return storeStyleRulesAll ?? []
     return data?.styleRules ?? []
   }, [isAuthMode, storeStyleRulesAll, data?.styleRules])
 
-  // Build the viewer index the resolver needs to enumerate grid cell
-  // addresses for `scope='grid-cell'` rules. Without this the resolver
-  // returns an empty map for grid-cell targets (see resolver.ts:311-316:
-  // the `all + grid-cell` branch reads *exclusively* from
-  // `viewers.gridCells`). Mirrors the editor's `viewerIndex` in
+  // Build the viewer index the resolver needs to broadcast a rule to
+  // every shape of a kind. Mirrors the editor's `viewerIndex` in
   // create-grids/index.tsx.
-  const viewerIndex = useMemo<import('@/lib/style-rules').ViewerIndex>(() => {
-    const gridCells: { gridId: number; row: number; col: number; level: number }[] = []
-    for (const bin of allBins) {
-      if (bin.targetKind !== 'grid-cell') continue
-      if (bin.gridId === undefined || bin.row === undefined || bin.col === undefined) continue
-      gridCells.push({
-        gridId: bin.gridId,
-        row: bin.row,
-        col: bin.col,
-        level: bin.level ?? 0,
-      })
-    }
-    return {
+  //
+  // Grid cells are NOT listed here: `gridCellsFromBins` has the resolver
+  // enumerate every grid-cell bin with a full address itself (the same
+  // list, in the same order, this memo used to build from `allBins`).
+  // Building it here rebuilt ~50k objects on every seat event and changed
+  // the index identity, which forced the resolver to compare the whole
+  // cell list again; without it the index only changes with the shapes.
+  const viewerIndex = useMemo<import('@/lib/style-rules').ViewerIndex>(
+    () => ({
       polygons,
       circles,
       lines,
@@ -1233,9 +1679,10 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       models,
       textLabels,
       stairs,
-      gridCells,
-    }
-  }, [polygons, circles, lines, markers, images, models, textLabels, stairs, allBins])
+      gridCells: [],
+    }),
+    [polygons, circles, lines, markers, images, models, textLabels, stairs],
+  )
 
   // Resolve per-cell + per-shape style overrides from bins + style
   // rules — same call the editor makes (see create-grids/index.tsx).
@@ -1244,6 +1691,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       resolveStyleMaps(activeStyleRules, allBins, {
         zoneId: warehouseIdNum ?? undefined,
         viewers: viewerIndex,
+        gridCellsFromBins: true,
       }),
     [activeStyleRules, allBins, warehouseIdNum, viewerIndex],
   )
@@ -1303,6 +1751,24 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       ),
     [warehouseConfigs, hiddenConfigIds],
   )
+  // The report map's Live / Cluster / Heatmap controls (viewer-map-tools.tsx).
+  const floorsStacked = floorPlans.length > 1 && singleFloorId(selectedFloorPlanIds) === null
+  const mapTools = useViewerMapTools({ configs: visibleConfigs, floorsStacked })
+  // Heat stops at walls and solid objects — the route planner's shapes.
+  const pointHeatmap = useMemo(
+    () => (mapTools.pointHeatmap ? { ...mapTools.pointHeatmap, barriers: routeFacility } : null),
+    [mapTools.pointHeatmap, routeFacility],
+  )
+  // Several floors read as a stack only with the camera tilted (as on a
+  // report map): switching to them eases a flat camera to 55°. The first
+  // framing and a single floor keep whatever pitch the viewer has.
+  const wasStackedRef = useRef(floorsStacked)
+  useEffect(() => {
+    const was = wasStackedRef.current
+    wasStackedRef.current = floorsStacked
+    if (!overlayMap || !floorsStacked || was) return
+    if (overlayMap.getPitch() < 50) overlayMap.easeTo({ pitch: 55, duration: 700 })
+  }, [overlayMap, floorsStacked])
 
   // Shape items for the viewer layers panel — maps each shape kind to
   // its visible items (filtered by floor + user toggle).
@@ -1315,10 +1781,14 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       stairs: stairs.map((s) => ({ id: s.id!, name: s.name })),
       doors: doors.map((d) => ({ id: d.id, name: d.name })),
       imagePlanes: imagePlanes.map((ip) => ({ id: ip.id!, name: ip.name })),
-      textLabels: textLabels.map((tl) => ({ id: tl.id!, name: tl.name })),
+      textLabels: textLabels.map((tl) => ({ id: tl.id!, name: textLabelName(tl) })),
       grids: grids.map((g) => ({ id: g.id!, name: g.name })),
       images: images.map((img) => ({ id: img.id!, name: img.name })),
-      bins: (bins ?? []).map((b) => ({ id: b.id!, name: b.sku || b.externalCode || `Bin ${b.row ?? '?'}-${b.col ?? '?'}` })),
+      bins: (bins ?? []).map((b) => ({
+        id: b.id!,
+        name: b.sku || b.externalCode || `Bin ${b.row ?? '?'}-${b.col ?? '?'}`,
+        focusable: focusTargetForBin(b) !== null,
+      })),
     }),
     [polygons, circles, markers, models, stairs, doors, imagePlanes, textLabels, grids, images, bins],
   )
@@ -1362,36 +1832,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   // of entities (`clusterItems`, non-empty). In cluster mode a
   // scrollable list of leaves is shown; clicking one flips the drawer
   // back into single-item mode by populating `bin`.
-  const [dlEntityDrawer, setDlEntityDrawer] = useState<{
-    title: string
-    kindLabel: string
-    accentColor: string | undefined
-    bin?: Bin
-    clusterItems?: Array<{
-      payload: Record<string, unknown>
-      position: [number, number]
-    }>
-    /** v4 — rendered above the field grid in the drawer. Resolved from
-     *  `config.tooltip.panel.template` against the payload. */
-    panelHeader?: string
-    /** v4 — ordered field paths the drawer should show. When set, the
-     *  synthetic bin's `customProperties` is pre-filtered so classifyBin
-     *  can only surface these keys, in this order. */
-    panelFields?: string[]
-    /** Raw (unresolved) template — kept so cluster-item drill-in can
-     *  re-resolve it against the leaf's payload. */
-    panelTemplateRaw?: string
-    /** v4 — labelField from the layer's fieldMapping. Used by the cluster
-     *  list to title each row (sku / external_code / etc.) instead of
-     *  falling back to the generic "Item" placeholder. */
-    labelField?: string
-    /** v5.4 — source id + entity key for table-backed layers. When both
-     *  are set the drawer surfaces the History panel; otherwise the
-     *  entity has no per-row event trail (streaming path uses
-     *  `entity_events`, which the replay flow reads, not this panel). */
-    sourceId?: number
-    entityKey?: string
-  } | null>(null)
+  const [dlEntityDrawer, setDlEntityDrawer] = useState<DlEntityDrawerState | null>(null)
 
   const polygonTriggerIndex = useMemo(() => {
     const idx = new Map<number, 'hover' | 'click'>()
@@ -1402,326 +1843,926 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
     return idx
   }, [polygons])
 
-  const focusPolygon = (id: number) => {
-    setDrawerPolygonId(id)
-    const target = polygons.find((p) => p.id === id)
-    if (!target || !mapInstance) return
-    let minLng = Infinity
-    let minLat = Infinity
-    let maxLng = -Infinity
-    let maxLat = -Infinity
-    for (const [lng, lat] of target.vertices) {
-      minLng = Math.min(minLng, lng)
-      minLat = Math.min(minLat, lat)
-      maxLng = Math.max(maxLng, lng)
-      maxLat = Math.max(maxLat, lat)
-    }
-    if (!Number.isFinite(minLng)) return
-    mapInstance.fitBounds(
-      [[minLng, minLat], [maxLng, maxLat]],
-      {
-        padding: 40,
-        duration: 600,
-        maxZoom: 22,
-        bearing: mapInstance.getBearing(),
-      },
-    )
-  }
+  // ---- Focus mode ---------------------------------------------------------
+  //
+  // One focused item at a time, held here (never in a store) and handed to
+  // the overlays through FocusSceneContext / FocusBlockersContext (see the
+  // providers around the overlay stack). Every trigger goes through
+  // `focusItem`, which also opens exactly one detail drawer; closing the
+  // drawer, Esc, the chip's ✕ or a click on anything that doesn't focus
+  // something else goes through `exitFocus`. With no focus both contexts
+  // carry FOCUS_OFF / NO_BLOCKERS and the map is drawn exactly as before.
+  const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null)
+  /** Chip name a trigger supplied (data-link rows: their label field). */
+  const [focusLabel, setFocusLabel] = useState<string | null>(null)
+  /** Bumped by every focus request that moves the camera, so re-focusing the same item flies again. */
+  const [focusCameraNonce, setFocusCameraNonce] = useState(0)
+  /** Bumped by every focus action — a map click during which it changed was claimed by a trigger. */
+  const focusSeqRef = useRef(0)
+  /**
+   * True while a click on a data-link symbol is being dispatched. The
+   * symbols draw above every shape, so they win the click: the shape
+   * handlers that run after the data-link one (grid cell, area, label,
+   * door, the tooltip's override) stand down while it is set.
+   */
+  const dataLinkClickRef = useRef(false)
+  const focusActive = focusTarget !== null
 
-  // Zoom the map to a single data-link entity. Resolves the entity's
-  // anchor the same way the overlay does — coord mode reads payload
-  // coordFields (with `entity.position` fallback); shape-anchored modes
-  // resolve to the matched shape's centroid. Used by the Layers pill's
-  // per-item "zoom to" button.
-  const handleZoomToDataLinkItem = useCallback(
-    (cfg: DataLinkConfig, entity: EntityState) => {
-      if (!mapInstance) return
-      const state = useSpatialStore.getState()
-      const snapshot: MatchStoreSnapshot = {
-        bins: state.bins ?? [],
-        polygons: state.polygons ?? [],
-        markers: state.markers ?? [],
-        circles: state.circles ?? [],
-        lines: state.lines ?? [],
-        stairs: state.stairs ?? [],
-        doors: state.doors ?? [],
-        images: state.images ?? [],
-        imagePlanes: state.imagePlanes ?? [],
-        models: state.models ?? [],
-        textLabels: state.textLabels ?? [],
-      }
-      const result = resolveMatchTargets(entity.payload, cfg, snapshot)
-      let position: [number, number] | null = null
-      if (result.kind === 'coord') {
-        position = result.position
-      } else if (result.kind === 'shapes' && result.shapes.length > 0) {
-        position = centroidForDataLinkShape(result.shapes[0], cfg.targetKind)
-      }
-      // Coord-mode fallback: the overlay's PointAtCoordSubRenderer falls
-      // back to `entity.position` when the payload doesn't carry coord
-      // fields (e.g. the backend extracted coords at ingest time but
-      // didn't echo them in the payload JSON). Mirror that here so the
-      // zoom button works for those entities too.
-      if (!position && entity.position && entity.position.length === 2) {
-        position = entity.position
-      }
-      if (!position) {
-        // Debug aid: when the button silently no-ops, this logs the
-        // resolver's verdict so you can see why (e.g. join field
-        // mismatch, target shape missing from store, coordFields unset).
-        console.warn('[zoom-to-item] no position resolved', {
-          configId: cfg.id,
-          configName: cfg.name,
-          renderMode: cfg.renderMode,
-          targetKind: cfg.targetKind,
-          match: cfg.fieldMapping?.match,
-          entityKey: entity.entityKey,
-          resolver: result.kind === 'none' ? result.reason : result.kind,
-          hasEntityPosition: !!entity.position,
+  // The viewer's own rows (the store is empty on share links). Every
+  // floor: the item may sit on a floor the picker hides.
+  const focusShapes = useMemo<FocusShapes>(
+    () => ({
+      markers: allMarkers,
+      polygons: allPolygons,
+      circles: allCircles,
+      lines: allLines,
+      stairs: allStairs,
+      grids: allGrids,
+      images: allImages,
+      imagePlanes: allImagePlanes,
+      models: allModels,
+      doors: allDoors,
+      textLabels: allTextLabels,
+    }),
+    [allMarkers, allPolygons, allCircles, allLines, allStairs, allGrids, allImages, allImagePlanes, allModels, allDoors, allTextLabels],
+  )
+  const resolvedFocus = useMemo(() => resolveFocus(focusTarget, focusShapes), [focusTarget, focusShapes])
+
+  // The geometry markers / door labels hide behind — each kind gated on
+  // its own visibility (see the marker overlay). One memo, so the marker
+  // overlay, the door overlay and focus mode hand `buildOccluders` the
+  // same arrays and share one prism list / spatial index.
+  const visibleOccluders = useMemo(
+    () => ({
+      images: layerVisible('images') && isShapeKindVisible('images') ? images : undefined,
+      polygons: layerVisible('polygons') && isShapeKindVisible('polygons') ? polygons : undefined,
+      circles: layerVisible('circles') && isShapeKindVisible('circles') ? circles : undefined,
+      lines: layerVisible('lines') && isShapeKindVisible('lines') ? lines : undefined,
+      stairs: layerVisible('stairs') && isShapeKindVisible('stairs') ? stairs : undefined,
+      grids: layerVisible('racks') && isShapeKindVisible('grids') ? grids : undefined,
+    }),
+    [layerVisible, isShapeKindVisible, images, polygons, circles, lines, stairs, grids],
+  )
+  // Built only while something is focused (not gated on the Graphics
+  // occlusion toggle — blockers and the camera probe need it either way).
+  const focusPrisms = useMemo(
+    () => (focusActive ? buildOccluders(visibleOccluders) : NO_PRISMS),
+    [focusActive, visibleOccluders],
+  )
+  const focusBlockers = useTrackFocusBlockers(overlayMap, resolvedFocus, focusPrisms)
+  // The item's NEAR set (fades to FOCUS_FACTOR.near): what it sits inside,
+  // volumetric shapes on its floor within 5 m, anything overhead.
+  // Computed once per focus / floor switch, never on a camera move.
+  const focusNear = useFocusNear(resolvedFocus, focusPrisms, focusShapes)
+
+  // `?focus=` (applied further down) — declared here because leaving or
+  // moving the focus takes it out of the URL.
+  const focusParam = searchParams.get('focus')
+  const focusParamTarget = useMemo(() => parseFocusParam(focusParam), [focusParam])
+  const focusParamTag = focusParam ? `${id ?? ''}|${focusParam}` : ''
+  /** The `?focus=` tag already applied (null once the param leaves the URL, so the same link applies again). */
+  const appliedFocusParamRef = useRef<string | null>(null)
+  /** Drop `?focus=` from the URL — replace, never a new history entry. */
+  const dropFocusParam = useStableCallback(() => {
+    if (!searchParams.has('focus')) return
+    setSearchParams(withoutFocusParam, { replace: true })
+  })
+  /**
+   * Once a `?focus=` link has been applied, the URL follows the focus: when
+   * it moves off the link's item (another item, or none) the param goes, so
+   * a reload doesn't bring a stale focus back.
+   */
+  const releaseFocusParam = useStableCallback((nextKey: string) => {
+    if (focusParamReleased(appliedFocusParamRef.current, focusParamTag, focusKey(focusParamTarget), nextKey)) {
+      dropFocusParam()
+    }
+  })
+
+  const liveFloorIdSet = useMemo(() => new Set(liveFloorPlanIds), [liveFloorPlanIds])
+  const sharePinnedHiddenConfigIds = useMemo(
+    () => new Set(shareSettings?.hiddenDataLinkConfigIds ?? []),
+    [shareSettings],
+  )
+
+  /** Leave focus but keep whatever drawer is open (cluster "Back to list", a row that can't be drawn). */
+  const clearFocusOnly = useStableCallback(() => {
+    focusCameraIntentRef.current = null
+    setFocusTarget(null)
+    setFocusLabel(null)
+    releaseFocusParam('')
+  })
+
+  /** Leave focus: the map returns to its unfocused look and every drawer closes. */
+  const exitFocus = useStableCallback(() => {
+    clearFocusOnly()
+    setDrawerMarkerId(null)
+    setDrawerPolygonId(null)
+    setDlEntityDrawer(null)
+  })
+
+  /**
+   * Focus one item. Share links never reveal what the link hides: a kind,
+   * data-link layer or floor the link leaves out is refused with a toast.
+   * Toggles the viewer switched off themselves are switched back on for
+   * the focused kind / layer, and shell-only mode drops back to auto.
+   */
+  const focusItem = useStableCallback((requested: FocusTarget, opts: FocusItemOptions): boolean => {
+    focusSeqRef.current += 1
+    // Re-focusing the row already focused keeps its drawn anchor (no
+    // flicker back to "pending" while the overlay re-reports it).
+    const prev = focusTarget
+    const target: FocusTarget =
+      requested.kind === 'dl' &&
+      !requested.anchor &&
+      prev?.kind === 'dl' &&
+      prev.anchor &&
+      focusKey(prev) === focusKey(requested)
+        ? { ...requested, anchor: prev.anchor }
+        : requested
+    const refusal = focusRefusal(target, {
+      layerVisible,
+      pinnedHiddenConfigIds: sharePinnedHiddenConfigIds,
+      lockedFloorPlanId: typeof lockedFloorPlanId === 'number' ? lockedFloorPlanId : null,
+      configs: warehouseConfigs,
+      shapes: focusShapes,
+    })
+    if (refusal !== null) {
+      toast.info(
+        refusal === 'notInLink'
+          ? t('view.focus.notInLink', { defaultValue: "That item isn't part of this shared view." })
+          : t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }),
+      )
+      return false
+    }
+    const dlRef = focusDlRef(target)
+
+    const hideKey = target.kind === 'dl' ? undefined : HIDE_KEY_OF_FOCUS[target.kind]
+    if (hideKey) {
+      setHiddenShapeKinds((prev) => {
+        if (!prev.has(hideKey)) return prev
+        const next = new Set(prev)
+        next.delete(hideKey)
+        return next
+      })
+    }
+    if (dlRef) {
+      setHiddenConfigIds((prev) => {
+        if (!prev.has(dlRef.configId)) return prev
+        const next = new Set(prev)
+        next.delete(dlRef.configId)
+        return next
+      })
+    }
+    if (shellMode === 'shell-only') setShellMode('auto')
+
+    setFocusTarget(target)
+    setFocusLabel(opts.label ?? null)
+    // Exactly one drawer: the one this focus asks for, or none.
+    setDrawerMarkerId(opts.drawer === 'marker' && target.kind === 'markers' ? target.id : null)
+    setDrawerPolygonId(opts.drawer === 'polygon' && target.kind === 'polygons' ? target.id : null)
+    setDlEntityDrawer(opts.dlDrawer ?? null)
+
+    if (opts.camera === 'none') {
+      focusCameraIntentRef.current = null
+    } else {
+      focusCameraIntentRef.current = { key: focusKey(target), mode: opts.camera, floorSwitched: false }
+      setFocusCameraNonce((n) => n + 1)
+    }
+    releaseFocusParam(focusKey(target))
+    return true
+  })
+
+  /** Open the data-link drawer for something that isn't one row (a cluster list, a keyless row). */
+  const showDataLinkDrawerOnly = useStableCallback((state: DlEntityDrawerState) => {
+    focusSeqRef.current += 1
+    clearFocusOnly()
+    setDrawerMarkerId(null)
+    setDrawerPolygonId(null)
+    setDlEntityDrawer(state)
+  })
+
+  /**
+   * Focus one data-link row and open its drawer. Shape-bound layers
+   * (marker / polygon) focus the shape instead — with the row as its
+   * `dl` sub-ref so the row's symbol is exempt too — and open the
+   * shape's drawer, the same UX as clicking the shape itself. Shared by
+   * the map click, the popup's "View more" and the Layers pill.
+   */
+  const focusDataLinkEntity = useStableCallback(
+    (
+      cfg: DataLinkConfig,
+      payload: Record<string, unknown>,
+      entityKey: string | undefined,
+      opts: { camera: FocusItemOptions['camera']; anchor?: DlAnchor },
+    ) => {
+      if (cfg.id === undefined) return
+      const shapeId = cfg.targetShapeId
+      if (shapeId !== undefined && shapeId !== null && (cfg.targetKind === 'marker' || cfg.targetKind === 'polygon')) {
+        const dl = entityKey !== undefined ? { configId: cfg.id, entityKey } : undefined
+        const kind = cfg.targetKind === 'marker' ? 'markers' : 'polygons'
+        focusItem(dl ? { kind, id: shapeId, dl } : { kind, id: shapeId }, {
+          camera: opts.camera,
+          drawer: drawerForFocusKind(kind),
         })
         return
       }
-      mapInstance.flyTo({
-        center: position,
-        zoom: Math.max(mapInstance.getZoom(), 18),
-        duration: 600,
-        essential: true,
-      })
+      const drawer = dataLinkDrawerFor(cfg, payload, entityKey, t('view.drawer.kind.asset', { defaultValue: 'Asset' }))
+      if (entityKey === undefined) {
+        showDataLinkDrawerOnly(drawer)
+        return
+      }
+      focusItem(
+        opts.anchor
+          ? { kind: 'dl', configId: cfg.id, entityKey, anchor: opts.anchor }
+          : { kind: 'dl', configId: cfg.id, entityKey },
+        { camera: opts.camera, dlDrawer: drawer, label: dataLinkLabelOf(cfg, payload, entityKey) },
+      )
     },
-    [mapInstance],
   )
 
-  // Polygon selection outline — the drawer highlights the currently
-  // opened polygon on the map.
+  // The data-link overlay → here: where the pending row is drawn (or null
+  // when it can't be). The anchor merges into the target; the key stays.
+  const onDlAnchor = useStableCallback((key: string, anchor: DlAnchor | null) => {
+    const current = focusTarget
+    if (!current || current.kind !== 'dl' || focusKey(current) !== key) return
+    if (!anchor) {
+      toast.info(t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }))
+      clearFocusOnly()
+      return
+    }
+    if (typeof lockedFloorPlanId === 'number' && anchor.floorPlanId !== null && anchor.floorPlanId !== lockedFloorPlanId) {
+      toast.info(t('view.focus.notInLink', { defaultValue: "That item isn't part of this shared view." }))
+      exitFocus()
+      return
+    }
+    const prev = current.anchor
+    if (
+      prev &&
+      prev.position[0] === anchor.position[0] &&
+      prev.position[1] === anchor.position[1] &&
+      prev.elevationM === anchor.elevationM &&
+      prev.floorPlanId === anchor.floorPlanId
+    ) {
+      return
+    }
+    setFocusTarget((tgt) => (tgt && tgt.kind === 'dl' && focusKey(tgt) === key ? { ...tgt, anchor } : tgt))
+  })
+
+  // A focused record keeps the camera while its table plays back (history
+  // player): the camera eases onto it and the anchor — so the ring and the
+  // fades — moves with it. Dragging the map pauses; the chip resumes.
+  const followCfg = focusTarget?.kind === 'dl' ? visibleConfigs.find((c) => c.id === focusTarget.configId) : undefined
+  const followKey = focusTarget?.kind === 'dl' ? focusTarget.entityKey : null
+  const follow = useFollowEntity(overlayMap, {
+    config: followCfg,
+    entityKey: followKey,
+    enabled: followCfg?.renderMode === 'history-movement',
+    onMove: (point) => {
+      // Only moves the anchor the overlay reported (see facility-map.tsx).
+      if (focusTarget?.kind !== 'dl' || !focusTarget.anchor) return
+      onDlAnchor(focusKey(focusTarget), { position: point, elevationM: focusTarget.anchor.elevationM, floorPlanId: focusTarget.anchor.floorPlanId })
+    },
+  })
+
+  // Backstop: a data-link row the overlay never reports (its layer never
+  // loads) must not leave a pending focus up forever.
+  const pendingDlKey = focusTarget?.kind === 'dl' && !focusTarget.anchor ? focusKey(focusTarget) : ''
+  const giveUpPendingDl = useStableCallback((key: string) => {
+    if (focusTarget?.kind !== 'dl' || focusTarget.anchor || focusKey(focusTarget) !== key) return
+    toast.info(t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }))
+    clearFocusOnly()
+  })
+  useEffect(() => {
+    if (pendingDlKey === '') return
+    const timer = setTimeout(() => giveUpPendingDl(pendingDlKey), DL_ANCHOR_TIMEOUT_MS)
+    return () => clearTimeout(timer)
+  }, [pendingDlKey, giveUpPendingDl])
+
+  const focusScene = useFocusSceneValue({
+    target: focusTarget,
+    resolved: resolvedFocus,
+    near: focusNear,
+    onDlAnchor,
+  })
+
+  // The focused shape gets its overlay's own selection highlight (markers
+  // are styled through `data-focus-tier` instead; a rack bin gets the grid
+  // overlay's focus layer, not the whole rack's outline).
+  let focusSelKind: FocusShapeKind | null = null
+  let focusSelId: number | null = null
+  if (focusTarget && focusTarget.kind !== 'dl' && focusTarget.kind !== 'markers' && !focusTarget.cell) {
+    focusSelKind = focusTarget.kind
+    focusSelId = focusTarget.id
+  }
+  const focusSelection = useMemo(
+    () =>
+      focusSelKind !== null && focusSelId !== null
+        ? { kind: focusSelKind, ids: new Set([focusSelId]) as ReadonlySet<number> }
+        : null,
+    [focusSelKind, focusSelId],
+  )
+  const focusSelectedIds = (kind: FocusShapeKind): ReadonlySet<number> | undefined =>
+    focusSelection?.kind === kind ? focusSelection.ids : undefined
+
+  // Polygon selection outline — the open area drawer and the focused area.
   const selectedPolygonIds = useMemo(() => {
     const set = new Set<number>()
     if (drawerPolygonId !== null) set.add(drawerPolygonId)
+    if (focusSelKind === 'polygons' && focusSelId !== null) set.add(focusSelId)
     return set
-  }, [drawerPolygonId])
+  }, [drawerPolygonId, focusSelKind, focusSelId])
 
-  const handlePolygonClick = (id: number) => {
-    if (polygonTriggerIndex.get(id) === 'click') {
-      focusPolygon(id)
-    }
-  }
-  const handleMarkerClick = (id: number) => {
-    setDrawerMarkerId(id)
-  }
+  // Show the focused item's floor when the picker hides it: a single-floor
+  // pick switches to it, a multi-floor pick adds it. A floor-locked share
+  // link is never overridden (its items were checked in `focusItem`).
+  const showFocusFloor = useStableCallback((key: string, floor: number) => {
+    if (typeof lockedFloorPlanId === 'number') return
+    const next = floorSelectionShowing(selectedFloorPlanIds, floor, liveFloorIdSet)
+    if (next === undefined) return
+    const intent = focusCameraIntentRef.current
+    if (intent && intent.key === key) intent.floorSwitched = true
+    setSelectedFloorPlanIds(next)
+  })
+  const focusFloorKey = resolvedFocus?.key ?? ''
+  const focusFloorId = resolvedFocus?.floorPlanId ?? null
+  useEffect(() => {
+    if (focusFloorKey === '' || focusFloorId === null) return
+    showFocusFloor(focusFloorKey, focusFloorId)
+  }, [focusFloorKey, focusFloorId, showFocusFloor])
 
-  const clickShapeOverride = (
-    kind: 'polygon' | 'circle' | 'line' | 'marker' | 'image' | 'model',
-    id: number,
-  ): boolean | void => {
-    if (kind === 'polygon') {
-      focusPolygon(id)
-      return true
+  // Bring the camera to the item once its floor is on screen: a clear line
+  // of sight when there is one (`flyToFocus` probes pitches / bearings),
+  // clear of the drawer, with the new floor's rotation folded in. A map
+  // click ('reveal') only pans the item out from under the drawer.
+  const anyDrawerOpen = drawerMarkerId !== null || drawerPolygonId !== null || dlEntityDrawer !== null
+  useEffect(() => {
+    const intent = focusCameraIntentRef.current
+    if (!intent || !overlayMap || !resolvedFocus || resolvedFocus.key !== intent.key) return
+    const locked = typeof lockedFloorPlanId === 'number' ? lockedFloorPlanId : null
+    if (!focusFloorShown(selectedFloorPlanIds, resolvedFocus.floorPlanId, liveFloorIdSet, locked)) {
+      return // the floor switch above hasn't rendered yet
     }
-    if (kind === 'marker') {
-      setDrawerMarkerId(id)
-      return true
-    }
-    return
-  }
-
-  const kindLabelForDataLinkConfig = (
-    cfg: import('@/lib/db').DataLinkConfig,
-  ): string => {
-    return cfg.name || 'Asset'
-  }
-
-  /**
-   * Route a data-link entity payload to the right drawer:
-   *   - Shape-bound configs (marker / polygon) → focus the shape's
-   *     dedicated drawer so it shares the same UX as clicking the
-   *     shape itself.
-   *   - Coord-based configs → synthesise a Bin from the payload and
-   *     open the entity drawer.
-   * Shared by the map click handler AND the popup's "View more"
-   * callback so the two entry points produce identical results.
-   */
-  const openDataLinkEntityDrawer = (
-    cfg: import('@/lib/db').DataLinkConfig,
-    payload: Record<string, unknown>,
-    /** Optional — the map feature's `entityKey` prop. When present +
-     *  the layer is table-backed, the drawer surfaces the History
-     *  panel for this row's change trail. */
-    entityKey?: string,
-  ) => {
-    if (cfg.targetShapeId !== undefined && cfg.targetShapeId !== null) {
-      if (cfg.targetKind === 'marker') {
-        setDrawerMarkerId(cfg.targetShapeId)
-        return
-      }
-      if (cfg.targetKind === 'polygon') {
-        setDrawerPolygonId(cfg.targetShapeId)
-        return
-      }
-    }
-    const { customProperties, header } = applyPanelConfig(payload, cfg)
-    const bin: Bin = {
-      targetKind: 'polygon',
-      customProperties,
-      updatedAt: new Date(),
-    }
-    setDlEntityDrawer({
-      title: kindLabelForDataLinkConfig(cfg),
-      kindLabel: 'Asset',
-      accentColor: cfg.style?.defaultColor,
-      bin,
-      panelHeader: header,
-      panelFields: cfg.tooltip.panel?.fields ?? cfg.tooltip.fields,
-      labelField: cfg.fieldMapping?.labelField,
-      sourceId: cfg.sourceId ?? undefined,
-      entityKey,
+    focusCameraIntentRef.current = null
+    // The auto-rotate loop sets the bearing every frame and would cut the flight short.
+    if (isAutoRotating) stopAutoRotate()
+    // The focus owns the camera from here: the first fit stands down (a
+    // fit already under way is cut short by `flyToFocus`'s `map.stop()`).
+    // Set only now, so a `?focus=` link that is refused, stale or still
+    // waiting for its row keeps the normal first fit.
+    fittedRef.current = true
+    flyToFocus(overlayMap, resolvedFocus, focusPrisms, {
+      mode: intent.mode,
+      padding: focusPaddingFor(overlayMap, anyDrawerOpen, isRtl),
+      bearing:
+        intent.mode !== 'reveal' && intent.floorSwitched && selectedFloorRotation !== null
+          ? selectedFloorRotation
+          : undefined,
     })
-  }
+  }, [
+    focusCameraNonce,
+    overlayMap,
+    resolvedFocus,
+    selectedFloorPlanIds,
+    liveFloorIdSet,
+    lockedFloorPlanId,
+    focusPrisms,
+    anyDrawerOpen,
+    isRtl,
+    selectedFloorRotation,
+    isAutoRotating,
+    stopAutoRotate,
+  ])
+
+  // Esc leaves focus (a drawer's own Esc closes it first, which also leaves).
+  // Map clicks are handled below instead of by the hook's "empty click":
+  // in the viewer a click on a floor plate, a hover-only area or a wall
+  // focuses nothing, so it counts as empty even though it hits a layer.
+  useFocusExit(overlayMap, focusActive, exitFocus, { emptyClick: false })
+  // Also live while only a drawer is open (a cluster list): the drawer
+  // has no scrim any more, so an unclaimed map click is what closes it.
+  const clickExitActive = focusActive || anyDrawerOpen
+  useEffect(() => {
+    if (!overlayMap || !clickExitActive || routePreviewActive) return
+    const container = overlayMap.getCanvasContainer()
+    let live = true
+    // Snapshot at press time: every focus trigger runs between the press
+    // and this click's listeners (overlays register before this one).
+    let seqAtPress = focusSeqRef.current
+    const onPress = () => {
+      seqAtPress = focusSeqRef.current
+    }
+    const onClick = (e: MapMouseEvent) => {
+      queueMicrotask(() => {
+        if (!live || focusSeqRef.current !== seqAtPress) return
+        const target = (e.originalEvent as Event | undefined)?.target
+        if (target instanceof Element && target.closest('.shape-marker,.mapboxgl-popup')) return
+        exitFocus()
+      })
+    }
+    container.addEventListener('pointerdown', onPress, true)
+    overlayMap.on('click', onClick)
+    return () => {
+      live = false
+      container.removeEventListener('pointerdown', onPress, true)
+      overlayMap.off('click', onClick)
+    }
+  }, [overlayMap, clickExitActive, routePreviewActive, exitFocus])
+
+  // ---- Focus triggers -----------------------------------------------------
+
+  const handlePolygonClick = useStableCallback((id: number) => {
+    if (dataLinkClickRef.current) return
+    if (polygonTriggerIndex.get(id) === 'click') {
+      focusItem({ kind: 'polygons', id }, { camera: 'always', drawer: 'polygon' })
+    }
+  })
+  // Map clicks use camera 'reveal': the item is already on screen, so the
+  // camera only pans when the drawer that opens would cover it.
+  const handleMarkerClick = useStableCallback((id: number) => {
+    focusItem({ kind: 'markers', id }, { camera: 'reveal', drawer: 'marker' })
+  })
+  const handleTextLabelClick = useStableCallback((id: number) => {
+    if (dataLinkClickRef.current) return
+    focusItem({ kind: 'text-labels', id }, { camera: 'reveal' })
+  })
+  const handleDoorClick = useStableCallback((id: number) => {
+    if (dataLinkClickRef.current) return
+    focusItem({ kind: 'doors', id }, { camera: 'reveal' })
+  })
+  const handleGridCellClick = useStableCallback((gridId: number, row: number, col: number, level: number) => {
+    if (dataLinkClickRef.current || row < 0 || col < 0) return
+    focusItem({ kind: 'grids', id: gridId, cell: { row, col, level } }, { camera: 'reveal' })
+  })
+
+  // MapShapeTooltip calls this for click-trigger shapes with linked data
+  // (and from a hover popup's "View more"). Areas and markers take the
+  // click over (drawer); circles / walls / floor plans / models focus but
+  // keep their popup. Hover-trigger shapes are never focused from here.
+  const clickShapeOverride = useStableCallback(
+    (kind: 'polygon' | 'circle' | 'line' | 'marker' | 'image' | 'model', id: number): boolean | void => {
+      // A data-link symbol on top of this shape took the click (and no
+      // popup should open for the shape under it).
+      if (dataLinkClickRef.current) return true
+      if (kind === 'polygon') {
+        focusItem({ kind: 'polygons', id }, { camera: 'always', drawer: 'polygon' })
+        return true
+      }
+      if (kind === 'marker') {
+        focusItem({ kind: 'markers', id }, { camera: 'reveal', drawer: 'marker' })
+        return true
+      }
+      const trigger =
+        kind === 'circle'
+          ? allCircles.find((c) => c.id === id)?.config.tooltipTrigger
+          : kind === 'line'
+            ? allLines.find((l) => l.id === id)?.config.tooltipTrigger
+            : kind === 'image'
+              ? allImages.find((img) => img.id === id)?.config.tooltipTrigger
+              : allModels.find((m) => m.id === id)?.config.tooltipTrigger
+      if (trigger !== 'click') return
+      const focusKind = FOCUS_KIND_OF_BINDING[kind]
+      if (focusKind) focusItem({ kind: focusKind, id }, { camera: 'reveal' })
+      return
+    },
+  )
+
+  // The popup's "View more" — one identity for the page's lifetime, so
+  // the data-link overlay's tooltip context doesn't change every render.
+  // The row's anchor comes from the overlay (`onDlAnchor`).
+  const onDataLinkViewMore = useStableCallback(
+    (
+      cfg: DataLinkConfig,
+      payload: Record<string, unknown>,
+      _lngLat: { lng: number; lat: number },
+      entityKey?: string,
+    ) => focusDataLinkEntity(cfg, payload, entityKey, { camera: 'reveal' }),
+  )
+
+  // Layers pill → "Show on map".
+  const handleFocusLayerItem = useStableCallback((kind: ShapeLayerKind, id: number) => {
+    const target: FocusTarget | null =
+      kind === 'bins' ? focusTargetForBin(allBins.find((b) => b.id === id)) : { kind: FOCUS_KIND_OF_LAYER[kind], id }
+    if (!target) {
+      toast.info(t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }))
+      return
+    }
+    focusItem(target, { camera: 'always', drawer: drawerForFocusKind(target.kind) })
+  })
+  const handleFocusDataLinkItem = useStableCallback((cfg: DataLinkConfig, entity: EntityState) => {
+    focusDataLinkEntity(cfg, entity.payload, entity.entityKey, { camera: 'always' })
+  })
+
+  // Viewer search → focus.
+  const handleSearchPick = useStableCallback((r: SearchResult) => {
+    const target: FocusTarget | null =
+      r.kind === 'rack'
+        ? r.grid.id !== undefined
+          ? { kind: 'grids', id: r.grid.id }
+          : null
+        : r.kind === 'bin'
+          ? focusTargetForBin(r.bin)
+          : r.kind === 'marker'
+            ? r.marker.id !== undefined
+              ? { kind: 'markers', id: r.marker.id }
+              : null
+            : r.model.id !== undefined
+              ? { kind: 'models', id: r.model.id }
+              : null
+    if (!target) {
+      toast.info(t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }))
+      return
+    }
+    focusItem(target, { camera: 'always', drawer: drawerForFocusKind(target.kind) })
+  })
+
+  // What the search may offer: only kinds the share link shows, and on a
+  // floor-locked link only that floor's rows.
+  const inLinkFloor = useCallback(
+    <T extends { floorPlanId?: number }>(rows: readonly T[]): readonly T[] =>
+      typeof lockedFloorPlanId === 'number'
+        ? rows.filter((r) => r.floorPlanId === undefined || r.floorPlanId === lockedFloorPlanId)
+        : rows,
+    [lockedFloorPlanId],
+  )
+  const searchGrids = useMemo(
+    () => (layerVisible('racks') ? inLinkFloor(allGrids) : []),
+    [layerVisible, inLinkFloor, allGrids],
+  )
+  const searchBins = useMemo(() => {
+    if (!layerVisible('racks')) return []
+    if (typeof lockedFloorPlanId !== 'number') return allBins
+    return allBins.filter((b) => {
+      if (b.gridId === undefined) return true
+      const floor = gridFloorIndex.get(b.gridId)
+      return floor === undefined || floor === lockedFloorPlanId
+    })
+  }, [layerVisible, lockedFloorPlanId, allBins, gridFloorIndex])
+  const searchMarkers = useMemo(
+    () => (layerVisible('markers') ? inLinkFloor(allMarkers) : []),
+    [layerVisible, inLinkFloor, allMarkers],
+  )
+  const searchModels = useMemo(
+    () => (layerVisible('models') ? inLinkFloor(allModels) : []),
+    [layerVisible, inLinkFloor, allModels],
+  )
+
+  // ---- `?focus=` share / deep link ---------------------------------------
+  // `/view/:id?focus=markers:12` and `/share/:token?focus=dl:343:<key>` open
+  // the facility focused. Applied once per facility + param, after the
+  // data, the first floor pick and (share links) the link's own settings.
+  // The first fit is NOT skipped here: the focus camera effect takes the
+  // camera over only when it actually moves to the item, so a link that is
+  // refused, stale or still waiting for its row still gets framed. Once
+  // applied, the param leaves the URL as soon as the focus moves off its
+  // item (`releaseFocusParam`); a refused or unreadable link leaves at once.
+  const focusParamEntityKind = focusParamTarget ? ENTITY_KIND_OF_FOCUS[focusParamTarget.kind] : null
+  const focusParamKindLoaded = useSpatialStore((st) =>
+    focusParamEntityKind === null ? true : st.loadedFor[focusParamEntityKind] === warehouseIdNum,
+  )
+  const focusParamReady =
+    !isAuthMode ||
+    (focusParamTarget?.kind === 'doors' ? doorsLoadedFor === warehouseIdNum : focusParamKindLoaded)
+  useEffect(() => {
+    if (focusParamTag === '') {
+      // Gone from the URL (exit, or navigated away): the same link pasted
+      // again applies again.
+      appliedFocusParamRef.current = null
+      return
+    }
+    if (appliedFocusParamRef.current === focusParamTag) return
+    if (viewerLoading || !focusParamReady) return
+    if (floorPlanIdsKey !== '' && !floorInitializedRef.current) return
+    if (shareTokenForLookup && shareSettings && appliedSettingsForTokenRef.current !== shareTokenForLookup) return
+    appliedFocusParamRef.current = focusParamTag
+    if (!focusParamTarget) {
+      toast.info(t('view.focus.notFound', { defaultValue: 'That item is no longer on this map.' }))
+      dropFocusParam()
+      return
+    }
+    if (!focusItem(focusParamTarget, { camera: 'always', drawer: drawerForFocusKind(focusParamTarget.kind) })) {
+      dropFocusParam() // refused (toast shown): a reload would only refuse it again
+    }
+  }, [
+    focusParamTag,
+    focusParamTarget,
+    focusParamReady,
+    viewerLoading,
+    floorPlanIdsKey,
+    shareTokenForLookup,
+    shareSettings,
+    focusItem,
+    dropFocusParam,
+    t,
+  ])
+
+  // ---- Focus chip ---------------------------------------------------------
+  const focusChipKind =
+    focusTarget === null ? '' : focusTarget.kind === 'grids' && focusTarget.cell ? 'cell' : focusTarget.kind
+  const focusChipName = useMemo(() => {
+    const tgt = focusTarget
+    if (!tgt) return ''
+    const nameIn = (rows: ReadonlyArray<{ id?: number; name?: string }>, rowId: number) =>
+      rows.find((r) => r.id === rowId)?.name ?? ''
+    switch (tgt.kind) {
+      case 'dl':
+        return focusLabel || tgt.entityKey
+      case 'markers':
+        return nameIn(allMarkers, tgt.id)
+      case 'polygons':
+        return nameIn(allPolygons, tgt.id)
+      case 'circles':
+        return nameIn(allCircles, tgt.id)
+      case 'lines':
+        return nameIn(allLines, tgt.id)
+      case 'stairs':
+        return nameIn(allStairs, tgt.id)
+      case 'images':
+        return nameIn(allImages, tgt.id)
+      case 'image-planes':
+        return nameIn(allImagePlanes, tgt.id)
+      case 'models':
+        return nameIn(allModels, tgt.id)
+      case 'doors':
+        return nameIn(allDoors, tgt.id)
+      case 'text-labels':
+        return textLabelName(allTextLabels.find((l) => l.id === tgt.id))
+      case 'grids': {
+        const gridName = nameIn(allGrids, tgt.id)
+        const cell = tgt.cell
+        if (!cell) return gridName
+        const bin = allBins.find(
+          (b) =>
+            b.targetKind === 'grid-cell' &&
+            b.gridId === tgt.id &&
+            b.row === cell.row &&
+            b.col === cell.col &&
+            (b.level ?? 0) === cell.level,
+        )
+        return bin?.sku || bin?.externalCode || `${gridName ? `${gridName} · ` : ''}${cell.row},${cell.col}`
+      }
+    }
+    return ''
+  }, [
+    focusTarget,
+    focusLabel,
+    allMarkers,
+    allPolygons,
+    allCircles,
+    allLines,
+    allStairs,
+    allImages,
+    allImagePlanes,
+    allModels,
+    allDoors,
+    allTextLabels,
+    allGrids,
+    allBins,
+  ])
+  const copyFocusLink = useStableCallback(async () => {
+    if (!focusTarget) return
+    const url = `${window.location.origin}${window.location.pathname}?focus=${encodeURIComponent(formatFocusParam(focusTarget))}`
+    try {
+      await navigator.clipboard.writeText(url)
+      toast.success(t('view.focus.linkCopied', { defaultValue: 'Link copied' }))
+    } catch {
+      /* clipboard blocked (insecure context / permission) — nothing to copy into */
+    }
+  })
+
+  // Picking the shell-only view leaves focus: the interior it points into is hidden.
+  const changeShellMode = useStableCallback((next: 'auto' | 'shell-only' | 'interior-only') => {
+    if (next === 'shell-only') exitFocus()
+    setShellMode(next)
+  })
+
+  // Drawer clicks on the map switch focus instead of closing the drawer.
+  const isMapEventTarget = useCallback(
+    (target: EventTarget | null) =>
+      !!mapInstance && target instanceof Node && mapInstance.getContainer().contains(target),
+    [mapInstance],
+  )
 
   // Click on a data-link widget (sensor / camera / asset — any layer
-  // whose id starts with `dl-{configId}-`) opens the shared drawer.
-  //   - If the widget's config binds to a marker/polygon, open the
-  //     shape drawer for that shape id (uses its Bin like normal).
-  //   - Otherwise (point-at-coord / heatmap / track — no shape id),
-  //     synthesise a Bin from the clicked feature's payload so the
-  //     ShapeDetailDrawer can render the same UX with live data.
-  useEffect(() => {
-    if (!mapInstance) return
-    const readPayload = (props: Record<string, unknown> | null | undefined): Record<string, unknown> => {
-      if (!props) return {}
-      const raw = props['payload']
-      if (typeof raw === 'string') {
-        try { return JSON.parse(raw) as Record<string, unknown> } catch { /* fallthrough */ }
-      }
-      if (raw && typeof raw === 'object') return raw as Record<string, unknown>
-      // No `payload` key — treat every property as the payload.
-      return props
+  // whose id starts with `dl-{configId}-`) focuses that row and opens
+  // its drawer (`focusDataLinkEntity`). A cluster opens the drawer in
+  // list mode; picking a row there focuses it (`handleSelectClusterItem`).
+  const handleDataLinkMapClick = useStableCallback((e: MapMouseEvent) => {
+    const map = mapInstance
+    if (!map) return
+    let hits: Array<{
+      layer?: { id?: string; source?: string }
+      properties?: Record<string, unknown> | null
+      geometry?: GeoJSON.Geometry | null
+      source?: string
+    }>
+    // Query the data-link layers only. Unfiltered, every click
+    // hit-tested every rendered layer (the stadium's ~50k seat
+    // extrusions included) just to skip the non-`dl-` hits below.
+    // Same hits, same top-down order, for the layers that matter.
+    const dlLayerIds = rootLayerOrder(map).filter(
+      (layerId) => layerId.startsWith('dl-') && hasMapLayer(map, layerId),
+    )
+    if (dlLayerIds.length === 0) return
+    try {
+      hits = map.queryRenderedFeatures(e.point, { layers: dlLayerIds }) as typeof hits
+    } catch {
+      return
     }
-    const onDlClick = (e: import('mapbox-gl').MapMouseEvent) => {
-      let hits: Array<{
-        layer?: { id?: string; source?: string }
-        properties?: Record<string, unknown> | null
-        source?: string
-      }>
-      try {
-        hits = mapInstance.queryRenderedFeatures(e.point) as typeof hits
-      } catch {
-        return
-      }
-      for (const hit of hits) {
-        const layerId = hit.layer?.id
-        if (typeof layerId !== 'string' || !layerId.startsWith('dl-')) continue
-        const rest = layerId.slice('dl-'.length)
-        const dash = rest.indexOf('-')
-        const configId = Number(dash === -1 ? rest : rest.slice(0, dash))
-        if (!Number.isFinite(configId)) continue
-        const cfg = warehouseConfigs.find((c) => c.id === configId)
-        if (!cfg) continue
-        e.preventDefault()
+    for (const hit of hits) {
+      const layerId = hit.layer?.id
+      if (typeof layerId !== 'string' || !layerId.startsWith('dl-')) continue
+      const rest = layerId.slice('dl-'.length)
+      const dash = rest.indexOf('-')
+      const configId = Number(dash === -1 ? rest : rest.slice(0, dash))
+      if (!Number.isFinite(configId)) continue
+      const cfg = warehouseConfigs.find((c) => c.id === configId)
+      if (!cfg || cfg.id === undefined) continue
+      // Claim the click on both event flavours (the overlays' protocol),
+      // so the shape handlers that run after this one bail.
+      e.preventDefault()
+      e.originalEvent?.preventDefault?.()
+      dataLinkClickRef.current = true
+      queueMicrotask(() => {
+        dataLinkClickRef.current = false
+      })
+      // Claimed: whatever opens below (possibly after an async leaf
+      // fetch), this click must not count as an empty one.
+      focusSeqRef.current += 1
 
-        // Cluster hit — a `-cluster` or `-cluster-count` layer carries
-        // `{cluster: true, cluster_id, point_count}` properties for
-        // native Mapbox clusters, OR `{manualCluster: true, groupKey,
-        // point_count}` for our room-aware manual clusters. Both
-        // paths open the drawer in list mode; only how we fetch the
-        // leaves differs. The individual-item detail rendered when
-        // the user clicks a row is identical.
-        const isCluster = /-cluster(-count)?$/.test(layerId)
-        if (isCluster) {
-          const props = hit.properties ?? {}
-          const pointCount =
-            typeof props['point_count'] === 'number'
-              ? (props['point_count'] as number)
-              : Number(props['point_count'] ?? 0) || 0
-          const openList = (
-            leaves: Array<{
-              properties?: Record<string, unknown> | null
-              geometry?: GeoJSON.Geometry | null
-            }>,
-          ) => {
-            const items: Array<{
-              payload: Record<string, unknown>
-              position: [number, number]
-            }> = []
-            for (const leaf of leaves) {
-              const payload = readPayload(
-                leaf.properties as Record<string, unknown> | null,
-              )
-              const geom = leaf.geometry
-              const coords =
-                geom && geom.type === 'Point'
-                  ? (geom.coordinates as [number, number])
-                  : [0, 0]
-              items.push({ payload, position: [coords[0], coords[1]] })
-            }
-            setDlEntityDrawer({
-              title: `${kindLabelForDataLinkConfig(cfg)} · ${pointCount || items.length}`,
-              kindLabel: kindLabelForDataLinkConfig(cfg),
-              accentColor: cfg.style?.defaultColor,
-              clusterItems: items,
-              panelFields: cfg.tooltip.panel?.fields ?? cfg.tooltip.fields,
-              panelTemplateRaw: cfg.tooltip.panel?.template,
-              labelField: cfg.fieldMapping?.labelField,
+      // Cluster hit — a `-cluster` or `-cluster-count` layer carries
+      // `{cluster: true, cluster_id, point_count}` properties for
+      // native Mapbox clusters, OR `{manualCluster: true, groupKey,
+      // point_count}` for our room-aware manual clusters. Both
+      // paths open the drawer in list mode; only how we fetch the
+      // leaves differs. The individual-item detail rendered when
+      // the user clicks a row is identical.
+      const isCluster = /-cluster(-count)?$/.test(layerId)
+      if (isCluster) {
+        const props = hit.properties ?? {}
+        const pointCount =
+          typeof props['point_count'] === 'number'
+            ? (props['point_count'] as number)
+            : Number(props['point_count'] ?? 0) || 0
+        const openList = (
+          leaves: Array<{
+            properties?: Record<string, unknown> | null
+            geometry?: GeoJSON.Geometry | null
+          }>,
+        ) => {
+          const items: DlClusterItem[] = []
+          for (const leaf of leaves) {
+            const leafProps = leaf.properties as Record<string, unknown> | null
+            const payload = readFeaturePayload(leafProps)
+            const geom = leaf.geometry
+            const coords =
+              geom && geom.type === 'Point'
+                ? (geom.coordinates as [number, number])
+                : [0, 0]
+            const rawKey = leafProps?.['entityKey']
+            items.push({
+              payload,
+              position: [coords[0], coords[1]],
+              entityKey: typeof rawKey === 'string' && rawKey !== '' ? rawKey : undefined,
+              anchor: dataLinkAnchorOf(geom, leafProps, dataLinkEntityFloor(payload, cfg, liveFloorIdSet)),
             })
           }
-          // Manual cluster path — the aggregate feature carries
-          // `manualCluster: true` and its `groupKey` tells us which
-          // room to filter the raw feature list on.
-          if (props['manualCluster'] === true || props['manualCluster'] === 'true') {
-            const groupKey = String(props['groupKey'] ?? '')
-            const leaves = getManualClusterLeaves(configId, groupKey)
-            openList(leaves)
-            return
-          }
-          // Native Mapbox cluster path.
-          const clusterId =
-            typeof props['cluster_id'] === 'number'
-              ? (props['cluster_id'] as number)
-              : Number(props['cluster_id'])
-          const sourceId = hit.layer?.source ?? `dl-${configId}-src`
-          const source = mapInstance.getSource(sourceId) as
-            | (mapboxgl.GeoJSONSource & {
-                getClusterLeaves?: (
-                  clusterId: number,
-                  limit: number,
-                  offset: number,
-                  cb: (err: unknown, features: GeoJSON.Feature[]) => void,
-                ) => void
-              })
-            | undefined
-          if (!source?.getClusterLeaves || !Number.isFinite(clusterId)) return
-          source.getClusterLeaves(clusterId, 1000, 0, (err, leaves) => {
-            if (err || !leaves) {
-              console.warn('[view] getClusterLeaves failed', err)
-              return
-            }
-            openList(leaves)
+          const assetLabel = t('view.drawer.kind.asset', { defaultValue: 'Asset' })
+          showDataLinkDrawerOnly({
+            title: `${cfg.name || assetLabel} · ${pointCount || items.length}`,
+            kindLabel: cfg.name || assetLabel,
+            accentColor: cfg.style?.defaultColor,
+            clusterItems: items,
+            panelFields: cfg.tooltip.panel?.fields ?? cfg.tooltip.fields,
+            panelTemplateRaw: cfg.tooltip.panel?.template,
+            labelField: cfg.fieldMapping?.labelField,
+            configId: cfg.id,
           })
+        }
+        // Manual cluster path — the aggregate feature carries
+        // `manualCluster: true` and its `groupKey` tells us which
+        // room to filter the raw feature list on.
+        if (props['manualCluster'] === true || props['manualCluster'] === 'true') {
+          const groupKey = String(props['groupKey'] ?? '')
+          openList(getManualClusterLeaves(configId, groupKey))
           return
         }
-
-        // Non-cluster hit: delegate to the shared helper. Same
-        // routing as the popup's "View more" callback so the two
-        // entry points produce identical drawer state.
-        const payload = readPayload(hit.properties)
-        const rawKey = hit.properties?.['entityKey']
-        const entityKey = typeof rawKey === 'string' ? rawKey : undefined
-        // v5.4 — respect analytic occlusion. `queryRenderedFeatures`
-        // returns features regardless of paint opacity, so a marker
-        // that has been faded to 0 by the occlusion pass is still
-        // clickable and would open the drawer over a marker the user
-        // can't see. Property-based hide (see OCCLUSION_TEXT_OPACITY
-        // in map-data-linked-overlay.tsx) means the flag is on the
-        // feature's `properties.occluded` — not feature-state, which
-        // Mapbox wipes on every `source.setData`.
-        if (hit.properties?.['occluded'] === true) continue
-        openDataLinkEntityDrawer(cfg, payload, entityKey)
+        // Native Mapbox cluster path.
+        const clusterId =
+          typeof props['cluster_id'] === 'number'
+            ? (props['cluster_id'] as number)
+            : Number(props['cluster_id'])
+        const sourceId = hit.layer?.source ?? `dl-${configId}-src`
+        const source = map.getSource(sourceId) as
+          | (mapboxgl.GeoJSONSource & {
+              getClusterLeaves?: (
+                clusterId: number,
+                limit: number,
+                offset: number,
+                cb: (err: unknown, features: GeoJSON.Feature[]) => void,
+              ) => void
+            })
+          | undefined
+        if (!source?.getClusterLeaves || !Number.isFinite(clusterId)) return
+        source.getClusterLeaves(clusterId, 1000, 0, (err, leaves) => {
+          if (err || !leaves) {
+            console.warn('[view] getClusterLeaves failed', err)
+            return
+          }
+          openList(leaves)
+        })
         return
       }
+
+      // One row. Occluded rows are clickable on purpose: they are only
+      // drawn (as faint ghosts) when Graphics → "Show hidden items as
+      // faint ghosts" is on, and clicking a ghost is how you focus it.
+      const payload = readFeaturePayload(hit.properties)
+      const rawKey = hit.properties?.['entityKey']
+      const entityKey = typeof rawKey === 'string' && rawKey !== '' ? rawKey : undefined
+      const anchor = dataLinkAnchorOf(
+        hit.geometry,
+        hit.properties,
+        dataLinkEntityFloor(payload, cfg, liveFloorIdSet),
+      )
+      focusDataLinkEntity(cfg, payload, entityKey, { camera: 'reveal', anchor })
+      return
     }
-    mapInstance.on('click', onDlClick)
+  })
+  useEffect(() => {
+    if (!mapInstance) return
+    mapInstance.on('click', handleDataLinkMapClick)
     return () => {
-      mapInstance.off('click', onDlClick)
+      mapInstance.off('click', handleDataLinkMapClick)
     }
-  }, [mapInstance, warehouseConfigs])
+  }, [mapInstance, handleDataLinkMapClick])
+
+  // A cluster row → focus it (the drawer stays in the cluster's list
+  // mode, so "Back to list" still works).
+  const handleSelectClusterItem = useStableCallback((item: DlClusterItem) => {
+    const current = dlEntityDrawer
+    if (!current) return
+    const payload = item.payload
+    // Apply the same content-viewer filter/order as the top-level
+    // click path so drilling into a cluster leaf renders the same
+    // set of configured fields. Fills empty/null/undefined values
+    // with an em-dash so classifyBin (which drops nullish + empty
+    // strings from its custom list) keeps every configured field
+    // visible — matches the intent that "if I added it to the
+    // sidebar it should always show, with — when there's no data."
+    const panelFields = current.panelFields
+    let customProperties: Record<string, unknown> = payload
+    if (panelFields && panelFields.length > 0) {
+      const ordered: Record<string, unknown> = {}
+      for (const path of panelFields) {
+        const raw = readPayloadPath(payload, path)
+        const shortKey = path.split('.').pop() ?? path
+        const key = shortKey in ordered ? path : shortKey
+        if (
+          raw === undefined ||
+          raw === null ||
+          (typeof raw === 'string' && raw.trim() === '')
+        ) {
+          ordered[key] = '—'
+        } else {
+          ordered[key] = raw
+        }
+      }
+      customProperties = ordered
+    }
+    const header = current.panelTemplateRaw
+      ? resolveLabelTemplate(current.panelTemplateRaw, payload)
+      : undefined
+    const next: DlEntityDrawerState = {
+      ...current,
+      // Keep the cluster snapshot around so the "Back to list"
+      // control can flip us home.
+      bin: {
+        targetKind: 'polygon',
+        customProperties,
+        updatedAt: new Date(),
+      } as Bin,
+      panelHeader: header,
+    }
+    const cfg = current.configId !== undefined ? warehouseConfigs.find((c) => c.id === current.configId) : undefined
+    if (!cfg || cfg.id === undefined || !item.entityKey) {
+      setDlEntityDrawer(next)
+      return
+    }
+    // The row was on screen inside its cluster: only move the camera when
+    // the drawer covers it or something hides it.
+    focusItem(
+      item.anchor
+        ? { kind: 'dl', configId: cfg.id, entityKey: item.entityKey, anchor: item.anchor }
+        : { kind: 'dl', configId: cfg.id, entityKey: item.entityKey },
+      { camera: 'ifNeeded', dlDrawer: next, label: dataLinkLabelOf(cfg, payload, item.entityKey) },
+    )
+  })
+  const handleBackToCluster = useStableCallback(() => {
+    const current = dlEntityDrawer
+    if (!current) return
+    clearFocusOnly()
+    setDlEntityDrawer({ ...current, bin: undefined })
+  })
 
   const committedLines = useMemo<CommittedLine[]>(
     () =>
@@ -1732,7 +2773,10 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
   )
 
   return (
-    <div className="w-dvw h-dvh overflow-hidden bg-background">
+    // A share link is the whole window; inside the app shell the viewer fills
+    // <main> (as the editor does) — viewport-sized there, it overflowed <main>
+    // by the sidebar's width and the top bar's height and scrolled both ways.
+    <div className={mode === 'token' ? 'relative h-dvh w-dvw overflow-hidden bg-background' : 'absolute inset-0 overflow-clip bg-background'}>
       <MapboxMap
         onMapLoad={setMapInstance}
         onMapDestroy={() => setMapInstance(null)}
@@ -1752,7 +2796,13 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
        * image-plane + door overlays outside this block, and pushing
        * polygons / walls on top of them. Match the editor pattern
        * (create-grids OverlayStack Fragment key = layerOrder only).
+       *
+       * The two focus providers are ALWAYS rendered (FOCUS_OFF /
+       * NO_BLOCKERS while nothing is focused) so toggling focus never
+       * changes this tree's shape — no overlay remounts.
        */}
+      <FocusSceneContext.Provider value={focusScene}>
+      <FocusBlockersContext.Provider value={focusBlockers}>
       <Fragment key={DEFAULT_LAYER_ORDER.join('-')}>
         {DEFAULT_LAYER_ORDER.map((kind: ReorderableLayerKind) => {
           // v5.5 — in shell-only mode ONLY the shell model paints; every
@@ -1780,6 +2830,9 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
                       ? resolvedStyles.gridCells
                       : null
                   }
+                  selectedGridIds={focusSelectedIds('grids')}
+                  // A bin (rack cell) click focuses that cell.
+                  onCellClick={handleGridCellClick}
                   // v5.5 — rack labels fade behind floor plates,
                   // walls, and OTHER rack cells (a rear rack hides
                   // the label of a rack behind it). Same layer
@@ -1816,6 +2869,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
                   map={overlayMap}
                   circles={circles}
                   committedVisible={layerVisible('circles') && isShapeKindVisible('circles')}
+                  selectedCircleIds={focusSelectedIds('circles')}
                 />
               )
             case 'polygon':
@@ -1841,6 +2895,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
                       ? attachedDoorsByLineId
                       : null
                   }
+                  selectedLineIds={focusSelectedIds('lines')}
                 />
               )
             case 'stair':
@@ -1851,6 +2906,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
                   map={overlayMap}
                   stairs={stairs}
                   floorElevations={floorElevations}
+                  selectedStairIds={focusSelectedIds('stairs')}
                 />
               )
             case 'model':
@@ -1862,7 +2918,9 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
                   models={models}
                   urlMap={modelUrlMap}
                   boundingCenterMap={modelBoundingCenters}
+                  boundsMap={modelBounds}
                   facilityShellMode={shellMode}
+                  selectedModelIds={focusSelectedIds('models')}
                 />
               )
             case 'imagePlane':
@@ -1902,6 +2960,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           layerVisible('imagePlanes') &&
           isShapeKindVisible('imagePlanes')
         }
+        selectedImagePlaneIds={focusSelectedIds('image-planes')}
       />
       {routePreviewActive && (
         <>
@@ -1909,14 +2968,18 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
             map={overlayMap}
             start={routePreview.start}
             end={routePreview.end}
-            path={routePreview.path}
+            option={routePreview.options[routePreview.selected] ?? null}
             status={routePreview.status}
+            floors={routePreview.floors}
             elevatedPolygons={routePreview.elevatedPolygons}
+            portalLabel={routePortalLabel}
           />
           <RouteDirectionsPanel
             status={routePreview.status}
-            waypoints={routePreview.path}
-            distanceMeters={routePreview.distanceMeters}
+            options={routePreview.options}
+            selected={routePreview.selected}
+            onSelect={routePreview.setSelected}
+            floors={routePreview.floors}
             onClear={routePreview.reset}
             side="left"
           />
@@ -1930,35 +2993,12 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           layerVisible('doors') &&
           isShapeKindVisible('doors')
         }
+        selectedDoorIds={focusSelectedIds('doors')}
+        onDoorClick={handleDoorClick}
         // v5.5 — door labels use the same analytic occlusion pass as
         // text-labels + markers so they stop poking through floor
         // plates, walls, and rack cells at a tilt.
-        occluders={{
-          images:
-            layerVisible('images') && isShapeKindVisible('images')
-              ? images
-              : undefined,
-          polygons:
-            layerVisible('polygons') && isShapeKindVisible('polygons')
-              ? polygons
-              : undefined,
-          circles:
-            layerVisible('circles') && isShapeKindVisible('circles')
-              ? circles
-              : undefined,
-          lines:
-            layerVisible('lines') && isShapeKindVisible('lines')
-              ? lines
-              : undefined,
-          stairs:
-            layerVisible('stairs') && isShapeKindVisible('stairs')
-              ? stairs
-              : undefined,
-          grids:
-            layerVisible('racks') && isShapeKindVisible('grids')
-              ? grids
-              : undefined,
-        }}
+        occluders={visibleOccluders}
       />
       {!shellHidesInterior && layerVisible('markers') && isShapeKindVisible('markers') && (
         <MapMarkerOverlay
@@ -1968,32 +3008,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           // Slabs, walls and staircases hide the markers standing behind
           // them. Each kind is gated on its own visibility — geometry the
           // viewer toggled off paints nothing and so must occlude nothing.
-          occluders={{
-            images:
-              layerVisible('images') && isShapeKindVisible('images')
-                ? images
-                : undefined,
-            polygons:
-              layerVisible('polygons') && isShapeKindVisible('polygons')
-                ? polygons
-                : undefined,
-            circles:
-              layerVisible('circles') && isShapeKindVisible('circles')
-                ? circles
-                : undefined,
-            lines:
-              layerVisible('lines') && isShapeKindVisible('lines')
-                ? lines
-                : undefined,
-            stairs:
-              layerVisible('stairs') && isShapeKindVisible('stairs')
-                ? stairs
-                : undefined,
-            grids:
-              layerVisible('racks') && isShapeKindVisible('grids')
-                ? grids
-                : undefined,
-          }}
+          occluders={visibleOccluders}
         />
       )}
       {!shellHidesInterior && layerVisible('bins') && isShapeKindVisible('bins') && (
@@ -2003,6 +3018,8 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         <MapTextLabelOverlay
           map={overlayMap}
           labels={textLabels}
+          selectedLabelIds={focusSelectedIds('text-labels')}
+          onLabelClick={handleTextLabelClick}
           // v5.4 — Same-floor geometry only. Passing `allPolygons` /
           // `allLines` (multi-floor) marked every ground-floor label
           // as occluded in top-down because upper-floor slabs at
@@ -2014,11 +3031,14 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           // moved the projection off the slab, which is why labels
           // seemed to appear "randomly on tilt". Restricting to the
           // current floor's shapes matches the editor, which renders
-          // one floor at a time. Images stay multi-floor because they
-          // carry `floorPlanId` on their prism and the solver skips
-          // the label's own floor plate (see marker-occlusion.ts).
+          // one floor at a time. Images are the DRAWN floor plates —
+          // multi-floor when several floors are shown (each prism
+          // carries `floorPlanId`, so the solver skips the label's own
+          // floor plate; see marker-occlusion.ts). Not `allImages`: the
+          // viewer force-shows every row, so an unselected upper floor's
+          // plan — invisible on screen — hid every label below it.
           occluders={{
-            images: allImages,
+            images,
             polygons,
             circles,
             lines,
@@ -2072,9 +3092,9 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           activeFloorPlanId={selectedFloorPlanId}
           liveFloorPlanIds={liveFloorPlanIds}
           configFilters={configFilters}
-          onEntityViewMore={(cfg, payload, _lngLat, entityKey) =>
-            openDataLinkEntityDrawer(cfg, payload, entityKey)
-          }
+          onEntityViewMore={onDataLinkViewMore}
+          pointCluster={mapTools.pointCluster}
+          pointHeatmap={pointHeatmap}
         />
       )}
 
@@ -2092,6 +3112,11 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         models={allModels}
       />
 
+      {/* Focus mode's pulse ring (DOM marker, outside the depth buffer). */}
+      <MapFocusOverlay map={overlayMap} focus={shellHidesInterior ? null : resolvedFocus} prisms={focusPrisms} />
+      </FocusBlockersContext.Provider>
+      </FocusSceneContext.Provider>
+
       {/* Preview header — only in authenticated preview mode
           (`/view/:warehouseId` from the map-toolbar's Preview button),
           NEVER in share-link mode (`/share/:token`). Shows a back
@@ -2100,20 +3125,23 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
           of the top-end controls (glass card, rounded-full pills). */}
       {isAuthMode && (
         <div className="absolute z-10 flex items-center gap-2 top-4 start-4">
+          {/* Below sm the back button is icon-only and the name pill hides:
+              the top-end Search sits on the same row there. */}
           <Button
             variant="outline"
             size="sm"
-            className="h-9 gap-1.5 rounded-full border-border/60 bg-background/70 pl-2 pr-3 shadow-lg shadow-black/5 backdrop-blur-xl hover:bg-background/90"
+            className="h-9 gap-1.5 rounded-full border-border/60 bg-background/70 px-2.5 shadow-lg shadow-black/5 backdrop-blur-xl hover:bg-background/90 sm:pl-2 sm:pr-3"
             onClick={() => {
               if (window.history.length > 1) navigate(-1)
               else navigate('/create-grids')
             }}
-            title="Back to editor"
+            title={t('view.header.backToEditor', { defaultValue: 'Back to editor' })}
+            aria-label={t('view.header.backToEditor', { defaultValue: 'Back to editor' })}
           >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            <span className="text-xs font-medium">Back to editor</span>
+            <ArrowLeft className="h-3.5 w-3.5 rtl:-scale-x-100" />
+            <span className="hidden text-xs font-medium sm:inline">{t('view.header.backToEditor', { defaultValue: 'Back to editor' })}</span>
           </Button>
-          <div className="flex items-center gap-2 h-9 px-3 rounded-full border border-border/60 bg-background/70 shadow-lg shadow-black/5 backdrop-blur-xl">
+          <div className="hidden h-9 items-center gap-2 rounded-full border border-border/60 bg-background/70 px-3 shadow-lg shadow-black/5 backdrop-blur-xl sm:flex">
             <span
               className="flex items-center justify-center w-5 h-5 rounded-md bg-primary/10 text-primary ring-1 ring-primary/15"
               aria-hidden
@@ -2121,7 +3149,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
               <Eye className="w-3 h-3" />
             </span>
             <span className="text-[10px] uppercase tracking-[0.1em] font-semibold text-muted-foreground">
-              Preview
+              {t('toolbar.preview', { defaultValue: 'Preview' })}
             </span>
             {zone?.name && (
               <>
@@ -2135,7 +3163,33 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         </div>
       )}
 
-      <div className="sgv-scroll-hide absolute z-10 flex flex-col items-end gap-2 max-h-[calc(100dvh-2rem)] overflow-y-auto top-4 end-4">
+      {/* The report map's list + key numbers, from this map's own layers. */}
+      {showLayersPanel && layerVisible('dataLinks') && !shellHidesInterior && (
+        <ViewerItemsPanel
+          configs={visibleConfigs}
+          activeFloors={selectedFloorPlanId}
+          configFilters={configFilters}
+          liveFloorPlanIds={liveFloorIdSet}
+          styleRules={activeStyleRules}
+          focusedKey={focusTarget?.kind === 'dl' ? `${focusTarget.configId}:${focusTarget.entityKey}` : null}
+          onFocus={handleFocusDataLinkItem}
+        />
+      )}
+
+      <div className="sgv-scroll-hide absolute z-10 flex flex-col items-end gap-2 max-h-[calc(100%-2rem)] overflow-y-auto top-4 end-4">
+        {/* Search → focus mode (racks, bins, markers, 3D models). Only
+            what the share link shows is searchable; a pick in shell-only
+            mode drops back to auto (`focusItem`). */}
+        {(searchGrids.length > 0 || searchBins.length > 0 || searchMarkers.length > 0 || searchModels.length > 0) && (
+          <ViewSearch
+            grids={searchGrids}
+            bins={searchBins}
+            markers={searchMarkers}
+            models={searchModels}
+            warehouseId={id}
+            onPick={handleSearchPick}
+          />
+        )}
         {showFloorPlanFilter && floorPlans.length > 0 && (
           <FloorSwitcher
             floorPlans={floorPlans}
@@ -2143,7 +3197,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
             onSelect={setSelectedFloorPlanIds}
             allowAllFloors={typeof lockedFloorPlanId !== 'number'}
             shellMode={shellMode}
-            onShellModeChange={setShellMode}
+            onShellModeChange={changeShellMode}
             hasFacilityShell={allModels.some(
               (m) => m.config?.facilityShell?.enabled === true,
             )}
@@ -2152,11 +3206,11 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         {showStyleSwitcher && (
           <StyleSwitcher selectedId={mapStyle} onSelect={setMapStyle} />
         )}
+        {warehouseConfigs.length > 0 && layerVisible('dataLinks') && mapTools.node}
         {showLayersPanel && (warehouseConfigs.length > 0 || Object.values(shapeLayerItems).some((v) => v.length > 0)) && (
           <ViewerLayersPanel
             shapeItems={shapeLayerItems}
-            getShapeCenter={getShapeCenter}
-            onZoomTo={handleZoomToShape}
+            onFocusItem={handleFocusLayerItem}
             hiddenShapeKinds={hiddenShapeKinds}
             onToggleShapeKind={toggleShapeKind}
             dataLinkConfigs={warehouseConfigs}
@@ -2165,7 +3219,7 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
             onSetAllDataLinkConfigs={setAllConfigsOfKind}
             onToggleDataLinkEnabled={toggleConfigEnabled}
             activeFilterLabels={activeFilterLabels}
-            onZoomToDataLinkItem={handleZoomToDataLinkItem}
+            onZoomToDataLinkItem={handleFocusDataLinkItem}
           />
         )}
         {showDataLinkFilter && (
@@ -2179,11 +3233,47 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         {showGraphicsSettings && <ViewerGraphicsPanel />}
       </div>
 
+      {/* Focus chip — what is focused, a link to it, and the way out.
+          The ALWAYS-MOUNTED live region around it keeps the chip in the
+          accessibility tree while a detail drawer is open: vaul (1.1.2)
+          never hands `modal={false}` to Radix, so the drawer runs Radix's
+          modal content, whose `hideOthers` sets aria-hidden on everything
+          outside it — except `[aria-live]` subtrees that exist when it
+          runs. This wrapper is there before any drawer opens, so the chip
+          (and its "Show everything" ✕) stays reachable. Keyboard focus is
+          still trapped in the drawer by Radix while it is open (Esc and the
+          drawer's ✕ leave focus); a pointer reaches the chip as before.
+          A plain static block: no box of its own (0 px tall, the chip is
+          absolutely placed against the same ancestor as before), nothing
+          to hit when empty. */}
+      <div aria-live="polite">
+        {focusTarget !== null && !shellHidesInterior && (
+          <FocusChip
+            kindLabel={t(`view.focus.kind.${focusChipKind}`, {
+              defaultValue: FOCUS_KIND_FALLBACK[focusChipKind] ?? '',
+            })}
+            name={focusChipName || t('view.focus.untitled', { defaultValue: 'Selected item' })}
+            onCopyLink={() => void copyFocusLink()}
+            onExit={exitFocus}
+            drawerOpen={anyDrawerOpen}
+            belowHeader={isAuthMode}
+          />
+        )}
+      </div>
+
       {/* v5.4 — history player. Bottom-of-map, video-player-style bar
           that auto-shows when at least one visible layer uses
           renderMode='history-movement'. Positioned outside the
           top-right stack so it can span the map width. */}
       <TableHistoryPlayer configs={visibleConfigs} />
+      {followCfg && (follow.playing || follow.paused) && (
+        <FollowChip
+          label={focusChipName || t('view.focus.untitled', { defaultValue: 'Selected item' })}
+          paused={follow.paused}
+          onResume={follow.resume}
+          style={{ bottom: 132 }}
+        />
+      )}
 
       {/* Share-link watermark (settings.watermark). Small pill drawn at
           the bottom-center so it's visible over the map but doesn't
@@ -2271,27 +3361,29 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
       <ShapeDetailDrawer
         name={drawerPolygon?.name}
         accentColor={drawerPolygon?.config.color}
-        kindLabel="Area"
+        kindLabel={t('view.drawer.kind.area', { defaultValue: 'Area' })}
         fallbackId={drawerPolygon?.id}
         bin={drawerBin}
         open={drawerPolygonId !== null}
-        onClose={() => setDrawerPolygonId(null)}
+        onClose={exitFocus}
+        isMapEventTarget={isMapEventTarget}
       />
 
       <ShapeDetailDrawer
         name={drawerMarker?.name}
         accentColor={drawerMarker?.config.iconColor}
-        kindLabel="Marker"
+        kindLabel={t('view.drawer.kind.marker', { defaultValue: 'Marker' })}
         fallbackId={drawerMarker?.id}
         bin={drawerMarkerBin}
         open={drawerMarkerId !== null}
-        onClose={() => setDrawerMarkerId(null)}
+        onClose={exitFocus}
+        isMapEventTarget={isMapEventTarget}
       />
 
       <ShapeDetailDrawer
         name={dlEntityDrawer?.title}
         accentColor={dlEntityDrawer?.accentColor}
-        kindLabel={dlEntityDrawer?.kindLabel ?? 'Widget'}
+        kindLabel={dlEntityDrawer?.kindLabel ?? t('view.drawer.kind.widget', { defaultValue: 'Widget' })}
         fallbackId={undefined}
         bin={dlEntityDrawer?.bin}
         clusterItems={dlEntityDrawer?.clusterItems}
@@ -2299,57 +3391,117 @@ export default function View({ mode = 'id' }: { mode?: 'id' | 'token' }) {
         panelHeader={dlEntityDrawer?.panelHeader}
         historySourceId={dlEntityDrawer?.sourceId}
         historyEntityKey={dlEntityDrawer?.entityKey}
-        onSelectClusterItem={(payload) => {
-          if (!dlEntityDrawer) return
-          // Apply the same content-viewer filter/order as the top-level
-          // click path so drilling into a cluster leaf renders the same
-          // set of configured fields. Fills empty/null/undefined values
-          // with an em-dash so classifyBin (which drops nullish + empty
-          // strings from its custom list) keeps every configured field
-          // visible — matches the intent that "if I added it to the
-          // sidebar it should always show, with — when there's no data."
-          const panelFields = dlEntityDrawer.panelFields
-          let customProperties: Record<string, unknown> = payload
-          if (panelFields && panelFields.length > 0) {
-            const ordered: Record<string, unknown> = {}
-            for (const path of panelFields) {
-              const raw = readPayloadPath(payload, path)
-              const shortKey = path.split('.').pop() ?? path
-              const key = shortKey in ordered ? path : shortKey
-              if (
-                raw === undefined ||
-                raw === null ||
-                (typeof raw === 'string' && raw.trim() === '')
-              ) {
-                ordered[key] = '—'
-              } else {
-                ordered[key] = raw
-              }
-            }
-            customProperties = ordered
-          }
-          const header = dlEntityDrawer.panelTemplateRaw
-            ? resolveLabelTemplate(dlEntityDrawer.panelTemplateRaw, payload)
-            : undefined
-          setDlEntityDrawer({
-            ...dlEntityDrawer,
-            // Keep the cluster snapshot around so the "Back to list"
-            // control can flip us home.
-            bin: {
-              targetKind: 'polygon',
-              customProperties,
-              updatedAt: new Date(),
-            } as Bin,
-            panelHeader: header,
-          })
-        }}
-        onBackToCluster={() => {
-          if (!dlEntityDrawer) return
-          setDlEntityDrawer({ ...dlEntityDrawer, bin: undefined })
-        }}
+        onSelectClusterItem={handleSelectClusterItem}
+        onBackToCluster={handleBackToCluster}
         open={dlEntityDrawer !== null}
-        onClose={() => setDlEntityDrawer(null)}
+        onClose={exitFocus}
+        isMapEventTarget={isMapEventTarget}
       />
+
+      {/* The app shell's toaster isn't mounted on public share links. */}
+      {mode === 'token' && <Toaster />}
+    </div>
+  )
+}
+
+/**
+ * Focus mode's chip: what is focused, a copy-link button for it, and the
+ * way out (✕, or Esc).
+ *
+ * From `sm` up it sits at the top, centred in the map's FREE area: a
+ * wrapper spans the map from its start edge to its end edge — or to the
+ * open drawer's edge + 16 px (the drawer is 420 / 460 / 500 px and always
+ * on the logical end side, so logical insets work in both directions) —
+ * and the chip is centred in it, never wider than the wrapper. With no
+ * drawer the top-end control stack shares the row, so the chip is capped
+ * at the wrapper minus room for the stack on both sides. The wrapper is
+ * placed like the other map chrome (against the app shell's <main> on
+ * /view, the page on /share — not the viewport), so the app sidebar never
+ * clips it. Below the signed-in preview header. On phones the stack fills
+ * the top-end corner and the drawer covers the map, so the chip sits
+ * full-width above the bottom-start Navigate / Auto-rotate pills instead.
+ */
+function FocusChip({
+  kindLabel,
+  name,
+  onCopyLink,
+  onExit,
+  drawerOpen,
+  belowHeader,
+}: {
+  kindLabel: string
+  name: string
+  onCopyLink: () => void
+  onExit: () => void
+  drawerOpen: boolean
+  /** The signed-in preview header holds the top-start corner. */
+  belowHeader: boolean
+}) {
+  const { t } = useTranslation()
+  const title = t('view.focus.title', { name, defaultValue: 'Showing {{name}}' })
+  const copyLabel = t('view.focus.copyLink', { defaultValue: 'Copy link to this item' })
+  const exitLabel = t('view.focus.exit', { defaultValue: 'Show everything' })
+  // Literal class strings (Tailwind can't see composed ones).
+  return (
+    <div
+      className={cn(
+        'pointer-events-none absolute z-20 flex justify-center',
+        'inset-x-4 bottom-[7.5rem]',
+        'sm:bottom-auto',
+        belowHeader ? 'sm:top-16' : 'sm:top-4',
+        drawerOpen && 'sm:end-[436px] md:end-[476px] lg:end-[516px]',
+      )}
+    >
+      {/* Announced by the host's always-mounted live region around the chip. */}
+      <span className="sr-only">{title}</span>
+      <div
+        role="group"
+        aria-label={title}
+        className={cn(
+          'pointer-events-auto flex h-9 min-w-0 max-w-full items-center gap-1.5 rounded-full border border-border/60 bg-background/80 ps-3 pe-1 shadow-lg shadow-black/5 backdrop-blur-xl',
+          drawerOpen ? 'sm:max-w-[min(28rem,100%)]' : 'sm:max-w-[min(28rem,calc(100%-27rem))]',
+        )}
+      >
+        <span className="relative flex h-2 w-2 flex-shrink-0" aria-hidden>
+          <span className="absolute inline-flex h-full w-full rounded-full bg-primary/60 motion-safe:animate-ping" />
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+        </span>
+        <span className="flex-shrink-0 text-[10px] font-semibold uppercase tracking-[0.1em] text-primary">
+          {kindLabel}
+        </span>
+        <span className="text-muted-foreground/60" aria-hidden>
+          ·
+        </span>
+        <span className="min-w-0 truncate text-xs font-medium text-foreground" title={name}>
+          {name}
+        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="ms-0.5 h-7 w-7 flex-shrink-0 rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+          onClick={onCopyLink}
+          aria-label={copyLabel}
+          title={copyLabel}
+        >
+          <Link2 className="h-3.5 w-3.5" aria-hidden />
+        </Button>
+        <kbd
+          className="hidden h-5 flex-shrink-0 items-center rounded border border-border/60 bg-muted px-1.5 font-mono text-[10px] leading-none text-muted-foreground md:inline-flex"
+          aria-hidden
+        >
+          {t('view.focus.escHint', { defaultValue: 'Esc' })}
+        </kbd>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 flex-shrink-0 rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+          onClick={onExit}
+          aria-label={exitLabel}
+          title={exitLabel}
+        >
+          <X className="h-3.5 w-3.5" aria-hidden />
+        </Button>
+      </div>
     </div>
   )
 }
@@ -2369,6 +3521,7 @@ function ShapeDetailDrawer({
   panelHeader,
   historySourceId,
   historyEntityKey,
+  isMapEventTarget,
 }: {
   name: string | undefined
   accentColor: string | undefined
@@ -2382,15 +3535,12 @@ function ShapeDetailDrawer({
    * `bin` so the drawer flips to detail mode. `onBackToCluster` lets
    * the user return to the list without closing the drawer.
    */
-  clusterItems?: ReadonlyArray<{
-    payload: Record<string, unknown>
-    position: [number, number]
-  }>
+  clusterItems?: ReadonlyArray<DlClusterItem>
   /** v4 — payload path chosen by the layer as its main label (e.g.
    *  `sku`). Used to title each entry in the cluster-list mode so users
    *  see the identifier they picked, not a hardcoded fallback. */
   clusterLabelField?: string
-  onSelectClusterItem?: (payload: Record<string, unknown>) => void
+  onSelectClusterItem?: (item: DlClusterItem) => void
   onBackToCluster?: () => void
   open: boolean
   onClose: () => void
@@ -2403,6 +3553,12 @@ function ShapeDetailDrawer({
    *  `data_source_row_events` trail. */
   historySourceId?: number
   historyEntityKey?: string
+  /**
+   * The drawer is non-modal (focus mode keeps the map live beside it):
+   * an outside interaction on the map must never close it — a map click
+   * switches focus, or leaves it through `onClose`'s owner.
+   */
+  isMapEventTarget?: (target: EventTarget | null) => boolean
 }) {
   const inClusterMode = (clusterItems?.length ?? 0) > 0 && !bin
   const classified = useMemo(() => (bin ? classifyBin(bin) : null), [bin])
@@ -2414,7 +3570,17 @@ function ShapeDetailDrawer({
     () => classified?.media.filter((m) => m.kind === 'video') ?? [],
     [classified],
   )
-  const links = classified?.links ?? []
+  // Streams the browser can show play in the Live view section; the rest
+  // (RTSP, plain links) stay link tiles.
+  const liveStreams = useMemo(
+    () => (classified?.links ?? []).filter((m) => m.kind === 'stream' && isWatchableStream(m.src)),
+    [classified],
+  )
+  const links = useMemo(
+    () => (classified?.links ?? []).filter((m) => !liveStreams.includes(m)),
+    [classified, liveStreams],
+  )
+  const cameraOffline = /^offline$/i.test(String(bin?.customProperties?.['status'] ?? ''))
   const primary = classified?.primary ?? []
   const custom = classified?.custom ?? []
 
@@ -2427,9 +3593,33 @@ function ShapeDetailDrawer({
       name ||
       (fallbackId !== undefined ? `${kindLabel} #${fallbackId}` : kindLabel)) as string
 
-  const { i18n } = useTranslation()
+  const { t, i18n } = useTranslation()
   const isRtl = i18n.dir() === 'rtl'
   const direction: 'left' | 'right' = isRtl ? 'left' : 'right'
+  const copyLabel = t('view.drawer.copyIdentifier', { defaultValue: 'Copy identifier' })
+
+  // vaul renders a non-modal drawer on Radix's MODAL dialog, whose layer
+  // sets `body { pointer-events: none }`; vaul switches it back only when
+  // the drawer opens itself. Opened from here (the `open` prop) the map
+  // would stop taking clicks — and a map click is how focus moves on with
+  // the drawer open. Same reset vaul does, on our open path (two frames:
+  // the dialog layer's effect lands after its node mounts). Radix puts
+  // the original value back when the last layer closes.
+  useEffect(() => {
+    if (!open || typeof window === 'undefined') return
+    const release = () => {
+      if (document.body.style.pointerEvents === 'none') document.body.style.pointerEvents = 'auto'
+    }
+    let second = 0
+    const first = window.requestAnimationFrame(() => {
+      release()
+      second = window.requestAnimationFrame(release)
+    })
+    return () => {
+      window.cancelAnimationFrame(first)
+      window.cancelAnimationFrame(second)
+    }
+  }, [open])
 
   const [copiedTitle, setCopiedTitle] = useState(false)
   const copyTitle = async () => {
@@ -2449,10 +3639,15 @@ function ShapeDetailDrawer({
         if (!v) onClose()
       }}
       direction={direction}
+      // Non-modal, no scrim: the focused item stays visible and the map
+      // stays interactive beside the drawer.
+      modal={false}
     >
       <DrawerPrimitive.Portal>
-        <DrawerPrimitive.Overlay className="fixed inset-0 z-40 bg-black/30 backdrop-blur-[2px]" />
         <DrawerPrimitive.Content
+          onInteractOutside={(e) => {
+            if (isMapEventTarget?.(e.target)) e.preventDefault()
+          }}
           className={cn(
             'fixed top-0 bottom-0 z-50 flex flex-col outline-none',
             'w-full sm:w-[420px] md:w-[460px] lg:w-[500px]',
@@ -2463,9 +3658,16 @@ function ShapeDetailDrawer({
             'shadow-[0_10px_40px_-10px_rgba(0,0,0,0.25),0_0_0_1px_rgba(0,0,0,0.02)]',
             'dark:shadow-[0_10px_40px_-10px_rgba(0,0,0,0.5),0_0_0_1px_rgba(255,255,255,0.03)]',
             'ring-1 ring-black/5 dark:ring-white/10',
-            isRtl
-              ? 'start-0 border-e border-border/60 rounded-e-2xl'
-              : 'end-0 border-s border-border/60 rounded-s-2xl',
+            // On the logical END side in both directions — the right in
+            // LTR, the left in RTL — which is where vaul slides it in from
+            // (`direction`) and the side `focusPaddingFor` keeps the
+            // focused item clear of.
+            'end-0 border-s border-border/60 rounded-s-2xl',
+            // No vaul ::after — a 200%-wide copy of the drawer's background
+            // beyond its outer edge (drag overshoot). Without a modal scrim,
+            // whenever it lands on the map side it washes out and blocks
+            // the map (it did in RTL).
+            'after:hidden',
           )}
         >
           {/* Header — matches side-panel.tsx's "hero card" treatment:
@@ -2516,9 +3718,16 @@ function ShapeDetailDrawer({
                 <DrawerTitle className="text-lg font-semibold leading-tight truncate">
                   {headerTitle}
                 </DrawerTitle>
-                {name && name !== headerTitle && (
+                {/* Always a description (Radix warns without one): the
+                    shape's name when the title shows something else,
+                    otherwise a screen-reader-only line. */}
+                {name && name !== headerTitle ? (
                   <DrawerDescription className="text-xs truncate text-muted-foreground">
                     {name}
+                  </DrawerDescription>
+                ) : (
+                  <DrawerDescription className="sr-only">
+                    {t('view.drawer.description', { kind: kindLabel, defaultValue: '{{kind}} details' })}
                   </DrawerDescription>
                 )}
               </div>
@@ -2530,8 +3739,8 @@ function ShapeDetailDrawer({
                   size="icon"
                   className="w-8 h-8 rounded-md text-muted-foreground hover:text-foreground hover:bg-background/60"
                   onClick={copyTitle}
-                  title={copiedTitle ? 'Copied' : 'Copy identifier'}
-                  aria-label="Copy identifier"
+                  title={copiedTitle ? t('view.drawer.copied', { defaultValue: 'Copied' }) : copyLabel}
+                  aria-label={copyLabel}
                 >
                   {copiedTitle ? (
                     <Check className="w-4 h-4" />
@@ -2545,7 +3754,7 @@ function ShapeDetailDrawer({
                   variant="ghost"
                   size="icon"
                   className="w-8 h-8 rounded-md text-muted-foreground hover:text-foreground hover:bg-background/60"
-                  aria-label="Close"
+                  aria-label={t('view.drawer.close', { defaultValue: 'Close' })}
                 >
                   <X className="w-4 h-4" />
                 </Button>
@@ -2587,30 +3796,32 @@ function ShapeDetailDrawer({
             )}
             {inClusterMode && (
               <DrawerSection
-                title={`Cluster · ${clusterItems?.length ?? 0} items`}
+                title={t('view.drawer.cluster', {
+                  n: clusterItems?.length ?? 0,
+                  defaultValue: 'Cluster · {{n}} items',
+                })}
                 icon={Layers}
               >
                 <div className="p-2 space-y-1.5 border rounded-lg shadow-sm border-border/60 bg-card/50 backdrop-blur-sm">
-                  {clusterItems?.map(
-                    (
-                      it: { payload: Record<string, unknown>; position: [number, number] },
-                      i: number,
-                    ) => (
-                      <ClusterListItem
-                        key={`${i}-${String(it.payload.id ?? i)}`}
-                        payload={it.payload}
-                        labelField={clusterLabelField}
-                        onClick={() => onSelectClusterItem?.(it.payload)}
-                      />
-                    ),
-                  )}
+                  {clusterItems?.map((it: DlClusterItem, i: number) => (
+                    <ClusterListItem
+                      key={`${i}-${String(it.payload.id ?? i)}`}
+                      payload={it.payload}
+                      labelField={clusterLabelField}
+                      onClick={() => onSelectClusterItem?.(it)}
+                    />
+                  ))}
                 </div>
               </DrawerSection>
             )}
 
             {!inClusterMode && !bin && (
               <div className="px-6 py-12 text-sm text-center border border-dashed rounded-lg border-border/60 bg-card/40 text-muted-foreground">
-                No linked data for this {kindLabel.toLowerCase()}.
+                {t('view.drawer.noLinkedData', {
+                  kind: kindLabel,
+                  kindLower: kindLabel.toLowerCase(),
+                  defaultValue: 'No linked data for this {{kindLower}}.',
+                })}
               </div>
             )}
 
@@ -2625,14 +3836,34 @@ function ShapeDetailDrawer({
                 className="inline-flex items-center gap-1.5 h-7 px-2 -mt-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
               >
                 <ChevronLeftIcon className="w-3.5 h-3.5" />
-                Back to list ({clusterItems!.length})
+                {t('view.drawer.backToList', {
+                  n: clusterItems!.length,
+                  defaultValue: 'Back to list ({{n}})',
+                })}
               </button>
+            )}
+
+            {!inClusterMode && liveStreams.length > 0 && (
+              <DrawerSection title={t('view.drawer.section.liveView', { defaultValue: 'Live view' })} icon={Video}>
+                <div className="space-y-2">
+                  {liveStreams.map((m: MediaItem, i: number) => (
+                    <LiveStreamPlayer
+                      key={`${m.sourceKey}-${i}`}
+                      src={m.src}
+                      title={headerTitle}
+                      subtitle={typeof bin?.customProperties?.['area'] === 'string' ? (bin.customProperties['area'] as string) : undefined}
+                      offline={cameraOffline}
+                      className="border border-border/60 shadow-sm"
+                    />
+                  ))}
+                </div>
+              </DrawerSection>
             )}
 
             {/* Additional images (all but the first — that one is
                 already the hero above). */}
             {!inClusterMode && images.length > 1 && (
-              <DrawerSection title="Media" icon={ImageIcon}>
+              <DrawerSection title={t('view.drawer.section.media', { defaultValue: 'Media' })} icon={ImageIcon}>
                 <div className="grid grid-cols-2 gap-2 p-2 border rounded-lg shadow-sm border-border/60 bg-card/50 backdrop-blur-sm">
                   {images.slice(1).map((m: MediaItem, i: number) => (
                     <a
@@ -2654,7 +3885,7 @@ function ShapeDetailDrawer({
             )}
 
             {videos.length > 0 && (
-              <DrawerSection title="Video" icon={Video}>
+              <DrawerSection title={t('view.drawer.section.video', { defaultValue: 'Video' })} icon={Video}>
                 <div className="grid grid-cols-1 gap-2 p-2 border rounded-lg shadow-sm border-border/60 bg-card/50 backdrop-blur-sm">
                   {videos.map((m: MediaItem, i: number) => (
                     <video
@@ -2669,7 +3900,7 @@ function ShapeDetailDrawer({
             )}
 
             {primary.length > 0 && (
-              <DrawerSection title="Details" icon={Info}>
+              <DrawerSection title={t('view.drawer.section.details', { defaultValue: 'Details' })} icon={Info}>
                 <FieldGridWithDivider>
                   {primary.map((f: PrimaryFieldRow) => (
                     <FieldRow
@@ -2686,7 +3917,7 @@ function ShapeDetailDrawer({
             )}
 
             {custom.length > 0 && (
-              <DrawerSection title="Properties" icon={Braces}>
+              <DrawerSection title={t('view.drawer.section.properties', { defaultValue: 'Properties' })} icon={Braces}>
                 <FieldGridWithDivider>
                   {custom.map((c: { key: string; value: unknown }) => (
                     <FieldRow
@@ -2705,7 +3936,7 @@ function ShapeDetailDrawer({
             {!inClusterMode &&
               historySourceId !== undefined &&
               historyEntityKey !== undefined && (
-                <DrawerSection title="History" icon={Clock}>
+                <DrawerSection title={t('view.drawer.section.history', { defaultValue: 'History' })} icon={Clock}>
                   <TableHistoryPanel
                     sourceId={historySourceId}
                     entityKey={historyEntityKey}
@@ -2714,7 +3945,7 @@ function ShapeDetailDrawer({
               )}
 
             {links.length > 0 && (
-              <DrawerSection title="Links" icon={Link2}>
+              <DrawerSection title={t('view.drawer.section.links', { defaultValue: 'Links' })} icon={Link2}>
                 <div className="p-2 space-y-1 border rounded-lg shadow-sm border-border/60 bg-card/50 backdrop-blur-sm">
                   {links.map((l: MediaItem, i: number) => (
                     <a
@@ -2766,6 +3997,7 @@ function ClusterListItem({
   labelField?: string
   onClick: () => void
 }) {
+  const { t } = useTranslation()
   // Pull the first URL-shaped value with a media-hinted key. Uses the
   // same classifier the drawer body relies on so what shows here
   // stays consistent with the hero image below.
@@ -2804,7 +4036,7 @@ function ClusterListItem({
     (typeof payload['id'] === 'string' ? (payload['id'] as string) : '') ||
     (typeof payload['mrn'] === 'string' ? (payload['mrn'] as string) : '') ||
     (typeof payload['employeeId'] === 'string' ? (payload['employeeId'] as string) : '') ||
-    'Item'
+    t('view.drawer.item', { defaultValue: 'Item' })
 
   const subtitleParts: string[] = []
   for (const k of ['type', 'role', 'status', 'condition', 'department']) {
@@ -2894,7 +4126,11 @@ function FieldGridWithDivider({ children }: { children: React.ReactNode }) {
   )
 }
 
+/** Bin statuses with a translated badge (`view.drawer.status.*`); others show as stored. */
+const KNOWN_BIN_STATUSES: ReadonlySet<string> = new Set(['empty', 'occupied', 'reserved'])
+
 function StatusBadge({ status }: { status: 'empty' | 'occupied' | 'reserved' | string }) {
+  const { t } = useTranslation()
   const tone =
     status === 'occupied'
       ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/25'
@@ -2908,7 +4144,7 @@ function StatusBadge({ status }: { status: 'empty' | 'occupied' | 'reserved' | s
         tone,
       )}
     >
-      {status}
+      {KNOWN_BIN_STATUSES.has(status) ? t(`view.drawer.status.${status}`, { defaultValue: status }) : status}
     </span>
   )
 }
@@ -3114,6 +4350,9 @@ function StyleSwitcher({
   selectedId: MapStyleId
   onSelect: (id: MapStyleId) => void
 }) {
+  // The report map view's style tiles (icon + name), same labels.
+  const styleLabel = useStyleLabel()
+  const SelectedIcon = STYLE_ICON[selectedId] ?? MapIcon
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -3122,9 +4361,9 @@ function StyleSwitcher({
           size="sm"
           className="h-9 gap-2 rounded-full border-border/60 bg-background/70 pl-3 pr-2.5 shadow-lg shadow-black/5 backdrop-blur-xl hover:bg-background/90"
         >
-          <MapIcon className="h-3.5 w-3.5 text-primary" />
+          <SelectedIcon className="h-3.5 w-3.5 text-primary" />
           <span className="max-w-[140px] truncate text-xs font-medium">
-            {defaultStyleLabel(selectedId)}
+            {styleLabel(selectedId)}
           </span>
           <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
         </Button>
@@ -3132,22 +4371,25 @@ function StyleSwitcher({
       <DropdownMenuContent
         align="end"
         sideOffset={6}
-        className="w-56 shadow-xl rounded-xl border-border/60 bg-popover/90 backdrop-blur-xl"
+        className="grid w-72 grid-cols-2 gap-1 rounded-xl border-border/60 bg-popover/90 p-1.5 shadow-xl backdrop-blur-xl"
       >
-        {MAP_STYLE_IDS.map((sid: MapStyleId) => (
-          <DropdownMenuItem
-            key={sid}
-            onSelect={() => onSelect(sid)}
-            className="gap-2 text-xs"
-          >
-            <Check
-              className={
-                'h-3.5 w-3.5 ' + (selectedId === sid ? 'opacity-100' : 'opacity-0')
-              }
-            />
-            <span className="flex-1 truncate">{defaultStyleLabel(sid)}</span>
-          </DropdownMenuItem>
-        ))}
+        {MAP_STYLE_IDS.map((sid: MapStyleId) => {
+          const Icon = STYLE_ICON[sid] ?? MapIcon
+          const on = sid === selectedId
+          return (
+            <DropdownMenuItem
+              key={sid}
+              onSelect={() => onSelect(sid)}
+              className={cn(
+                'flex-col items-start gap-1 rounded-lg border py-2 pl-2.5 pr-2 text-xs',
+                on ? 'border-primary bg-primary/10' : 'border-border/60',
+              )}
+            >
+              <Icon className={cn('h-4 w-4', on ? 'text-primary' : 'text-muted-foreground')} aria-hidden />
+              <span className="w-full truncate font-medium">{styleLabel(sid)}</span>
+            </DropdownMenuItem>
+          )
+        })}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -3182,7 +4424,7 @@ function ViewerLoadError({ tokenMode, onRetry }: { tokenMode: boolean; onRetry: 
           </Button>
           {!tokenMode && (
             <Button asChild size="sm">
-              <a href="/warehouses">{t('view.loadState.back', { defaultValue: 'All facilities' })}</a>
+              <a href={sitePath('/warehouses')}>{t('view.loadState.back', { defaultValue: 'All facilities' })}</a>
             </Button>
           )}
         </div>

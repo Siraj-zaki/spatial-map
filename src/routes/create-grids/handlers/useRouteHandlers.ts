@@ -5,6 +5,7 @@ import type { Map as MapboxMapInstance } from 'mapbox-gl'
 import { type Tool } from '@/lib/keyboard-shortcuts'
 import { type RouteShape } from '@/lib/shapes'
 import { useSpatialStore } from '@/lib/spatial-store'
+import { fitBoundsIfOffscreen } from './fitToShapeOnSelect'
 
 /**
  * Route (wayfinding path) CRUD handlers. Routes persist via the
@@ -48,6 +49,29 @@ export function useRouteHandlers({
     [mapInstance, savedRoutes],
   )
 
+  /** A click in the saved-routes list: select it (shift / ctrl adds) and bring it into view. */
+  const handleSelectRoute = useCallback(
+    (id: number, additive: boolean) => {
+      setSelectedRouteIds((prev) => {
+        if (!additive) return new Set([id])
+        const next = new Set(prev)
+        if (next.has(id)) next.delete(id)
+        else next.add(id)
+        return next
+      })
+      const route = savedRoutes.find((r) => r.id === id)
+      if (!route || route.vertices.length === 0) return
+      const lngs = route.vertices.map((v) => v[0])
+      const lats = route.vertices.map((v) => v[1])
+      fitBoundsIfOffscreen(
+        mapInstance,
+        [Math.min(...lngs), Math.min(...lats), Math.max(...lngs), Math.max(...lats)],
+        { additive },
+      )
+    },
+    [mapInstance, savedRoutes, setSelectedRouteIds],
+  )
+
   const handleDeleteRouteById = useCallback(
     (id: number) => {
       const store = useSpatialStore.getState()
@@ -69,6 +93,7 @@ export function useRouteHandlers({
   )
 
   return {
+    handleSelectRoute,
     handleFitToRouteById,
     handleDeleteRouteById,
     handleRenameRoute,

@@ -3,8 +3,17 @@ import { createRoot, type Root } from 'react-dom/client'
 import mapboxgl, { type Map as MapboxMapInstance } from 'mapbox-gl'
 import { useGraphicsSettings } from '@/lib/graphics-settings'
 import {
+  focusTier,
+  focusedIdOf,
+  NO_BLOCKERS,
+  useFocusScene,
+  type FocusTier,
+} from '@/lib/focus/focus-scene'
+import {
   buildOccluders,
-  computeOccludedMarkerIds,
+  createOcclusionState,
+  markerOcclusionTargets,
+  updateOcclusion,
   type OccluderInput,
 } from '@/lib/marker-occlusion'
 import type { MarkerShape } from '@/lib/shapes'
@@ -80,6 +89,39 @@ interface MarkerEntry {
   marker: mapboxgl.Marker
   root: Root
   el: HTMLElement
+  /**
+   * What `root` last rendered, so the sync effect re-renders only the
+   * markers whose visual inputs changed (a selection click or a style-rule
+   * tick touches one or two of ~200 roots, not all of them).
+   */
+  rendered?: { marker: MarkerShape; selected: boolean }
+  /** `data-occluded` as last written by the occlusion pass. */
+  occluded?: boolean
+  /** `data-focus-tier` ('focus' | 'near') as last written by the focus pass (undefined / 'normal' = no attribute). */
+  focusTier?: FocusTier
+}
+
+/**
+ * Would `MarkerVisual` draw `a` and `b` the same? Shallow over the shape's
+ * own fields and over its config (every config field is a scalar). The
+ * style-rule resolver hands back a fresh override object — and so a fresh
+ * effective config — on every tick, hence content rather than identity.
+ */
+function sameMarkerVisual(a: MarkerShape, b: MarkerShape): boolean {
+  if (a === b) return true
+  return shallowEqual(a, b, 'config') && shallowEqual(a.config, b.config)
+}
+
+function shallowEqual(a: object, b: object, skip?: string): boolean {
+  const ra = a as Record<string, unknown>
+  const rb = b as Record<string, unknown>
+  const keys = Object.keys(ra)
+  if (keys.length !== Object.keys(rb).length) return false
+  for (const k of keys) {
+    if (k === skip) continue
+    if (!(k in rb) || ra[k] !== rb[k]) return false
+  }
+  return true
 }
 
 /**
@@ -129,6 +171,15 @@ function isNeutralGrayscale(hex: string): boolean {
  * feed the analytic depth test in `src/lib/marker-occlusion.ts`, which
  * flips `data-occluded` per camera frame. The user can turn the pass off
  * from the side panel's Graphics section.
+ *
+ * Focus mode (`src/lib/focus/`, read from the host's FocusSceneContext):
+ *   .shape-marker[data-focus-tier="focus" | "near"]
+ *   map container [data-sgv-occlusion="ghost"]   (Graphics → faint ghosts)
+ * The focused marker is left out of the occlusion pass, so it shows even
+ * behind a slab. Only markers in the focused item's NEAR column fade;
+ * every other marker carries no tier and looks exactly as without focus.
+ * With no focus and ghosts off neither attribute is written and the
+ * occlusion targets are the same array as before.
  */
 export function MapMarkerOverlay({
   map,
@@ -152,6 +203,11 @@ export function MapMarkerOverlay({
   // through every host — same pattern `mapbox-map.tsx` uses for the
   // shadow / AO flags.
   const occlusionEnabled = useGraphicsSettings((s) => s.markerOcclusion)
+  const occlusionGhosts = useGraphicsSettings((s) => s.occlusionGhosts)
+  // Focus mode. FOCUS_OFF outside a provider, so a host that never
+  // focuses gets a null id and 'normal' tiers — today's behaviour.
+  const focusScene = useFocusScene()
+  const focusedMarkerId = focusedIdOf(focusScene, 'markers')
   // Map<markerId, MarkerEntry> kept in a ref so we can diff against
   // incoming props without losing the underlying DOM nodes on re-renders.
   const entriesRef = useRef<Map<number, MarkerEntry>>(new Map())
@@ -239,25 +295,98 @@ export function MapMarkerOverlay({
         entry = { marker, root, el }
         entries.set(id, entry)
       } else {
-        entry.marker.setLngLat(m.position)
-        entry.marker.setRotation(m.bearing)
+        // Every setter runs a full `Marker._update` (project + rAF + DOM
+        // task), and this effect re-runs for all ~200 markers on any
+        // selection / override / list change — so call one only when it
+        // would change something. Compared against the marker's OWN state
+        // (exactly what each setter stores), not a cached prop: a native
+        // drag moves `_lngLat` too, and must still be snapped back to
+        // `m.position` here just as before.
+        const ll = entry.marker.getLngLat()
+        if (!ll || ll.lng !== m.position[0] || ll.lat !== m.position[1]) {
+          entry.marker.setLngLat(m.position)
+        }
+        // `setRotation` stores `bearing || 0`.
+        if (entry.marker.getRotation() !== (m.bearing || 0)) {
+          entry.marker.setRotation(m.bearing)
+        }
       }
+      // `setAltitude` already returns early for an unchanged value.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const setAlt = (entry.marker as any).setAltitude
       if (typeof setAlt === 'function') setAlt.call(entry.marker, altitude)
       const isSelected = selectedMarkerIds?.has(id) ?? false
-      entry.el.dataset.selected = String(isSelected)
-      entry.el.style.display = committedVisible ? '' : 'none'
+      // DOM writes only on change: an attribute or style write invalidates
+      // style even when the value is the same.
+      const selectedAttr = String(isSelected)
+      if (entry.el.dataset.selected !== selectedAttr) entry.el.dataset.selected = selectedAttr
+      const display = committedVisible ? '' : 'none'
+      if (entry.el.style.display !== display) entry.el.style.display = display
       const override = shapeStyleOverrides?.get(id)
       const effectiveMarker = override ? applyMarkerOverride(m, override) : m
-      entry.root.render(
-        <MarkerVisual
-          marker={effectiveMarker}
-          selected={isSelected}
-        />
-      )
+      const rendered = entry.rendered
+      if (
+        !rendered ||
+        rendered.selected !== isSelected ||
+        !sameMarkerVisual(rendered.marker, effectiveMarker)
+      ) {
+        entry.root.render(
+          <MarkerVisual
+            marker={effectiveMarker}
+            selected={isSelected}
+          />
+        )
+        entry.rendered = { marker: effectiveMarker, selected: isSelected }
+      }
     }
   }, [map, markers, selectedMarkerIds, committedVisible, shapeStyleOverrides])
+
+  // Focus tier → `data-focus-tier` (index.css: 'focus' glows and sits on
+  // top; 'near' 35 % unless the marker is occluded; no attribute = drawn as
+  // without focus). The focused marker gets 'focus'; a marker whose anchor
+  // lies in the focused item's NEAR column (`scene.near`: within
+  // FOCUS_NEAR_RADIUS_M horizontally, no more than FOCUS_NEAR_BELOW_M below
+  // the item) gets 'near'; every other marker stays 'normal'. Markers never
+  // block a line of sight, so the blocker set is irrelevant here (and there
+  // is no ghost tier). `entry.focusTier` mirrors the attribute, so only
+  // changed tiers are written. Declared after the sync effect, which
+  // creates elements on `map` / `markers` changes — both are deps here, so
+  // a marker created while focused is stamped in the same commit. Runs on
+  // focus enter / exit / change (or a change of the NEAR column), never per
+  // camera frame. With focus off and no tier ever written it returns at
+  // once, so no attribute is touched.
+  const tiersWrittenRef = useRef(false)
+  useEffect(() => {
+    if (!map) return
+    if (!focusScene.active && !tiersWrittenRef.current) return
+    const entries = entriesRef.current
+    let anyTier = false
+    for (const m of markers ?? []) {
+      if (m.id === undefined) continue
+      const entry = entries.get(m.id)
+      if (!entry) continue
+      const tier = focusTier(focusScene, NO_BLOCKERS, 'markers', m.id)
+      if (tier !== 'normal') anyTier = true
+      if ((entry.focusTier ?? 'normal') === tier) continue
+      entry.focusTier = tier
+      if (tier === 'normal') delete entry.el.dataset.focusTier
+      else entry.el.dataset.focusTier = tier
+    }
+    tiersWrittenRef.current = anyTier
+  }, [map, markers, focusScene])
+
+  // Graphics → "Show hidden items as faint ghosts": one attribute on the
+  // map container turns every occluded marker into a 25 % clickable ghost
+  // (index.css); a click reaches the element listener above, and the host
+  // focuses the marker. Off (the default) writes nothing.
+  useEffect(() => {
+    if (!map || !occlusionGhosts) return
+    const container = map.getContainer()
+    container.dataset.sgvOcclusion = 'ghost'
+    return () => {
+      delete container.dataset.sgvOcclusion
+    }
+  }, [map, occlusionGhosts])
 
   // Destructured so the memo below keys on the individual arrays. Hosts
   // build the `occluders` bag inline, so its object identity changes
@@ -304,23 +433,69 @@ export function MapMarkerOverlay({
   // Recomputed on every `move` because occlusion is a function of the
   // camera, not of the data: the same marker is hidden looking straight
   // down and visible at a grazing pitch. `move` already fires at most
-  // once per frame, and the pass is a few multiply-adds per marker.
+  // once per frame, and the pass walks a spatial index (see
+  // `occluder-index.ts`), so it stays cheap at stadium scale.
+  //
+  // Targets are the drawn (visible) markers — the only ones with an
+  // element — built once per `markers` change, not on every move.
+  //
+  // The focused marker is never a target: a focused item is always shown.
+  // Changing focus rebuilds the list, so the effect below re-subscribes and
+  // its full pass clears a stale `data-occluded` on the newly focused
+  // marker (and re-tests the one that lost focus) — writes are flips only.
+  // While no marker is focused the id stays null, so the array changes only
+  // with `markers` — the same list (and occlusion state) as before focus
+  // mode.
+  const occlusionTargets = useMemo(
+    () =>
+      markerOcclusionTargets(
+        (markers ?? []).filter(
+          (m) => m.visible !== false && (focusedMarkerId === null || m.id !== focusedMarkerId),
+        ),
+      ),
+    [markers, focusedMarkerId],
+  )
   useEffect(() => {
-    if (!map) return
+    // Hidden markers are `display: none`, so their flag can wait: this
+    // re-runs when they show again and re-checks every element in the
+    // same commit that un-hides it.
+    if (!map || !committedVisible) return
     const entries = entriesRef.current
+    const state = createOcclusionState()
+    // `entry.occluded` mirrors the attribute, so a frame where nothing
+    // flipped writes nothing. Re-writing an unchanged attribute still
+    // invalidates style on that element (~200 per frame before this).
+    const write = (entry: MarkerEntry, occluded: boolean) => {
+      if ((entry.occluded ?? false) === occluded) return
+      entry.occluded = occluded
+      if (occluded) entry.el.dataset.occluded = 'true'
+      else delete entry.el.dataset.occluded
+    }
+    // Full pass over every element on (re)subscribe: markers created or
+    // re-created since the last pass start without the attribute. Entries
+    // only change when `markers` does, which re-runs this effect.
+    const { occluded } = updateOcclusion(map, occlusionTargets, prisms, state)
+    for (const [id, entry] of entries) write(entry, occluded.has(id))
+    // Nothing to hide (occlusion off, no occluders, no markers): the
+    // result can't depend on the camera, so don't listen to it.
+    if (occlusionTargets.length === 0 || prisms.length === 0) return
+    // Per move, only the ids whose state flipped.
     const apply = () => {
-      const occluded = computeOccludedMarkerIds(map, markers ?? [], prisms)
-      for (const [id, entry] of entries) {
-        if (occluded.has(id)) entry.el.dataset.occluded = 'true'
-        else delete entry.el.dataset.occluded
+      const { entered, left } = updateOcclusion(map, occlusionTargets, prisms, state)
+      for (const id of left) {
+        const entry = entries.get(id)
+        if (entry) write(entry, false)
+      }
+      for (const id of entered) {
+        const entry = entries.get(id)
+        if (entry) write(entry, true)
       }
     }
-    apply()
     map.on('move', apply)
     return () => {
       map.off('move', apply)
     }
-  }, [map, markers, prisms])
+  }, [map, occlusionTargets, prisms, committedVisible])
 
   // Sync the ghost marker (placement preview).
   useEffect(() => {
@@ -383,8 +558,11 @@ export function MapMarkerOverlay({
     const cleanups: Array<() => void> = []
     for (const [id, entry] of entries) {
       const isTarget = id === targetId
+      // Re-runs on every `markers` change (a drag frame included), so
+      // only flip the markers whose draggability actually changes —
+      // `setDraggable` re-binds map listeners each call.
       try {
-        entry.marker.setDraggable(isTarget)
+        if (entry.marker.isDraggable() !== isTarget) entry.marker.setDraggable(isTarget)
       } catch {
         /* ignore */
       }
@@ -395,11 +573,12 @@ export function MapMarkerOverlay({
       // selectionEnabled sync effect above.
       const el = entry.el
       if (!isTarget) {
+        const cursor = selectionEnabledRef.current ? 'pointer' : 'default'
         // eslint-disable-next-line react-hooks/immutability
-        el.style.cursor = selectionEnabledRef.current ? 'pointer' : 'default'
+        if (el.style.cursor !== cursor) el.style.cursor = cursor
         continue
       }
-      el.style.cursor = 'grab'
+      if (el.style.cursor !== 'grab') el.style.cursor = 'grab'
       const onDragStart = () => {
         el.style.cursor = 'grabbing'
       }

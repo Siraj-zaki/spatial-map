@@ -42,7 +42,7 @@ const bulkDeleteMax = 500
 // viewers included, could wipe a source's data from the Data screen.
 func DataScreenRouter(q *db.Queries, pool *pgxpool.Pool) chi.Router {
 	r := chi.NewRouter()
-	edit := dataRoleGate(q, RoleOwner, RoleAdmin, RoleEditor)
+	edit := dataPermissionGate(api.PermDataManage)
 
 	// Filter dropdown — every source the tenant has ever created, active
 	// or archived. Sorted archived-first-null so active ones surface at top.
@@ -85,12 +85,12 @@ func DataScreenRouter(q *db.Queries, pool *pgxpool.Pool) chi.Router {
 	return r
 }
 
-// dataRoleGate lets the request through only for the given workspace roles
-// (requireRole writes the 401/403).
-func dataRoleGate(q *db.Queries, roles ...string) func(http.Handler) http.Handler {
+// dataPermissionGate lets the request through only with the permission
+// (api.RequirePermission writes the 403).
+func dataPermissionGate(perm string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !requireRole(w, r, q, roles...) {
+			if !api.RequirePermission(w, r, perm) {
 				return
 			}
 			next.ServeHTTP(w, r)

@@ -13,9 +13,10 @@
  * envelope JSON) hold everything in a single file.
  */
 
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
+  Box,
   Circle,
   Database,
   Download,
@@ -29,6 +30,7 @@ import {
   Hexagon,
   Image as ImageIcon,
   Info,
+  Loader2,
   Layers,
   MapPin,
   Package,
@@ -47,6 +49,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { toast } from '@/lib/toast-store'
+import { downloadModel3D } from '@/lib/export-3d'
 import {
   ALL_EXPORTABLE_KINDS,
   countByKind,
@@ -58,6 +62,9 @@ import {
 } from '@/lib/export-shapes'
 
 type ScopeMode = 'all' | 'byKind' | 'selected'
+
+/** The data formats plus the 3D model, which is built from geometry rather than rows. */
+type DialogFormat = ExportFormat | 'glb'
 
 const KIND_META: Record<
   ExportableKind,
@@ -78,7 +85,7 @@ const KIND_META: Record<
 }
 
 const FORMAT_META: Record<
-  ExportFormat,
+  DialogFormat,
   { labelKey: string; labelDefault: string; hintKey: string; hintDefault: string; icon: typeof FileText }
 > = {
   geojson: {
@@ -109,6 +116,14 @@ const FORMAT_META: Record<
     hintDefault: 'Single kind only — a flat table can only carry one schema.',
     icon: FileText,
   },
+  glb: {
+    labelKey: 'exportDialog.formatGlb',
+    labelDefault: '3D model (.glb)',
+    hintKey: 'exportDialog.formatGlbHint',
+    hintDefault:
+      'Walls, areas, racks, stairs, doors, models and floor plans as one 3D file with the data attached. Opens in Blender, Unity, Windows 3D Viewer.',
+    icon: Box,
+  },
 }
 
 export interface ExportDialogProps {
@@ -123,6 +138,8 @@ export interface ExportDialogProps {
   selectedIds?: Partial<Record<ExportableKind, ReadonlySet<number>>>
   /** Warehouse currently being edited; used to scope "Everything". */
   activeZoneId?: number | null
+  /** `{ modelAssetId: url }` (`useModelUrlMap()`) — lets the 3D export embed placed models. */
+  modelUrls?: Record<string, string>
 }
 
 export function ExportDialog({
@@ -131,6 +148,7 @@ export function ExportDialog({
   source,
   selectedIds,
   activeZoneId,
+  modelUrls,
 }: ExportDialogProps) {
   const { t } = useTranslation()
 
@@ -138,7 +156,9 @@ export function ExportDialog({
   const [kindChoices, setKindChoices] = useState<Set<ExportableKind>>(
     () => new Set(ALL_EXPORTABLE_KINDS),
   )
-  const [format, setFormat] = useState<ExportFormat>('geojson')
+  const [format, setFormat] = useState<DialogFormat>('geojson')
+  const [busy, setBusy] = useState<string | null>(null)
+  const runningRef = useRef(false)
   const [includeConfig, setIncludeConfig] = useState(true)
   const [includeTimestamps, setIncludeTimestamps] = useState(false)
 
@@ -188,15 +208,56 @@ export function ExportDialog({
     ? Object.values(selectedCounts).reduce((n, c) => n + c, 0)
     : 0
 
-  const handleExport = () => {
-    if (nothingToExport || csvBlocked) return
-    downloadShapes(source, {
-      format,
-      scope: activeScope,
-      includeConfig,
-      includeTimestamps,
-    })
-    onOpenChange(false)
+  const handleExport = async () => {
+    if (nothingToExport || csvBlocked || runningRef.current) return
+    if (format !== 'glb') {
+      downloadShapes(source, {
+        format,
+        scope: activeScope,
+        includeConfig,
+        includeTimestamps,
+      })
+      onOpenChange(false)
+      return
+    }
+    // 3D model: async (fetches floor-plan images and model files).
+    runningRef.current = true
+    setBusy('')
+    try {
+      const result = await downloadModel3D(source, {
+        scope: activeScope,
+        includeConfig,
+        includeTimestamps,
+        modelUrls,
+        onProgress: (step) => setBusy(step),
+      })
+      const shapes = Object.values(result.stats.shapes).reduce((n, c) => n + (c ?? 0), 0)
+      toast.success(t('exportDialog.glbDone', { defaultValue: '3D model exported' }), {
+        description: t('exportDialog.glbDoneDetail', {
+          defaultValue: '{{shapes}} shapes, {{triangles}} triangles.',
+          shapes,
+          triangles: result.stats.triangles.toLocaleString(),
+        }),
+      })
+      if (result.stats.skipped.length > 0) {
+        toast.info(
+          t('exportDialog.glbSkipped', {
+            defaultValue: '{{count}} item(s) left out: {{first}}',
+            count: result.stats.skipped.length,
+            first: result.stats.skipped[0],
+          }),
+        )
+      }
+      onOpenChange(false)
+    } catch (err) {
+      console.error('[ExportDialog] 3D export failed', err)
+      toast.error(t('exportDialog.glbFailed', { defaultValue: '3D export failed' }), {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      runningRef.current = false
+      setBusy(null)
+    }
   }
 
   const toggleKind = (kind: ExportableKind) => {
@@ -307,7 +368,7 @@ export function ExportDialog({
               title={t('exportDialog.formatTitle', { defaultValue: 'Format' })}
             />
             <div className="grid grid-cols-2 gap-2">
-              {(['geojson', 'json', 'xlsx', 'csv'] as ExportFormat[]).map((f) => {
+              {(['geojson', 'json', 'xlsx', 'csv', 'glb'] as DialogFormat[]).map((f) => {
                 const meta = FORMAT_META[f]
                 const Icon = meta.icon
                 const disabled = f === 'csv' && chosenKinds.length > 1
@@ -317,7 +378,7 @@ export function ExportDialog({
                     type="button"
                     key={f}
                     onClick={() => !disabled && setFormat(f)}
-                    disabled={disabled}
+                    disabled={disabled || busy !== null}
                     className={cn(
                       'text-start rounded-md border p-2 transition-colors',
                       active
@@ -400,6 +461,12 @@ export function ExportDialog({
                   ? t('exportDialog.previewNothing', {
                       defaultValue: 'Nothing to export with the current selection.',
                     })
+                  : format === 'glb'
+                    ? t('exportDialog.previewGlb', {
+                        defaultValue:
+                          'Will build a 3D model of {{count}} shape(s). Large floors with many models can take a moment.',
+                        count: chosenCount,
+                      })
                   : t('exportDialog.previewOk', {
                       defaultValue: 'Will export {{count}} shape(s) across {{kinds}} kind(s).',
                       count: chosenCount,
@@ -410,12 +477,18 @@ export function ExportDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy !== null}>
             {t('common.cancel', { defaultValue: 'Cancel' })}
           </Button>
-          <Button onClick={handleExport} disabled={csvBlocked || nothingToExport}>
-            <Download className="w-3.5 h-3.5 me-1.5" />
-            {t('exportDialog.exportButton', { defaultValue: 'Export' })}
+          <Button onClick={handleExport} disabled={csvBlocked || nothingToExport || busy !== null}>
+            {busy !== null ? (
+              <Loader2 className="w-3.5 h-3.5 me-1.5 animate-spin" />
+            ) : (
+              <Download className="w-3.5 h-3.5 me-1.5" />
+            )}
+            {busy !== null
+              ? t('exportDialog.glbBuilding', { defaultValue: 'Building 3D model… {{step}}', step: busy })
+              : t('exportDialog.exportButton', { defaultValue: 'Export' })}
           </Button>
         </DialogFooter>
       </DialogContent>

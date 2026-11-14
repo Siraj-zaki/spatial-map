@@ -14,7 +14,6 @@ import {
   lineString as turfLineString,
   distance as turfDistance,
   transformRotate,
-  buffer as turfBuffer,
   polygon as turfPolygon,
   difference as turfDifference,
   featureCollection as turfFC,
@@ -28,6 +27,8 @@ import type {
 } from 'geojson'
 import type { LineShape, LineShapeConfig } from './shapes'
 import type { DoorShape } from './door/types'
+import { leaningWallFootprint, wallLeans } from './sloped-mesh'
+import { joinLines, wallFootprint, wallOutlines, type JoinLine, type LineJoins } from './wall-joins'
 
 const METERS_PER_DEG_LAT = 111_320
 
@@ -66,6 +67,11 @@ export interface LineProps {
   /** Where the label anchors along the line. */
   labelPosition?: 'start' | 'middle' | 'end'
   preview?: boolean
+  /**
+   * Leaning wall (sloped-mesh.ts): the overlay draws it as a mesh, and this
+   * feature sits in the zero-opacity bucket as its click / hover target.
+   */
+  meshed?: boolean
 }
 
 export type LineFeature = Feature<LineString, LineProps>
@@ -80,6 +86,9 @@ function dashCodeFor(dash: LineShapeConfig['dash']): 0 | 1 | 2 {
 function opacityBucketFor(opacity: number): number {
   return Math.max(0, Math.min(100, Math.round((opacity ?? 100) / 10) * 10))
 }
+
+const isWall = (cfg: LineShapeConfig) => (cfg.height ?? 0) !== 0 || (cfg.elevation ?? 0) !== 0
+const wallThicknessOf = (cfg: LineShapeConfig) => Math.max(0.05, cfg.wallThickness ?? 0.3)
 
 
 function propsFor(
@@ -114,7 +123,7 @@ function propsFor(
  * centroid by `degrees`. Uses `lineCentroid` so the pivot matches the
  * line transform-handle UI in map-line-overlay.
  */
-function rotateLine(
+export function rotateLine(
   vertices: [number, number][],
   degrees: number
 ): [number, number][] {
@@ -137,10 +146,10 @@ function rotateLine(
  */
 export function buildLineFeature(
   shape: LineShape,
-  opts?: { preview?: boolean }
+  opts?: { preview?: boolean; vertices?: [number, number][] }
 ): LineFeature | null {
   if (!shape.vertices || shape.vertices.length < 2) return null
-  const rotated = rotateLine(shape.vertices, shape.rotation)
+  const rotated = opts?.vertices ?? rotateLine(shape.vertices, shape.rotation)
   return {
     type: 'Feature',
     properties: propsFor(
@@ -154,14 +163,19 @@ export function buildLineFeature(
 }
 
 /**
- * Buffer the line into a thin polygon used for 3D wall rendering. The
- * buffer width is proportional to the configured stroke width so the
- * wall feels visually consistent with the 2D line. Returns null when
- * height + elevation are both 0 (no wall needed).
+ * The wall's footprint for 3D extrusion: `wallThickness` wide, square
+ * ends and mitred corners (wall-joins.ts). `opts.footprint` is the joined
+ * one `buildLineWallCollection` passes, cut to fit its neighbours; a wall
+ * built on its own (preview, drag, occlusion) gets `wallFootprint`.
+ * Returns null when height + elevation are both 0 (no wall needed).
+ *
+ * `opts.openings` are door openings of OTHER walls that reach into this
+ * one (a wall ending at a doored wall, a corner next to a door): cut the
+ * same way, so a doorway stays open whichever wall's footprint covers it.
  *
  * When `opts.attachedDoors` is provided, every door's opening
  * footprint (a rectangle covering the wall thickness × door width) is
- * subtracted from the buffered polygon via `@turf/difference`, so the
+ * subtracted from the footprint via `@turf/difference`, so the
  * fill-extrusion renders with a real hole where each door sits.
  * Mapbox `fill-extrusion` handles polygons-with-inner-rings (and
  * MultiPolygons) natively, so the resulting geometry drops straight
@@ -169,34 +183,25 @@ export function buildLineFeature(
  */
 export function buildLineWallFeature(
   shape: LineShape,
-  opts?: { preview?: boolean; attachedDoors?: ReadonlyArray<DoorShape> },
+  opts?: {
+    preview?: boolean
+    attachedDoors?: ReadonlyArray<DoorShape>
+    openings?: ReadonlyArray<Feature<Polygon>>
+    footprint?: Polygon | MultiPolygon
+  },
 ): LineWallFeature | null {
   if (!shape.vertices || shape.vertices.length < 2) return null
   if ((shape.config.height ?? 0) === 0 && (shape.config.elevation ?? 0) === 0) {
     return null
   }
-  const rotated = rotateLine(shape.vertices, shape.rotation)
   // Wall thickness comes from the explicit `wallThickness` config (in
   // METERS) so the rendered solid actually reads as a wall — a visible
-  // top face, side faces, and a real shadow. The old stroke-derived
-  // formula (`width × 0.05`) was tied to the 2D pixel stroke width and
-  // produced near-zero thickness at typical zooms, so walls looked like
-  // paper sheets at 3D pitch. Default 0.3 m matches a typical interior
-  // partition; existing rows without the field get that default.
-  const fullThickness = Math.max(0.05, shape.config.wallThickness ?? 0.3)
-  const halfWidth = fullThickness / 2
-  let buffered: Feature<Polygon> | null
-  try {
-    const ls = turfLineString(rotated)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = turfBuffer(ls, halfWidth, { units: 'meters' }) as any
-    if (!result || !result.geometry) return null
-    if (result.geometry.type !== 'Polygon') return null
-    buffered = result as Feature<Polygon>
-  } catch {
-    return null
-  }
-  if (!buffered) return null
+  // top face, side faces, and a real shadow. Default 0.3 m matches a
+  // typical interior partition; existing rows without the field get it.
+  const fullThickness = wallThicknessOf(shape.config)
+  const geometry = opts?.footprint ?? wallFootprint(rotateLine(shape.vertices, shape.rotation), fullThickness / 2)
+  if (!geometry) return null
+  const buffered: Feature<Polygon | MultiPolygon> = { type: 'Feature', properties: {}, geometry }
 
   // Subtract each attached door's opening footprint. Iterative
   // `difference` — each call replaces `buffered` with a possibly
@@ -205,9 +210,12 @@ export function buildLineWallFeature(
   // in pathological cases), we bail and skip further subtractions so
   // the wall stays visible.
   let punched: Feature<Polygon | MultiPolygon> = buffered
-  if (opts?.attachedDoors && opts.attachedDoors.length > 0) {
-    for (const door of opts.attachedDoors) {
-      const footprint = buildDoorOpeningFootprint(door, fullThickness)
+  const cutters = [
+    ...(opts?.attachedDoors ?? []).map((door) => buildDoorOpeningFootprint(door, fullThickness)),
+    ...(opts?.openings ?? []),
+  ]
+  if (cutters.length > 0) {
+    for (const footprint of cutters) {
       if (!footprint) continue
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -382,10 +390,6 @@ export function buildSnapTargetFeature(
   }
 }
 
-/**
- * Build a FeatureCollection of LineStrings ready for a Mapbox geojson
- * source. Skips invisible shapes.
- */
 /** Per-line paint override pushed in by the style-rules engine. */
 export interface LineStyleOverride {
   /** Stroke color hex (`color` on LineProps). */
@@ -400,24 +404,64 @@ export interface LineStyleOverride {
   labelText?: string
 }
 
+const joinCache = new WeakMap<ReadonlyArray<LineShape>, LineJoins>()
+
+/**
+ * The joints between the visible lines (wall-joins.ts): each line's
+ * vertices with gaps and overshoots at its joints closed, and each wall's
+ * footprint fitted to its neighbours. Worked out once per `shapes` array,
+ * so the stroke and wall collections built from it share one result.
+ * Leaning walls keep their own geometry.
+ */
+export function lineJoins(shapes: ReadonlyArray<LineShape>): LineJoins {
+  const cached = joinCache.get(shapes)
+  if (cached) return cached
+  const input: JoinLine[] = []
+  for (const s of shapes) {
+    if (s.visible === false || s.id === undefined || !s.vertices || s.vertices.length < 2) continue
+    if (wallLeans(s.config)) continue
+    const wall = isWall(s.config)
+    const low = Number(s.config.elevation ?? 0)
+    input.push({
+      id: s.id,
+      vertices: rotateLine(s.vertices, s.rotation),
+      halfWidth: wall ? wallThicknessOf(s.config) / 2 : 0,
+      low,
+      high: wall ? low + Math.max(Number(s.config.height ?? 0), 0.05) : low,
+      floor: s.floorPlanId ?? null,
+    })
+  }
+  const joins = joinLines(input)
+  joinCache.set(shapes, joins)
+  return joins
+}
+
+/**
+ * Build a FeatureCollection of LineStrings ready for a Mapbox geojson
+ * source, joints closed (`lineJoins`). Skips invisible shapes.
+ */
 export function buildLineFeatureCollection(
   shapes: ReadonlyArray<LineShape>,
   extras?: ReadonlyMap<number, LineStyleOverride> | null,
 ): FeatureCollection<LineString, LineProps> {
+  const joins = lineJoins(shapes)
   const features: LineFeature[] = []
   for (const s of shapes) {
     if (s.visible === false) continue
-    const f = buildLineFeature(s)
+    const f = buildLineFeature(s, { vertices: s.id !== undefined ? joins.vertices.get(s.id) : undefined })
     if (!f) continue
     const override = s.id !== undefined ? extras?.get(s.id) : undefined
-    features.push(override ? applyLineOverride(f, override) : f)
+    const built = override ? applyLineOverride(f, override) : f
+    // A leaning wall's stroke stays at its base (the overlay reads `meshed`).
+    features.push(wallLeans(s.config, built.properties.height) ? { ...built, properties: { ...built.properties, meshed: true } } : built)
   }
   return { type: 'FeatureCollection', features }
 }
 
 /**
  * Build a FeatureCollection of wall polygons (for 3D extrusion). Each
- * entry is the buffered line of a shape with elevation/height > 0.
+ * entry is the joined footprint (`lineJoins`) of a shape with
+ * elevation/height > 0 — neighbouring walls abut, they don't overlap.
  *
  * The Mappedin-style "darker shadow at the wall base" effect is NOT
  * baked into the geometry — it's produced by the Mapbox GL JS v3 light
@@ -431,20 +475,99 @@ export function buildLineWallCollection(
   extras?: ReadonlyMap<number, LineStyleOverride> | null,
   attachedDoorsByLineId?: ReadonlyMap<number, ReadonlyArray<DoorShape>> | null,
 ): FeatureCollection<Polygon, LineProps> {
+  const joins = lineJoins(shapes)
+  const openings = doorOpenings(shapes, attachedDoorsByLineId)
   const features: LineWallFeature[] = []
   for (const s of shapes) {
     if (s.visible === false) continue
     const attachedDoors = s.id !== undefined
       ? attachedDoorsByLineId?.get(s.id)
       : undefined
-    const f = buildLineWallFeature(s, { attachedDoors })
+    const footprint = s.id !== undefined ? joins.footprints.get(s.id) : undefined
+    const box = footprint ? boxOf(footprint.type === 'Polygon' ? footprint.coordinates[0] : footprint.coordinates.flatMap((p) => p[0])) : null
+    const near = box
+      ? openings.filter((o) => o.host !== s.id && (o.floor ?? null) === (s.floorPlanId ?? null) && boxesMeet(o.box, box)).map((o) => o.footprint)
+      : undefined
+    const f = buildLineWallFeature(s, { attachedDoors, footprint, openings: near })
     if (!f) continue
     const override = s.id !== undefined ? extras?.get(s.id) : undefined
-    features.push(
-      override ? ({ ...f, properties: applyLineOverrideProps(f.properties, override) } as LineWallFeature) : f,
-    )
+    const props = override ? applyLineOverrideProps(f.properties, override) : f.properties
+    if (wallLeans(s.config, props.height)) {
+      // Drawn as a mesh by the overlay. The feature becomes its invisible
+      // hit target, covering everything the leaning wall overhangs.
+      const rings = leaningWallFootprint(rotateLine(s.vertices, s.rotation), s.config)
+      features.push({
+        ...f,
+        geometry: rings ? { type: 'Polygon', coordinates: rings } : f.geometry,
+        properties: { ...props, meshed: true, opacityBucket: 0 },
+      } as LineWallFeature)
+      continue
+    }
+    features.push(override ? ({ ...f, properties: props } as LineWallFeature) : f)
   }
   return { type: 'FeatureCollection', features }
+}
+
+type Box = [number, number, number, number]
+
+function boxOf(ring: ReadonlyArray<ReadonlyArray<number>>): Box {
+  const b: Box = [Infinity, Infinity, -Infinity, -Infinity]
+  for (const [x, y] of ring) {
+    b[0] = Math.min(b[0], x)
+    b[1] = Math.min(b[1], y)
+    b[2] = Math.max(b[2], x)
+    b[3] = Math.max(b[3], y)
+  }
+  return b
+}
+
+const boxesMeet = (a: Box, b: Box) => a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
+
+/** Every attached door's opening footprint, sized by its own wall. */
+function doorOpenings(
+  shapes: ReadonlyArray<LineShape>,
+  doorsByLineId?: ReadonlyMap<number, ReadonlyArray<DoorShape>> | null,
+): Array<{ host: number; floor?: number | null; footprint: Feature<Polygon>; box: Box }> {
+  const out: Array<{ host: number; floor?: number | null; footprint: Feature<Polygon>; box: Box }> = []
+  if (!doorsByLineId?.size) return out
+  for (const s of shapes) {
+    if (s.visible === false || s.id === undefined || !isWall(s.config)) continue
+    for (const door of doorsByLineId.get(s.id) ?? []) {
+      const footprint = buildDoorOpeningFootprint(door, wallThicknessOf(s.config))
+      if (footprint) out.push({ host: s.id, floor: s.floorPlanId, footprint, box: boxOf(footprint.geometry.coordinates[0]) })
+    }
+  }
+  return out
+}
+
+/**
+ * The walls' roof outline, from `buildLineWallCollection`'s features: one
+ * border round each group of touching walls with the same top
+ * (`wallOutlines`), so a joint draws one border instead of each wall's
+ * own crossing outline. Each stretch carries the props of the wall whose
+ * side it runs along — its border colour, width and opacity. Leaning
+ * walls (meshes) have no outline.
+ */
+export function buildLineWallBorderCollection(
+  walls: FeatureCollection<Polygon | MultiPolygon, LineProps>,
+): FeatureCollection<LineString, LineProps> {
+  // Keyed by feature: a wall cut by a focus region is two features.
+  const props: LineProps[] = []
+  const input = []
+  for (const f of walls.features) {
+    const p = f.properties
+    if (!p || p.meshed || p.lineId === undefined) continue
+    input.push({ id: props.length, geometry: f.geometry, top: Number(p.elevation ?? 0) + Math.max(Number(p.height ?? 0), 0.05) })
+    props.push(p)
+  }
+  return {
+    type: 'FeatureCollection',
+    features: wallOutlines(input).map((run) => ({
+      type: 'Feature',
+      properties: props[run.id],
+      geometry: { type: 'LineString', coordinates: run.coordinates },
+    })),
+  }
 }
 
 /** Spread the override into a feature's properties; returns a new feature. */

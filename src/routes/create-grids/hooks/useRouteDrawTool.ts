@@ -10,7 +10,7 @@ import { type RouteShape, type RouteShapeConfig } from '@/lib/shapes'
 import { type LengthUnit } from '@/lib/units'
 import { queryCache } from '@/lib/useApiQuery'
 
-import { unprojectAtAltitude } from './unproject-at-altitude'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 /**
  * Route (wayfinding path) draw tool. Click N times to add waypoints,
@@ -137,7 +137,7 @@ export function useRouteDrawTool({
       // Cast against the tool's elevation plane so the vertex lands at
       // the same altitude the preview sits at — same trick the polygon
       // + line placement handlers use.
-      const hit = unprojectAtAltitude(map, e.point, routeConfig.elevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, routeConfig.elevation ?? 0)
       const rawHit: [number, number] = [hit.lng, hit.lat]
       // When the snap engine reports a hit, the committed vertex lands
       // on the EXACT coordinate of the snap target. Coincident vertices
@@ -169,7 +169,7 @@ export function useRouteDrawTool({
       const e = pendingMove
       pendingMove = null
       if (!e) return
-      const hit = unprojectAtAltitude(map, e.point, routeConfig.elevation ?? 0)
+      const hit = unprojectOnScene(map, e.point, routeConfig.elevation ?? 0)
       const rawHit: [number, number] = [hit.lng, hit.lat]
       const snap = computeSnap(rawHit)
       // Preview cursor tracks the raw pointer; the snap object carries

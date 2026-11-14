@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 
 import type MapboxDraw from '@mapbox/mapbox-gl-draw'
+import type { Feature, LineString } from 'geojson'
 import type { Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import { unprojectOnScene } from '@/lib/unproject-at-altitude'
 
 import { apiDb } from '@/lib/api-db'
 import { DRAW_GRID_MODE_NAME } from '@/lib/grid-draw-mode'
 import { type Grid } from '@/lib/db'
 import { type GridConfig } from '@/lib/grid-generators'
+import { isPathLayout, pathGridGeometry } from '@/lib/grid-path'
 import { gridHistory } from '@/lib/grid-history'
-import { updateGridGeometry } from '@/lib/export'
+import { updateGridGeometry, updateGridShape } from '@/lib/export'
 import { type Tool } from '@/lib/keyboard-shortcuts'
 import { queryCache } from '@/lib/useApiQuery'
 
@@ -75,6 +78,13 @@ export function useGridDrawTool({
   const [drawMode, setDrawMode] = useState(false)
   const [liveStart, setLiveStart] = useState<[number, number] | null>(null)
   const [liveCurrent, setLiveCurrent] = useState<[number, number] | null>(null)
+  // Path layout: the vertices clicked so far (the cursor is `liveCurrent`).
+  const [liveVertices, setLiveVertices] = useState<[number, number][]>([])
+  // Mirror of the draw mode's vertices, written synchronously from its
+  // events: re-entering the mode (a config change mid-draw) passes them
+  // back in so the points clicked so far — or a re-drawn grid's existing
+  // path — survive. State would lag a render behind.
+  const pathVerticesRef = useRef<[number, number][]>([])
 
   // If the map instance disappears (style swap, unmount), reset any
   // in-flight draw state. Was previously handled by
@@ -87,15 +97,31 @@ export function useGridDrawTool({
     setDrawMode(false)
     setLiveStart(null)
     setLiveCurrent(null)
+    setLiveVertices([])
+    pathVerticesRef.current = []
   }, [mapInstance])
+
+  // Path layout: the in-progress path (clicked vertices + cursor) as a grid
+  // box and a config carrying the normalised path, so the overlay previews
+  // the real cells while the user is still clicking.
+  const livePath = useMemo(() => {
+    if (!isPathLayout(config) || liveVertices.length === 0 || !liveCurrent) return null
+    const geo = pathGridGeometry([...liveVertices, liveCurrent], config)
+    if (!geo) return null
+    return { line: { start: geo.start, current: geo.current }, config: { ...config, rotation: 0, path: geo.path } }
+  }, [config, liveVertices, liveCurrent])
 
   const liveLine = useMemo<
     { start: [number, number]; current: [number, number] } | null
   >(() => {
+    if (isPathLayout(config)) return livePath?.line ?? null
     if (!liveStart || !liveCurrent) return null
     if (liveStart[0] === liveCurrent[0] && liveStart[1] === liveCurrent[1]) return null
     return { start: liveStart, current: liveCurrent }
-  }, [liveStart, liveCurrent])
+  }, [config, livePath, liveStart, liveCurrent])
+
+  /** Config for the live preview: the path-carrying config while a path is being drawn. */
+  const livePreviewConfig = livePath?.config ?? null
 
   // ---- Toolbar ↔ side-panel sync ---------------------------------------
   const drawModeSourceRef = useRef<'toolbar' | 'panel' | null>(null)
@@ -126,10 +152,12 @@ export function useGridDrawTool({
     (opts?: { start?: [number, number]; config?: GridConfig }) => {
       const draw = drawRef.current
       if (!draw) return
+      const nextConfig = opts?.config ?? config
       setDrawMode(true)
       draw.changeMode(DRAW_GRID_MODE_NAME, {
-        config: opts?.config ?? config,
+        config: nextConfig,
         start: opts?.start,
+        vertices: isPathLayout(nextConfig) ? pathVerticesRef.current.slice() : undefined,
       })
     },
     [config, drawRef],
@@ -142,11 +170,36 @@ export function useGridDrawTool({
     setHasAnchor(false)
     setLiveStart(null)
     setLiveCurrent(null)
+    setLiveVertices([])
+    pathVerticesRef.current = []
     setRedrawingGridId(null)
     // Keep the toolbar in sync — exiting the grid draw mode must
     // de-highlight the create-grid button.
     setActiveTool((t) => (t === 'create-grid' ? 'pan' : t))
   }, [drawRef, setActiveTool, setRedrawingGridId])
+
+  /** Path layout: drop the last clicked vertex (the editor's Backspace shortcut). */
+  const undoPathVertex = useCallback(() => {
+    drawRef.current?.trash()
+  }, [drawRef])
+
+  /**
+   * Path layout: finish the path (the editor's Enter shortcut). The mode's
+   * own Enter handler only hears keys while the map has focus — after
+   * clicking Re-draw, focus is still in the panel — so this fires the same
+   * `draw.create` the mode would and leaves the mode.
+   */
+  const finishPathDraw = useCallback(() => {
+    const verts = pathVerticesRef.current
+    if (!mapInstance || !isPathLayout(config) || verts.length < 2) return
+    const line: Feature<LineString> = {
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'LineString', coordinates: verts },
+    }
+    mapInstance.fire('draw.create', { features: [line] })
+    drawRef.current?.changeMode('simple_select')
+  }, [mapInstance, config, drawRef])
 
   const handleToggleDrawMode = useCallback(() => {
     if (drawMode) exitDrawMode()
@@ -169,6 +222,13 @@ export function useGridDrawTool({
   }, [config, drawMode])
 
   // ---- Live preview (mousemove after anchor) ---------------------------
+  // The rack's elevation, read at move time (the listener isn't re-bound
+  // on config edits): the cursor point is taken on the scene at that
+  // height, matching where the draw mode puts the clicks.
+  const elevationRef = useRef(config.elevation ?? 0)
+  useEffect(() => {
+    elevationRef.current = config.elevation ?? 0
+  }, [config.elevation])
   useEffect(() => {
     if (!mapInstance || !drawMode || !hasAnchor) return
     const map = mapInstance
@@ -182,7 +242,7 @@ export function useGridDrawTool({
       }
     }
     const handleMove = (e: MapMouseEvent) => {
-      pending = { lng: e.lngLat.lng, lat: e.lngLat.lat }
+      pending = unprojectOnScene(map, e.point, elevationRef.current)
       if (rafId === null) rafId = requestAnimationFrame(flush)
     }
     map.on('mousemove', handleMove)
@@ -204,9 +264,16 @@ export function useGridDrawTool({
       }
       const coords = feature.geometry.coordinates as [number, number][]
       if (coords.length < 2) return
-      const start = coords[0]
-      const current = coords[coords.length - 1]
+      // Path layout: the whole clicked path becomes the grid's box + a
+      // normalised `config.path`; rotation is baked into the path.
+      const pathGeo = isPathLayout(config) ? pathGridGeometry(coords, config) : null
+      if (isPathLayout(config) && !pathGeo) return
+      const start = pathGeo ? pathGeo.start : coords[0]
+      const current = pathGeo ? pathGeo.current : coords[coords.length - 1]
+      const saveConfig: GridConfig = pathGeo ? { ...config, layout: 'path', rotation: 0, path: pathGeo.path } : config
       const now = new Date()
+      setLiveVertices([])
+      pathVerticesRef.current = []
       if (redrawingGridId !== null) {
         // Re-draw: update the existing grid's geometry.
         const orig = savedGrids.find((g) => g.id === redrawingGridId)
@@ -218,9 +285,10 @@ export function useGridDrawTool({
             oldCurrent: orig.current,
             newStart: start,
             newCurrent: current,
+            ...(pathGeo ? { oldConfig: orig.config, newConfig: { ...orig.config, ...saveConfig } } : {}),
           })
-          void updateGridGeometry(redrawingGridId, start, current).then(() => {
-          })
+          if (pathGeo) void updateGridShape(redrawingGridId, start, current, { ...orig.config, ...saveConfig })
+          else void updateGridGeometry(redrawingGridId, start, current)
         }
         setRedrawingGridId(null)
         setDrawMode(false)
@@ -237,7 +305,9 @@ export function useGridDrawTool({
           name,
           start,
           current,
-          config,
+          config: saveConfig,
+          // Like every other draw tool: the API stores a missing `visible` as false (hidden).
+          visible: true,
           zoneId: wid ?? undefined,
           floorPlanId: defaultFloorPlanIdRef.current ?? undefined,
           createdAt: now,
@@ -262,6 +332,8 @@ export function useGridDrawTool({
       const mode = draw.getMode()
       if (mode !== DRAW_GRID_MODE_NAME) {
         setDrawMode(false)
+        setLiveVertices([])
+        pathVerticesRef.current = []
         setHasAnchor(false)
         setLiveStart(null)
         setLiveCurrent(null)
@@ -280,16 +352,26 @@ export function useGridDrawTool({
       setHasAnchor(false)
       setLiveStart(null)
       setLiveCurrent(null)
+      setLiveVertices([])
+      pathVerticesRef.current = []
+    }
+    const handlePathVertices = (e: { vertices: [number, number][] }) => {
+      if (!Array.isArray(e?.vertices)) return
+      pathVerticesRef.current = e.vertices
+      setLiveVertices(e.vertices)
     }
     const onCreate = handleCreate as MapListener
     const onModeChange = handleModeChange as MapListener
     const onFirstClick = handleFirstClick as MapListener
     const onAnchorClear = handleAnchorClear as MapListener
+    const onPathVertices = handlePathVertices as MapListener
     mapInstance.on('draw.create', onCreate)
     mapInstance.on('draw.modechange', onModeChange)
     mapInstance.on('draw.firstclick', onFirstClick)
     mapInstance.on('draw.anchorclear', onAnchorClear)
+    mapInstance.on('draw.pathvertices', onPathVertices)
     return () => {
+      mapInstance.off('draw.pathvertices', onPathVertices)
       mapInstance.off('draw.create', onCreate)
       mapInstance.off('draw.modechange', onModeChange)
       mapInstance.off('draw.firstclick', onFirstClick)
@@ -314,12 +396,15 @@ export function useGridDrawTool({
     liveStart,
     liveCurrent,
     liveLine,
+    livePreviewConfig,
     setHasAnchor,
     setDrawMode,
     setLiveStart,
     setLiveCurrent,
     enterDrawMode,
     exitDrawMode,
+    undoPathVertex,
+    finishPathDraw,
     handleToggleDrawMode,
     drawModeSourceRef,
   }

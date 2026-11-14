@@ -33,8 +33,8 @@ export interface MapInsight {
 
 /** What the full-map page puts around the explorer. */
 export interface ExplorerMapChrome {
-  /** The top bar, given the explorer's floor picker to place in it. */
-  renderTopBar: (floorPicker: ReactNode) => ReactNode
+  /** The top bar, given the explorer's floor picker and cluster control to place in it. */
+  renderTopBar: (floorPicker: ReactNode, clusterControl?: ReactNode) => ReactNode
   kpis: ReactNode[]
   insights: MapInsight[]
   panels: { list: boolean; insights: boolean; kpis: boolean }
@@ -69,6 +69,7 @@ export function ExplorerMapLayout({
   detail,
   onCloseDetail,
   floorPicker,
+  clusterControl,
   loading,
   renderMap,
   onKeyDown,
@@ -83,6 +84,8 @@ export function ExplorerMapLayout({
   onCloseDetail: () => void
   /** The floor dropdown (null for a one-floor facility) — goes in the top bar. */
   floorPicker: ReactNode
+  /** The map's "Cluster items" control (null when the tab can't cluster) — top bar, after Filters. */
+  clusterControl?: ReactNode
   loading: ReactNode
   renderMap: (insets: MapInsets) => ReactNode
   onKeyDown: (e: React.KeyboardEvent) => void
@@ -127,8 +130,10 @@ export function ExplorerMapLayout({
         list={list}
         detail={detail}
         floorPicker={floorPicker}
+        clusterControl={clusterControl}
         loading={loading}
         renderMap={renderMap}
+        onKeyDown={onKeyDown}
         kpis={kpis}
         insights={insights}
       />
@@ -157,7 +162,7 @@ export function ExplorerMapLayout({
           (logo, scale, attribution — Mapbox requires them visible) clear. */}
       <div className="pointer-events-none absolute inset-0 z-10 flex flex-col gap-4 p-4 pb-9">
         <div className="sgv-enter-down pointer-events-auto" style={stagger(0)}>
-          {chrome.renderTopBar(floorPicker)}
+          {chrome.renderTopBar(floorPicker, clusterControl)}
         </div>
 
         <div ref={bodyRef} className="relative min-h-0 flex-1">
@@ -335,8 +340,10 @@ function PhoneLayout({
   list,
   detail,
   floorPicker,
+  clusterControl,
   loading,
   renderMap,
+  onKeyDown,
   kpis,
   insights,
 }: {
@@ -347,8 +354,11 @@ function PhoneLayout({
   list: ReactNode
   detail: ReactNode | null
   floorPicker: ReactNode
+  clusterControl?: ReactNode
   loading: ReactNode
   renderMap: (insets: MapInsets) => ReactNode
+  /** The explorer's keys (Esc lets go of the picked item, ↑/↓ step). */
+  onKeyDown: (e: React.KeyboardEvent) => void
   kpis: ReactNode[]
   insights: MapInsight[]
 }) {
@@ -386,12 +396,12 @@ function PhoneLayout({
   ]
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-muted/40">
+    <div className="relative h-full w-full overflow-hidden bg-muted/40" onKeyDown={onKeyDown}>
       {renderMap({ top: 76, bottom: sheetH })}
       {loading}
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex flex-col gap-2 p-2">
         <div className="sgv-enter-down pointer-events-auto" style={stagger(0)}>
-          {chrome.renderTopBar(floorPicker)}
+          {chrome.renderTopBar(floorPicker, clusterControl)}
         </div>
       </div>
       <section

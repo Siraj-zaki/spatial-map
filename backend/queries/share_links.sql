@@ -1,14 +1,14 @@
 -- name: CreateShareLink :one
 INSERT INTO share_links (tenant_id, zone_id, token, label, settings, expires_at, max_views, created_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by;
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id;
 
 -- name: GetShareLinkByID :one
 -- Tenant-scoped read for the editor UI. Returns even revoked rows so the
 -- dashboard's Manage-Links table can render a "Revoked" badge and expose
 -- a permanent-delete action. The public read-path uses GetShareLinkByToken
 -- which enforces revoked_at IS NULL itself.
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
 WHERE id = $1 AND tenant_id = $2;
 
@@ -17,9 +17,9 @@ WHERE id = $1 AND tenant_id = $2;
 -- Ordered newest-first so the most recently issued link is on top.
 -- Revoked rows are included and shown greyed-out in the UI so users
 -- can audit "who did I share this with, and did I already kill it?".
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
-WHERE tenant_id = $1 AND zone_id = $2
+WHERE tenant_id = $1 AND zone_id = $2 AND report_id IS NULL
 ORDER BY created_at DESC;
 
 -- name: GetShareLinkByToken :one
@@ -31,9 +31,10 @@ ORDER BY created_at DESC;
 -- Any failure returns pgx.ErrNoRows so the caller responds 404 — never
 -- 403 — so an attacker can't distinguish an expired link from a fake
 -- one.
-SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
 FROM share_links
 WHERE token = $1
+  AND report_id IS NULL
   AND revoked_at IS NULL
   AND (expires_at IS NULL OR expires_at > now())
   AND (max_views IS NULL OR view_count < max_views);
@@ -45,7 +46,7 @@ WHERE token = $1
 UPDATE share_links
 SET label = $3, settings = $4, expires_at = $5, max_views = $6, updated_at = now()
 WHERE id = $1 AND tenant_id = $2
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by;
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id;
 
 -- name: RevokeShareLink :one
 -- Soft-delete. The row stays for audit; the public endpoint returns 404
@@ -55,7 +56,7 @@ RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views,
 UPDATE share_links
 SET revoked_at = now(), revoked_by = $3, updated_at = now()
 WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by;
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id;
 
 -- name: DeleteShareLink :exec
 -- Hard-delete for the "purge from history" flow. Only exposed to owners.
@@ -73,3 +74,55 @@ UPDATE share_links
 SET view_count = view_count + 1,
     last_accessed_at = now()
 WHERE id = $1;
+
+-- name: CreateReportShareLink :one
+-- A public link to one report. zone_id is the report's facility (NULL for
+-- a workspace-wide report) — kept for the audit trail and the cascade.
+INSERT INTO share_links (tenant_id, zone_id, report_id, token, label, settings, expires_at, max_views, created_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id;
+
+-- name: ListShareLinksByReport :many
+-- The report's Share dialog: every link issued for it, newest first,
+-- revoked ones included (shown greyed out).
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE tenant_id = $1 AND report_id = $2
+ORDER BY created_at DESC;
+
+-- name: GetReportShareLinkByToken :one
+-- Public read for /public/report-share/{token}. Same gates as
+-- GetShareLinkByToken (revoked, expired, view cap → no rows → 404), and
+-- only report links answer.
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count < max_views);
+
+-- name: GetReportShareLinkForData :one
+-- The data calls a shared report page makes after it opened (run, map
+-- rows, history). The view cap counts page opens, so the open that used
+-- the last view keeps working (view_count <= max_views); revoking or
+-- expiry stop it at once.
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NOT NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count <= max_views);
+
+-- name: GetShareLinkForData :one
+-- The data calls a shared facility page makes after it opened (layer
+-- rows, history, live positions) — like GetReportShareLinkForData: the
+-- open that used the last view keeps working.
+SELECT id, tenant_id, zone_id, token, label, settings, expires_at, max_views, view_count, last_accessed_at, created_by, created_at, updated_at, revoked_at, revoked_by, report_id
+FROM share_links
+WHERE token = $1
+  AND report_id IS NULL
+  AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > now())
+  AND (max_views IS NULL OR view_count <= max_views);

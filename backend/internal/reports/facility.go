@@ -248,16 +248,52 @@ var FacilityEntities = []FacilityEntity{
                 ST_SetSRID(ST_MakePoint(x.start_lng, x.current_lat), 4326)::geography) AS d,
     greatest(coalesce(CASE WHEN jsonb_typeof(x.config->'levels') = 'number' THEN (x.config->>'levels')::numeric END, 1), 1) AS lv,
     nullif(CASE WHEN jsonb_typeof(x.config->'xSize') = 'number' THEN (x.config->>'xSize')::numeric END, 0) AS cw,
-    nullif(CASE WHEN jsonb_typeof(x.config->'ySize') = 'number' THEN (x.config->>'ySize')::numeric END, 0) AS ch
+    nullif(CASE WHEN jsonb_typeof(x.config->'ySize') = 'number' THEN (x.config->>'ySize')::numeric END, 0) AS ch,
+    greatest(coalesce(CASE WHEN jsonb_typeof(x.config->'cellGap') = 'number' THEN (x.config->>'cellGap')::numeric END, 0), 0) AS gap,
+    (x.config->>'layout' = 'path' AND jsonb_typeof(x.config->'path') = 'array' AND jsonb_array_length(x.config->'path') >= 2) AS is_path,
+    greatest(floor(coalesce(CASE WHEN jsonb_typeof(x.config->'pathRows') = 'number' THEN (x.config->>'pathRows')::numeric END, 1)), 1) AS prows,
+    coalesce(jsonb_typeof(x.config->'pathSmooth') = 'boolean' AND (x.config->>'pathSmooth')::boolean, false) AS psmooth
 ) dim
+-- Path-layout racks (src/lib/grid-path.ts): columns come from the path's
+-- length, measured along the Catmull-Rom curve (12 samples per segment) when
+-- smoothed — the same rule as the editor and import_pipeline.go.
+CROSS JOIN LATERAL (
+  SELECT coalesce(sum(sqrt(power(s.px - s.qx, 2) + power(s.py - s.qy, 2))), 0) AS plen FROM (
+    SELECT smp.px, smp.py, lag(smp.px) OVER (ORDER BY smp.o) AS qx, lag(smp.py) OVER (ORDER BY smp.o) AS qy
+    FROM (
+      SELECT pa.xs, pa.ys, coalesce(array_length(pa.xs, 1), 0) AS n FROM (
+        SELECT array_agg((e.p->>0)::float8 * dim.w ORDER BY e.o) AS xs, array_agg((e.p->>1)::float8 * dim.d ORDER BY e.o) AS ys
+        FROM jsonb_array_elements(CASE WHEN dim.is_path THEN x.config->'path' ELSE '[]'::jsonb END) WITH ORDINALITY e(p, o)
+      ) pa
+    ) b
+    CROSS JOIN LATERAL (
+      SELECT i::float8 AS o, b.xs[i] AS px, b.ys[i] AS py
+      FROM generate_series(1, b.n) i WHERE NOT (dim.psmooth AND b.n >= 3)
+      UNION ALL
+      SELECT ((i - 1) * 12 + k)::float8,
+        0.5 * (2 * b.xs[i] + (-b.xs[greatest(i - 1, 1)] + b.xs[i + 1]) * (k / 12.0)::float8
+          + (2 * b.xs[greatest(i - 1, 1)] - 5 * b.xs[i] + 4 * b.xs[i + 1] - b.xs[least(i + 2, b.n)]) * power((k / 12.0)::float8, 2)
+          + (-b.xs[greatest(i - 1, 1)] + 3 * b.xs[i] - 3 * b.xs[i + 1] + b.xs[least(i + 2, b.n)]) * power((k / 12.0)::float8, 3)),
+        0.5 * (2 * b.ys[i] + (-b.ys[greatest(i - 1, 1)] + b.ys[i + 1]) * (k / 12.0)::float8
+          + (2 * b.ys[greatest(i - 1, 1)] - 5 * b.ys[i] + 4 * b.ys[i + 1] - b.ys[least(i + 2, b.n)]) * power((k / 12.0)::float8, 2)
+          + (-b.ys[greatest(i - 1, 1)] + 3 * b.ys[i] - 3 * b.ys[i + 1] + b.ys[least(i + 2, b.n)]) * power((k / 12.0)::float8, 3))
+      FROM generate_series(1, b.n - 1) i, generate_series(0, 11) k WHERE dim.psmooth AND b.n >= 3
+      UNION ALL
+      SELECT ((b.n - 1) * 12)::float8, b.xs[b.n], b.ys[b.n] WHERE dim.psmooth AND b.n >= 3
+    ) smp
+  ) s WHERE s.qx IS NOT NULL
+) pth
 CROSS JOIN LATERAL (SELECT
-    greatest(floor(dim.w::numeric / dim.cw + 0.000001), 1) AS cols,
-    greatest(floor(dim.d::numeric / dim.ch + 0.000001), 1) AS nrows
+    CASE WHEN dim.is_path
+      THEN least(greatest(floor((pth.plen::numeric + dim.gap) / (dim.cw + dim.gap) + 0.000000001), 1), greatest(floor(20000 / (dim.prows * dim.lv)), 1))
+      ELSE greatest(floor(dim.w::numeric / dim.cw + 0.000001), 1) END AS cols,
+    CASE WHEN dim.is_path THEN dim.prows ELSE greatest(floor(dim.d::numeric / dim.ch + 0.000001), 1) END AS nrows
 ) cnt
 `+areaAt("(x.start_lng + x.current_lng) / 2", "(x.start_lat + x.current_lat) / 2"),
 			`'area', area.name, 'columns', cnt.cols, 'rows', cnt.nrows, 'levels', dim.lv,
   'bays', cnt.cols * cnt.nrows * dim.lv,
-  'width_m', round(dim.w::numeric, 2), 'depth_m', round(dim.d::numeric, 2),
+  'width_m', CASE WHEN dim.is_path THEN round(pth.plen::numeric, 2) ELSE round(dim.w::numeric, 2) END,
+  'depth_m', CASE WHEN dim.is_path THEN round(dim.prows * dim.ch + (dim.prows - 1) * dim.gap, 2) ELSE round(dim.d::numeric, 2) END,
   'height_m', CASE WHEN dim.lv > 1 THEN round(dim.lv * coalesce(CASE WHEN jsonb_typeof(x.config->'levelHeight') = 'number' THEN (x.config->>'levelHeight')::numeric END, 0), 2)
                    ELSE `+num("->'height'")+` END,
   'elevation_m', `+num("->'elevation'")+`, 'color', x.config->>'color'`,

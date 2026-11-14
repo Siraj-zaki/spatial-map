@@ -225,11 +225,12 @@ type reportAccess struct {
 // A missing row is a hard "no" for non-admins — that's what makes the
 // admin-created report invisible to unlisted members.
 func resolveReportAccess(ctx context.Context, q *db.Queries, r db.Report, userID int64, role string) (reportAccess, error) {
-	if role == RoleOwner || role == RoleAdmin {
-		return reportAccess{CanView: true, CanEdit: true}, nil
+	// Owners / admins — or any role with reports.viewAll — see every report.
+	if api.HasPermission(ctx, api.PermReportsViewAll) {
+		return reportAccess{CanView: true, CanEdit: roleCanEditReports(ctx)}, nil
 	}
 	if r.CreatedBy.Valid && r.CreatedBy.Int64 == userID {
-		return reportAccess{CanView: true, CanEdit: roleCanEditReports(role)}, nil
+		return reportAccess{CanView: true, CanEdit: roleCanEditReports(ctx)}, nil
 	}
 	perms, err := q.ListReportIDsVisibleToUser(ctx, userID)
 	if err != nil {
@@ -237,15 +238,16 @@ func resolveReportAccess(ctx context.Context, q *db.Queries, r db.Report, userID
 	}
 	for _, p := range perms {
 		if p.ReportID == r.ID {
-			return reportAccess{CanView: true, CanEdit: p.CanEdit && roleCanEditReports(role)}, nil
+			return reportAccess{CanView: true, CanEdit: p.CanEdit && roleCanEditReports(ctx)}, nil
 		}
 	}
 	return reportAccess{}, nil
 }
 
-// roleCanEditReports — viewers are read-only whatever the report ACL says.
-func roleCanEditReports(role string) bool {
-	return role == RoleOwner || role == RoleAdmin || role == RoleEditor
+// roleCanEditReports — without reports.edit (viewers, and custom roles
+// without it) nobody edits, whatever the report ACL says.
+func roleCanEditReports(ctx context.Context) bool {
+	return api.HasPermission(ctx, api.PermReportsEdit)
 }
 
 // callerRole fetches the caller's role on the current tenant. Returns
@@ -308,8 +310,8 @@ func listReportsHandler(q *db.Queries) http.HandlerFunc {
 			return
 		}
 		userID := api.UserID(r.Context())
-		role, ok := callerRole(w, r, q)
-		if !ok {
+		// Membership check (401/403); visibility comes from the permissions.
+		if _, ok := callerRole(w, r, q); !ok {
 			return
 		}
 		// Optional facility filter: `?zoneId=<n>` narrows the list to that
@@ -339,7 +341,8 @@ func listReportsHandler(q *db.Queries) http.HandlerFunc {
 		// Non-admins: prefetch the caller's permission grants once so we
 		// don't re-query per report.
 		grantMap := map[int64]bool{}
-		if role != RoleOwner && role != RoleAdmin {
+		seeAll := api.HasPermission(r.Context(), api.PermReportsViewAll)
+		if !seeAll {
 			perms, err := q.ListReportIDsVisibleToUser(r.Context(), userID)
 			if err != nil {
 				api.InternalError(w, r, err)
@@ -353,13 +356,13 @@ func listReportsHandler(q *db.Queries) http.HandlerFunc {
 		for _, row := range rows {
 			var canView, canEdit bool
 			switch {
-			case role == RoleOwner || role == RoleAdmin:
-				canView, canEdit = true, true
+			case seeAll:
+				canView, canEdit = true, roleCanEditReports(r.Context())
 			case row.CreatedBy.Valid && row.CreatedBy.Int64 == userID:
-				canView, canEdit = true, roleCanEditReports(role)
+				canView, canEdit = true, roleCanEditReports(r.Context())
 			default:
 				if editable, ok := grantMap[row.ID]; ok {
-					canView, canEdit = true, editable && roleCanEditReports(role)
+					canView, canEdit = true, editable && roleCanEditReports(r.Context())
 				}
 			}
 			if !canView {
@@ -431,7 +434,7 @@ func createReportHandler(q *db.Queries, pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 		userID := api.UserID(r.Context())
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermReportsCreate) {
 			return
 		}
 		var req CreateReportRequest
@@ -644,7 +647,7 @@ func archiveReportHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "missing tenant")
 			return
 		}
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermReportsCreate) {
 			return
 		}
 		id, err := api.IDParam(r, "id")
@@ -676,7 +679,7 @@ func restoreReportHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "missing tenant")
 			return
 		}
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermReportsCreate) {
 			return
 		}
 		id, err := api.IDParam(r, "id")
@@ -776,95 +779,107 @@ func runReportHandler(q *db.Queries, executor *reports.Executor) http.HandlerFun
 
 		var req RunReportRequest
 		_ = api.DecodeBody(r, &req) // body optional
-
-		mig, err := specmigrate.FromRaw(row.Spec, row.SpecVersion)
-		if err != nil {
-			api.BadRequest(w, "spec parse: "+err.Error())
-			return
-		}
-		spec := mig.Spec
-
-		if len(spec.Queries) == 0 {
-			api.BadRequest(w, "report has no queries configured")
-			return
-		}
-
-		// Resolve params — one entry per declared param. Unknown params
-		// in the request body are dropped silently (extra fields never
-		// influence execution).
-		params, err := resolveParamValues(spec, req.Params)
-		if err != nil {
-			api.BadRequest(w, "params: "+err.Error())
-			return
-		}
-
-		// Resolve sources — one entry per query. Queries the caller
-		// excluded via QueryNames are skipped (RunMany treats missing
-		// entries as "source not resolved" which we turn into an
-		// empty result rather than an error).
-		queryFilter := stringSet(req.QueryNames)
-		sources := make(map[string]*reports.Source, len(spec.Queries))
-		selectedQueries := make([]v2.Query, 0, len(spec.Queries))
-		for _, q2 := range spec.Queries {
-			if len(queryFilter) > 0 && !queryFilter[q2.Name] {
-				continue
-			}
-			src, err := reports.ResolveSource(r.Context(), q, tenantID, reports.SourceRef{
-				Kind: q2.SourceRef.Kind, ID: q2.SourceRef.ID,
-			})
-			if err != nil {
-				api.BadRequest(w, fmt.Sprintf("query %q: cannot resolve source: %s", q2.Name, err.Error()))
-				return
-			}
-			sources[q2.Name] = src
-			selectedQueries = append(selectedQueries, q2)
-		}
-
-		runSpec := spec
-		runSpec.Queries = selectedQueries
-
-		started := time.Now()
-		many, err := executor.RunMany(r.Context(), tenantID, sources, runSpec, params)
-		elapsed := int(time.Since(started).Milliseconds())
-		if err != nil {
-			runID := logDashboardRun(r.Context(), q, id, tenantID, row.Spec, req, userID, "error", 0, elapsed, err.Error(), nil)
-			api.Error(w, http.StatusUnprocessableEntity, "dashboard failed: "+err.Error())
-			_ = runID
-			return
-		}
-
-		// Aggregate stats + persist header + child rows.
-		aggRowCount := 0
-		aggErrs := 0
-		for _, qr := range many.Queries {
-			aggRowCount += qr.RowCount
-			if qr.Err != "" {
-				aggErrs++
-			}
-		}
-		status := "ok"
-		if aggErrs > 0 && aggErrs == len(many.Queries) {
-			status = "error"
-		}
-		runID := logDashboardRun(r.Context(), q, id, tenantID, row.Spec, req, userID, status, aggRowCount, elapsed, "", many.Queries)
-
-		out := RunReportResponse{
-			RunID:     runID,
-			MsElapsed: elapsed,
-			Queries:   make(map[string]QueryRunResult, len(many.Queries)),
-			Spec:      row.Spec,
-		}
-		for name, qr := range many.Queries {
-			out.Queries[name] = QueryRunResult{
-				Columns:   qr.Result.Columns,
-				Rows:      qr.Result.Rows,
-				RowCount:  qr.RowCount,
-				MsElapsed: qr.MsElapsed,
-				Error:     qr.Err,
-			}
-		}
-		api.JSON(w, http.StatusOK, out)
+		runStoredReport(w, r, q, executor, tenantID, row, userID, req, true)
 	}
+}
+
+// runStoredReport runs a stored report for a caller already cleared to see
+// it and writes the response. Shared by the signed-in run route and the
+// public report-share run route; `logRun` false (a share-link visitor)
+// leaves report_runs alone, so anonymous visits can't grow the history.
+func runStoredReport(w http.ResponseWriter, r *http.Request, q *db.Queries, executor *reports.Executor, tenantID int64, row db.Report, userID int64, req RunReportRequest, logRun bool) {
+	id := row.ID
+	mig, err := specmigrate.FromRaw(row.Spec, row.SpecVersion)
+	if err != nil {
+		api.BadRequest(w, "spec parse: "+err.Error())
+		return
+	}
+	spec := mig.Spec
+
+	if len(spec.Queries) == 0 {
+		api.BadRequest(w, "report has no queries configured")
+		return
+	}
+
+	// Resolve params — one entry per declared param. Unknown params
+	// in the request body are dropped silently (extra fields never
+	// influence execution).
+	params, err := resolveParamValues(spec, req.Params)
+	if err != nil {
+		api.BadRequest(w, "params: "+err.Error())
+		return
+	}
+
+	// Resolve sources — one entry per query. Queries the caller
+	// excluded via QueryNames are skipped (RunMany treats missing
+	// entries as "source not resolved" which we turn into an
+	// empty result rather than an error).
+	queryFilter := stringSet(req.QueryNames)
+	sources := make(map[string]*reports.Source, len(spec.Queries))
+	selectedQueries := make([]v2.Query, 0, len(spec.Queries))
+	for _, q2 := range spec.Queries {
+		if len(queryFilter) > 0 && !queryFilter[q2.Name] {
+			continue
+		}
+		src, err := reports.ResolveSource(r.Context(), q, tenantID, reports.SourceRef{
+			Kind: q2.SourceRef.Kind, ID: q2.SourceRef.ID,
+		})
+		if err != nil {
+			api.BadRequest(w, fmt.Sprintf("query %q: cannot resolve source: %s", q2.Name, err.Error()))
+			return
+		}
+		sources[q2.Name] = src
+		selectedQueries = append(selectedQueries, q2)
+	}
+
+	runSpec := spec
+	runSpec.Queries = selectedQueries
+
+	started := time.Now()
+	many, err := executor.RunMany(r.Context(), tenantID, sources, runSpec, params)
+	elapsed := int(time.Since(started).Milliseconds())
+	if err != nil {
+		if logRun {
+			logDashboardRun(r.Context(), q, id, tenantID, row.Spec, req, userID, "error", 0, elapsed, err.Error(), nil)
+		}
+		api.Error(w, http.StatusUnprocessableEntity, "dashboard failed: "+err.Error())
+		return
+	}
+
+	// Aggregate stats + persist header + child rows.
+	aggRowCount := 0
+	aggErrs := 0
+	for _, qr := range many.Queries {
+		aggRowCount += qr.RowCount
+		if qr.Err != "" {
+			aggErrs++
+		}
+	}
+	status := "ok"
+	if aggErrs > 0 && aggErrs == len(many.Queries) {
+		status = "error"
+	}
+	var runID int64
+	if logRun {
+		runID = logDashboardRun(r.Context(), q, id, tenantID, row.Spec, req, userID, status, aggRowCount, elapsed, "", many.Queries)
+	}
+
+	out := RunReportResponse{
+		RunID:     runID,
+		MsElapsed: elapsed,
+		Queries:   make(map[string]QueryRunResult, len(many.Queries)),
+		Spec:      row.Spec,
+	}
+	for name, qr := range many.Queries {
+		out.Queries[name] = QueryRunResult{
+			Columns:   qr.Result.Columns,
+			Rows:      qr.Result.Rows,
+			RowCount:  qr.RowCount,
+			MsElapsed: qr.MsElapsed,
+			Error:     qr.Err,
+		}
+	}
+	api.JSON(w, http.StatusOK, out)
 }
 
 // stringSet turns a slice of names into a set for O(1) membership.
@@ -1102,117 +1117,124 @@ func reportHistoryHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "sourceId is required")
 			return
 		}
-		// Verify the source belongs to the tenant. Any authed member
-		// with source access can pull history — no per-report ACL
-		// check because history is a source-level concept.
-		histSrc, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
-			ID: sourceID, TenantID: tenantID,
-		})
-		if err != nil {
-			api.NotFound(w, "source not found")
-			return
-		}
-		// Shapes keep no change trail, so a built-in facility source has
-		// no history to show.
-		if histSrc.Kind == db.DataSourceKindFacility {
-			api.BadRequest(w, "facility sources have no history")
-			return
-		}
-		windowDays := api.IntQuery(r, "windowDays", 7)
-		if windowDays <= 0 {
-			windowDays = 7
-		}
-		if windowDays > 365 {
-			windowDays = 365
-		}
-		bucketUnit, err := normalizeBucketUnit(r.URL.Query().Get("bucket"))
-		if err != nil {
-			api.BadRequest(w, err.Error())
-			return
-		}
-		recent := api.IntQuery(r, "recent", 20)
-		if recent < 0 {
-			recent = 0
-		}
-		if recent > 500 {
-			recent = 500
-		}
-		since := time.Now().UTC().Add(-time.Duration(windowDays) * 24 * time.Hour)
+		serveReportHistory(w, r, q, tenantID, sourceID)
+	}
+}
 
-		bucketRows, err := q.BucketDataSourceRowEvents(r.Context(), db.BucketDataSourceRowEventsParams{
-			SourceID:   sourceID,
-			TenantID:   tenantID,
-			Ts:         pgtype.Timestamptz{Time: since, Valid: true},
-			BucketUnit: bucketUnit,
+// serveReportHistory writes the History widget's buckets + recent events
+// for a source. Shared by the signed-in route and the report share-link
+// route.
+func serveReportHistory(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID, sourceID int64) {
+	// Verify the source belongs to the tenant. Any authed member
+	// with source access can pull history — no per-report ACL
+	// check because history is a source-level concept.
+	histSrc, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
+		ID: sourceID, TenantID: tenantID,
+	})
+	if err != nil {
+		api.NotFound(w, "source not found")
+		return
+	}
+	// Shapes keep no change trail, so a built-in facility source has
+	// no history to show.
+	if histSrc.Kind == db.DataSourceKindFacility {
+		api.BadRequest(w, "facility sources have no history")
+		return
+	}
+	windowDays := api.IntQuery(r, "windowDays", 7)
+	if windowDays <= 0 {
+		windowDays = 7
+	}
+	if windowDays > 365 {
+		windowDays = 365
+	}
+	bucketUnit, err := normalizeBucketUnit(r.URL.Query().Get("bucket"))
+	if err != nil {
+		api.BadRequest(w, err.Error())
+		return
+	}
+	recent := api.IntQuery(r, "recent", 20)
+	if recent < 0 {
+		recent = 0
+	}
+	if recent > 500 {
+		recent = 500
+	}
+	since := time.Now().UTC().Add(-time.Duration(windowDays) * 24 * time.Hour)
+
+	bucketRows, err := q.BucketDataSourceRowEvents(r.Context(), db.BucketDataSourceRowEventsParams{
+		SourceID:   sourceID,
+		TenantID:   tenantID,
+		Ts:         pgtype.Timestamptz{Time: since, Valid: true},
+		BucketUnit: bucketUnit,
+	})
+	if err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+
+	// Fold the per-operation rows into one row per bucket.
+	byTs := map[time.Time]*HistoryBucket{}
+	var order []time.Time
+	var total int64
+	for _, br := range bucketRows {
+		ts := br.BucketTs.Time
+		b, ok := byTs[ts]
+		if !ok {
+			b = &HistoryBucket{Ts: api.FormatTime(br.BucketTs)}
+			byTs[ts] = b
+			order = append(order, ts)
+		}
+		switch br.Operation {
+		case "insert":
+			b.Insert = br.EventCount
+		case "update":
+			b.Update = br.EventCount
+		case "delete":
+			b.Delete = br.EventCount
+		}
+		total += br.EventCount
+	}
+	buckets := make([]HistoryBucket, 0, len(order))
+	for _, ts := range order {
+		buckets = append(buckets, *byTs[ts])
+	}
+
+	// Initialize as empty slice (not nil) so the JSON response is
+	// always `"recent": []`, never `"recent": null`. The SPA
+	// widget treats the two the same after this response passes
+	// through its optional-chain guard, but keeping the wire
+	// shape consistent avoids one class of bug at every consumer.
+	recentEvents := []HistoryEvent{}
+	if recent > 0 {
+		rows, err := q.RecentDataSourceRowEvents(r.Context(), db.RecentDataSourceRowEventsParams{
+			SourceID: sourceID, TenantID: tenantID,
+			Ts:    pgtype.Timestamptz{Time: since, Valid: true},
+			Limit: int32(recent),
 		})
 		if err != nil {
 			api.InternalError(w, r, err)
 			return
 		}
-
-		// Fold the per-operation rows into one row per bucket.
-		byTs := map[time.Time]*HistoryBucket{}
-		var order []time.Time
-		var total int64
-		for _, br := range bucketRows {
-			ts := br.BucketTs.Time
-			b, ok := byTs[ts]
-			if !ok {
-				b = &HistoryBucket{Ts: api.FormatTime(br.BucketTs)}
-				byTs[ts] = b
-				order = append(order, ts)
-			}
-			switch br.Operation {
-			case "insert":
-				b.Insert = br.EventCount
-			case "update":
-				b.Update = br.EventCount
-			case "delete":
-				b.Delete = br.EventCount
-			}
-			total += br.EventCount
-		}
-		buckets := make([]HistoryBucket, 0, len(order))
-		for _, ts := range order {
-			buckets = append(buckets, *byTs[ts])
-		}
-
-		// Initialize as empty slice (not nil) so the JSON response is
-		// always `"recent": []`, never `"recent": null`. The SPA
-		// widget treats the two the same after this response passes
-		// through its optional-chain guard, but keeping the wire
-		// shape consistent avoids one class of bug at every consumer.
-		recentEvents := []HistoryEvent{}
-		if recent > 0 {
-			rows, err := q.RecentDataSourceRowEvents(r.Context(), db.RecentDataSourceRowEventsParams{
-				SourceID: sourceID, TenantID: tenantID,
-				Ts:    pgtype.Timestamptz{Time: since, Valid: true},
-				Limit: int32(recent),
+		for _, e := range rows {
+			recentEvents = append(recentEvents, HistoryEvent{
+				ID:        e.ID,
+				EntityKey: e.EntityKey,
+				Operation: e.Operation,
+				Ts:        api.FormatTime(e.Ts),
+				Payload:   e.Payload,
 			})
-			if err != nil {
-				api.InternalError(w, r, err)
-				return
-			}
-			for _, e := range rows {
-				recentEvents = append(recentEvents, HistoryEvent{
-					ID:        e.ID,
-					EntityKey: e.EntityKey,
-					Operation: e.Operation,
-					Ts:        api.FormatTime(e.Ts),
-					Payload:   e.Payload,
-				})
-			}
 		}
-
-		api.JSON(w, http.StatusOK, HistoryResponse{
-			Buckets:     buckets,
-			Recent:      recentEvents,
-			SourceID:    sourceID,
-			WindowDays:  windowDays,
-			BucketUnit:  bucketUnit,
-			TotalEvents: total,
-		})
 	}
+
+	api.JSON(w, http.StatusOK, HistoryResponse{
+		Buckets:     buckets,
+		Recent:      recentEvents,
+		SourceID:    sourceID,
+		WindowDays:  windowDays,
+		BucketUnit:  bucketUnit,
+		TotalEvents: total,
+	})
 }
 
 // normalizeBucketUnit maps the user-facing bucket string onto the
@@ -1473,7 +1495,7 @@ func listReportMemberCandidatesHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "missing tenant")
 			return
 		}
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermReportsCreate) {
 			return
 		}
 		members, err := q.ListTenantMembers(r.Context(), tenantID)
@@ -1526,6 +1548,9 @@ func ReportsRouter(q *db.Queries, pool *pgxpool.Pool, executor *reports.Executor
 		r.Post("/run", runReportHandler(q, executor))
 		r.Get("/runs", listReportRunsHandler(q))
 		r.Get("/param-options/{paramId}", paramOptionsHandler(q, executor))
+		// Public links to this report (report_share_links.go).
+		r.Get("/share-links", listReportShareLinksHandler(q))
+		r.Post("/share-links", createReportShareLinkHandler(q))
 	})
 	return r
 }
@@ -1612,32 +1637,38 @@ func getReportSourceFieldsHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "invalid source id")
 			return
 		}
-		src, err := reports.ResolveSource(r.Context(), q, tenantID, reports.SourceRef{
-			Kind: "dataSource", ID: sourceID,
-		})
-		if err != nil {
-			api.NotFound(w, "source not found")
-			return
-		}
-		type fieldHint struct {
-			Key   string `json:"key"`
-			Label string `json:"label"`
-			Type  string `json:"type"`
-		}
-		out := make([]fieldHint, 0, len(src.Fields))
-		for _, f := range src.Fields {
-			out = append(out, fieldHint{Key: f.Key, Label: f.Label, Type: string(f.Type)})
-		}
-		resp := map[string]any{
-			"id":     src.ID,
-			"kind":   string(src.Kind),
-			"name":   src.Name,
-			"fields": out,
-		}
-		if src.Facility != nil {
-			resp["facilityEntity"] = src.Facility.Key
-			resp["apiKind"] = src.Facility.APIKind
-		}
-		api.JSON(w, http.StatusOK, resp)
+		serveReportSourceFields(w, r, q, tenantID, sourceID)
 	}
+}
+
+// serveReportSourceFields writes a source's field schema. Shared by the
+// signed-in route and the report share-link route.
+func serveReportSourceFields(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID, sourceID int64) {
+	src, err := reports.ResolveSource(r.Context(), q, tenantID, reports.SourceRef{
+		Kind: "dataSource", ID: sourceID,
+	})
+	if err != nil {
+		api.NotFound(w, "source not found")
+		return
+	}
+	type fieldHint struct {
+		Key   string `json:"key"`
+		Label string `json:"label"`
+		Type  string `json:"type"`
+	}
+	out := make([]fieldHint, 0, len(src.Fields))
+	for _, f := range src.Fields {
+		out = append(out, fieldHint{Key: f.Key, Label: f.Label, Type: string(f.Type)})
+	}
+	resp := map[string]any{
+		"id":     src.ID,
+		"kind":   string(src.Kind),
+		"name":   src.Name,
+		"fields": out,
+	}
+	if src.Facility != nil {
+		resp["facilityEntity"] = src.Facility.Key
+		resp["apiKind"] = src.Facility.APIKind
+	}
+	api.JSON(w, http.StatusOK, resp)
 }

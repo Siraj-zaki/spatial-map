@@ -54,6 +54,16 @@ function evaluateNode(
   return applyOp(raw, node.op, node.value)
 }
 
+const IN_SETS = new WeakMap<readonly unknown[], Set<string>>()
+function inSetOf(values: readonly unknown[]): Set<string> {
+  let set = IN_SETS.get(values)
+  if (!set) {
+    set = new Set(values.map((v) => String(v)))
+    IN_SETS.set(values, set)
+  }
+  return set
+}
+
 function applyOp(
   lhs: unknown,
   op: DataLinkFilterOp,
@@ -120,7 +130,10 @@ function applyOp(
     case 'notIn': {
       if (!Array.isArray(rhs)) return op === 'notIn'
       const s = String(lhs ?? '')
-      const hit = rhs.some((v) => String(v) === s)
+      // A report narrows a layer to its filtered rows with one `in` over
+      // thousands of keys, evaluated per entity per rebuild — a Set per
+      // value array (cached by identity) keeps that linear.
+      const hit = rhs.length > 16 ? inSetOf(rhs).has(s) : rhs.some((v) => String(v) === s)
       return op === 'in' ? hit : !hit
     }
     case 'before':

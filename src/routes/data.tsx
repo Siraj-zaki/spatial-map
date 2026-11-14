@@ -81,7 +81,7 @@ export default function DataPage() {
   const { t, i18n } = useTranslation()
   const tenantId = useCurrentTenantId()
   const enabled = tenantId !== null
-  const { canEdit } = useWorkspaceRole()
+  const canEdit = useWorkspaceRole().can('data.manage')
 
   // ---- URL state --------------------------------------------------------
   const [tabParam, setTabParam] = useUrlState<DataTab>('tab', 'rows')

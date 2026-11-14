@@ -306,3 +306,234 @@ export function sortRulesForEval(
     return (a.id ?? 0) - (b.id ?? 0)
   })
 }
+
+// ---------------------------------------------------------------- compiled
+
+/**
+ * A rule prepared once for repeated evaluation. The resolver evaluates
+ * every rule against every target (30k+ seats in a stadium), so the work
+ * `evaluateRule` redoes per call — widening legacy conditions, picking the
+ * attribute reader, building the `in` Set, parsing a numeric bound,
+ * lower-casing a needle — is done here once per rule instead.
+ *
+ * Results are the same as `evaluateRule(rule, bins)` for every input; the
+ * functions above stay the reference. Rules and bins are immutable rows,
+ * so callers may cache a compiled rule per rule object.
+ */
+export interface CompiledRuleTest {
+  /** `evaluateRule(rule, bins)`. */
+  test: (bins: ReadonlyArray<Bin>) => boolean
+  /** `evaluateRule(rule, [bin])`, without allocating the one-bin set. */
+  testOne: (bin: Bin) => boolean
+  /**
+   * A condition reads the clock (`olderThan` / `newerThan`), so its
+   * result can change while the bins don't — such rules must not be
+   * cached per bin.
+   */
+  timeDependent: boolean
+}
+
+type Reader = (bin: Bin) => unknown
+
+/** `readBinAttribute(bin, attribute)` with the path resolved up front. */
+function compileReader(attribute: string): Reader {
+  // Malformed rows (no attribute) keep the reference path, errors included.
+  if (typeof attribute !== 'string') return (bin) => readBinAttribute(bin, attribute)
+  if (attribute.startsWith('custom.')) {
+    const key = attribute.slice('custom.'.length)
+    return (bin) => bin.customProperties?.[key]
+  }
+  switch (attribute) {
+    case 'status':       return (bin) => bin.status
+    case 'sku':          return (bin) => bin.sku
+    case 'capacity':     return (bin) => bin.capacity
+    case 'notes':        return (bin) => bin.notes
+    case 'externalCode': return (bin) => bin.externalCode
+    case 'syncSource':   return (bin) => bin.syncSource
+    case 'lastSyncedAt': return (bin) => bin.lastSyncedAt
+    default:             return () => undefined
+  }
+}
+
+const never = () => false
+
+/** `(lhs) => compare(op, lhs, rhs)` with the right-hand side prepared once. */
+function compileCompare(op: RuleOp, rhs: unknown): (lhs: unknown) => boolean {
+  switch (op) {
+    case 'equals':
+      return (lhs) => lhs == rhs
+    case 'notEquals':
+      return (lhs) => lhs != rhs
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte': {
+      const b = asNumber(rhs)
+      if (b === null) return never
+      if (op === 'lt') return (lhs) => { const a = asNumber(lhs); return a !== null && a < b }
+      if (op === 'lte') return (lhs) => { const a = asNumber(lhs); return a !== null && a <= b }
+      if (op === 'gt') return (lhs) => { const a = asNumber(lhs); return a !== null && a > b }
+      return (lhs) => { const a = asNumber(lhs); return a !== null && a >= b }
+    }
+    case 'in':
+    case 'notIn': {
+      if (!Array.isArray(rhs)) {
+        const r = op === 'notIn'
+        return () => r
+      }
+      const set = new Set(rhs.map((x) => String(x)))
+      return op === 'in'
+        ? (lhs) => set.has(String(lhs ?? ''))
+        : (lhs) => !set.has(String(lhs ?? ''))
+    }
+    case 'contains': {
+      const needle = String(rhs ?? '').toLowerCase()
+      return (lhs) => typeof lhs === 'string' && lhs.toLowerCase().includes(needle)
+    }
+    case 'startsWith': {
+      const needle = String(rhs ?? '').toLowerCase()
+      return (lhs) => typeof lhs === 'string' && lhs.toLowerCase().startsWith(needle)
+    }
+    case 'endsWith': {
+      const needle = String(rhs ?? '').toLowerCase()
+      return (lhs) => typeof lhs === 'string' && lhs.toLowerCase().endsWith(needle)
+    }
+    case 'isEmpty':
+      return isEmpty
+    case 'isSet':
+      return (lhs) => !isEmpty(lhs)
+    case 'olderThan':
+    case 'newerThan': {
+      const window = asNumber(rhs)
+      if (window === null) return never
+      const older = op === 'olderThan'
+      return (lhs) => {
+        const t = asDateMs(lhs)
+        if (t === null) return false
+        // Read per call, as `compare` does: the clock moves between calls.
+        const ageMs = Date.now() - t
+        return older ? ageMs > window : ageMs < window
+      }
+    }
+    default:
+      // An unknown op compares to nothing (`compare` returns undefined).
+      return never
+  }
+}
+
+interface CompiledCondition {
+  many: (bins: ReadonlyArray<Bin>) => boolean
+  one: (bin: Bin) => boolean
+  timeDependent: boolean
+}
+
+const isClockOp = (op: unknown) => op === 'olderThan' || op === 'newerThan'
+
+function compileCondition(cond: RuleCondition): CompiledCondition {
+  const c = normalizeCondition(cond)
+  if (c.type !== 'attr') {
+    // Aggregates reduce a whole set; they run on shared sources, not per
+    // target, so the reference evaluator is fine here.
+    return {
+      many: (bins) => evalAggregate(c, bins),
+      one: (bin) => evalAggregate(c, [bin]),
+      timeDependent: isClockOp(c.whereOp),
+    }
+  }
+  const read = compileReader(c.attribute)
+  const cmp = compileCompare(c.op, c.value ?? null)
+  const one = (bin: Bin) => cmp(read(bin))
+  const timeDependent = isClockOp(c.op)
+  const quantifier = c.quantifier ?? 'single'
+  switch (quantifier) {
+    case 'single':
+      return { many: (bins) => { const bin = bins[0]; return bin ? one(bin) : false }, one, timeDependent }
+    case 'every':
+      return {
+        many: (bins) => { for (const bin of bins) if (!one(bin)) return false; return true },
+        one,
+        timeDependent,
+      }
+    case 'some':
+      return {
+        many: (bins) => { for (const bin of bins) if (one(bin)) return true; return false },
+        one,
+        timeDependent,
+      }
+    case 'none':
+      return {
+        many: (bins) => { for (const bin of bins) if (one(bin)) return false; return true },
+        one: (bin) => !one(bin),
+        timeDependent,
+      }
+    default:
+      // An unknown quantifier never matches (see `evalAttr`).
+      return { many: never, one: never, timeDependent }
+  }
+}
+
+/** Compile `evaluateRule(rule, …)` for one rule. */
+export function compileRuleTest(rule: StyleRule): CompiledRuleTest {
+  if (!rule.enabled) return { test: never, testOne: never, timeDependent: false }
+  // Malformed rows (conditions not a list) keep the reference path.
+  if (!Array.isArray(rule.conditions)) {
+    return { test: (bins) => evaluateRule(rule, bins), testOne: (bin) => evaluateRule(rule, [bin]), timeDependent: true }
+  }
+  if (rule.conditions.length === 0) {
+    // An unconditional rule fires when its source is non-empty.
+    return { test: (bins) => bins.length > 0, testOne: () => true, timeDependent: false }
+  }
+  const conds = rule.conditions.map(compileCondition)
+  const timeDependent = conds.some((c) => c.timeDependent)
+  if (conds.length === 1) {
+    const [c] = conds
+    return { test: c.many, testOne: c.one, timeDependent }
+  }
+  if (rule.combine === 'or') {
+    return {
+      test: (bins) => { for (const c of conds) if (c.many(bins)) return true; return false },
+      testOne: (bin) => { for (const c of conds) if (c.one(bin)) return true; return false },
+      timeDependent,
+    }
+  }
+  return {
+    test: (bins) => { for (const c of conds) if (!c.many(bins)) return false; return true },
+    testOne: (bin) => { for (const c of conds) if (!c.one(bin)) return false; return true },
+    timeDependent,
+  }
+}
+
+/**
+ * Compile `renderLabelTemplate(template, bin)`: the `{attribute}` slots
+ * are found once and each gets its reader.
+ */
+export function compileLabelTemplate(template: string): (bin: Bin) => string {
+  // Malformed rows keep the reference path, errors included.
+  if (typeof template !== 'string') return (bin) => renderLabelTemplate(template, bin)
+  const parts: Array<string | Reader> = []
+  const re = /\{([^}]+)\}/g
+  let last = 0
+  for (let m = re.exec(template); m !== null; m = re.exec(template)) {
+    if (m.index > last) parts.push(template.slice(last, m.index))
+    parts.push(compileReader(m[1].trim()))
+    last = re.lastIndex
+  }
+  if (last < template.length) parts.push(template.slice(last))
+  if (parts.length === 1 && typeof parts[0] === 'string') {
+    const text = parts[0]
+    return () => text
+  }
+  return (bin) => {
+    let out = ''
+    for (const p of parts) {
+      if (typeof p === 'string') {
+        out += p
+        continue
+      }
+      const v = p(bin)
+      if (v === undefined || v === null) continue
+      out += v instanceof Date ? v.toISOString() : String(v)
+    }
+    return out
+  }
+}

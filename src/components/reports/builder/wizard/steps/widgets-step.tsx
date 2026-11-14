@@ -51,6 +51,8 @@ import { useSourceSchema } from '../use-source-schema'
 import { newWidgetId, useExplorerActions, useExplorerData, useExplorerSuggestion } from '../use-explorer-setup'
 import { useWidgetKindLabel } from '../widget-kinds'
 import { ExplorerSetup } from './explorer-setup'
+import { ExplorerClusterSetup } from './explorer-cluster-setup'
+import { readClusterBinding, toBindingValue } from '@/lib/reports/cluster-config'
 import type { DataLinkConfig, Zone } from '@/lib/db'
 import {
   readExplorerBindings,
@@ -400,6 +402,8 @@ function WidgetCard({
   const Icon = meta?.icon ?? Palette
   const [open, setOpen] = useState(defaultOpen)
   const isExplorer = widget.kind === 'facilityExplorer'
+  // The map & list's first linked-data tab: its points can cluster.
+  const clusterTab = isExplorer ? readExplorerBindings(widget).tabs.find((tab) => tab.kind === 'dataLink') : undefined
 
   const patchBindings = (patch: Record<string, unknown>) =>
     onChange({ bindings: { ...(widget.bindings ?? {}), ...patch } })
@@ -482,6 +486,16 @@ function WidgetCard({
               zones={zones}
               dataLinks={dataLinks}
               onChange={onExplorerChange}
+            />
+          )}
+          {/* The author's clustering default. Written through this card's
+              patchBindings ONLY — patchExplorer would strip the tabs'
+              queryRefs (a generated report's `rows` query). */}
+          {isExplorer && clusterTab && (
+            <ExplorerClusterSetup
+              value={readClusterBinding((widget.bindings as Record<string, unknown> | undefined)?.cluster)}
+              sourceId={clusterTab.sourceId}
+              onChange={(c) => patchBindings({ cluster: toBindingValue(c) })}
             />
           )}
           {/* Column span — presentation; a map & list is always full width */}

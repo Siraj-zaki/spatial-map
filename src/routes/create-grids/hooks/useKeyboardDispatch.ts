@@ -147,6 +147,8 @@ export function useKeyboardDispatch({
   handleRedo,
   handleExportGeoJSON,
   exitDrawMode,
+  undoGridPathVertex,
+  finishGridPath,
 }: {
   preview: boolean
   drawMode: boolean
@@ -230,6 +232,9 @@ export function useKeyboardDispatch({
   handleRedo: () => Promise<void>
   handleExportGeoJSON: () => void
   exitDrawMode: () => void
+  /** Grid path drawing: drop the last clicked vertex. */
+  undoGridPathVertex?: () => void
+  finishGridPath?: () => void
 }) {
   const handleDeleteAnySelected = useCallback(async () => {
     if (selectedGridIds.size > 0) {
@@ -840,8 +845,12 @@ export function useKeyboardDispatch({
       setActiveTool(tool)
     },
     preview,
-    commitInProgressDraw: () => { /* per-tool local listeners own this */ },
-    undoLastVertex: () => { /* per-tool local listeners own this */ },
+    // Per-tool local listeners own this, except the grid path draw: its
+    // mode only hears Enter while the map has focus.
+    commitInProgressDraw: () => { if (drawMode) finishGridPath?.() },
+    // Per-tool local listeners own this, except the grid path draw (MapboxDraw
+    // keeps Backspace from its mode), handled here.
+    undoLastVertex: () => { if (drawMode) undoGridPathVertex?.() },
     cancelInProgressDraw: () => {
       // Only the grid draw mode has no local listener — handle it here.
       if (drawMode) exitDrawMode()

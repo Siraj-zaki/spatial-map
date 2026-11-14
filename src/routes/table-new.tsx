@@ -25,7 +25,7 @@ import { toast } from '@/lib/toast-store'
 export default function TableNewPage() {
   const navigate = useNavigate()
   const { t } = useTranslation()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('data.manage')
 
   const back = (
     <Link

@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -757,9 +758,10 @@ func revokeTableTokenHandler(q *db.Queries) http.HandlerFunc {
 
 // --------------------------- history --------------------------------
 
-// listTableEventsHandler — GET /tables/{id}/events?window=86400&limit=500.
-// Returns append-only history events for the table (all rows). Used
-// by the SPA's history viewer + the map recap animation.
+// listTableEventsHandler — GET /tables/{id}/events?window=86400&limit=500,
+// or ?from=<RFC3339>&to=<RFC3339> for a custom range. Returns append-only
+// history events for the table (all rows). Used by the SPA's history
+// viewer + the map recap animation.
 func listTableEventsHandler(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := api.TenantID(r.Context())
@@ -772,40 +774,89 @@ func listTableEventsHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "invalid table id")
 			return
 		}
-		if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
-			ID: sourceID, TenantID: tenantID,
-		}); err != nil {
-			api.NotFound(w, "table not found")
-			return
-		}
-		windowSec := int64(86400) // default 24h
-		if v := r.URL.Query().Get("window"); v != "" {
-			if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 && parsed <= 30*86400 {
+		serveTableEvents(w, r, q, tenantID, sourceID, false)
+	}
+}
+
+// maxEventsRange caps a custom from/to range (the relative window caps at
+// 30 days; a calendar month can be 31).
+const maxEventsRange = 31 * 24 * time.Hour
+
+// eventsRange reads the history window from the query string: `from` +
+// `to` (RFC3339, both or neither) or `window` seconds back from now
+// (default 24 h, at most 30 days).
+func eventsRange(v url.Values) (since, until time.Time, err error) {
+	now := time.Now().UTC()
+	from, to := v.Get("from"), v.Get("to")
+	if from == "" && to == "" {
+		windowSec := int64(86400)
+		if s := v.Get("window"); s != "" {
+			if parsed, err := strconv.ParseInt(s, 10, 64); err == nil && parsed > 0 && parsed <= 30*86400 {
 				windowSec = parsed
 			}
 		}
-		limit := int32(500)
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if parsed, err := strconv.ParseInt(v, 10, 32); err == nil && parsed > 0 && parsed <= 5000 {
-				limit = int32(parsed)
-			}
-		}
-		since := time.Now().UTC().Add(-time.Duration(windowSec) * time.Second)
-		rows, err := q.ListDataSourceRowEventsBySource(r.Context(), db.ListDataSourceRowEventsBySourceParams{
-			SourceID: sourceID, TenantID: tenantID,
-			Ts:    pgtype.Timestamptz{Time: since, Valid: true},
-			Limit: limit,
-		})
-		if err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-		out := make([]dataSourceRowEventResponse, 0, len(rows))
-		for _, e := range rows {
-			out = append(out, toDataSourceRowEventResponse(e))
-		}
-		api.JSON(w, http.StatusOK, out)
+		return now.Add(-time.Duration(windowSec) * time.Second), now, nil
 	}
+	if from == "" || to == "" {
+		return since, until, errors.New("from and to must be sent together")
+	}
+	if since, err = time.Parse(time.RFC3339, from); err != nil {
+		return since, until, errors.New("from must be RFC3339")
+	}
+	if until, err = time.Parse(time.RFC3339, to); err != nil {
+		return since, until, errors.New("to must be RFC3339")
+	}
+	if !until.After(since) {
+		return since, until, errors.New("to must be after from")
+	}
+	if until.Sub(since) > maxEventsRange {
+		return since, until, errors.New("a range can cover at most 31 days")
+	}
+	return since.UTC(), until.UTC(), nil
+}
+
+// eventsLimit reads `limit` (default 500, at most 5000).
+func eventsLimit(v url.Values) int32 {
+	limit := int32(500)
+	if s := v.Get("limit"); s != "" {
+		if parsed, err := strconv.ParseInt(s, 10, 32); err == nil && parsed > 0 && parsed <= 5000 {
+			limit = int32(parsed)
+		}
+	}
+	return limit
+}
+
+// serveTableEvents answers a windowed history read for a source already
+// scoped to the caller's tenant. `public` (a report share-link visitor)
+// leaves out who wrote each event (IP, API token).
+func serveTableEvents(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID, sourceID int64, public bool) {
+	_, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
+		ID: sourceID, TenantID: tenantID,
+	})
+	if err != nil {
+		api.NotFound(w, "table not found")
+		return
+	}
+	since, until, err := eventsRange(r.URL.Query())
+	if err != nil {
+		api.BadRequest(w, err.Error())
+		return
+	}
+	rows, err := q.ListDataSourceRowEventsBySource(r.Context(), db.ListDataSourceRowEventsBySourceParams{
+		SourceID: sourceID, TenantID: tenantID,
+		Since:    pgtype.Timestamptz{Time: since, Valid: true},
+		Until:    pgtype.Timestamptz{Time: until, Valid: true},
+		RowLimit: eventsLimit(r.URL.Query()),
+	})
+	if err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+	out := make([]dataSourceRowEventResponse, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, toDataSourceRowEventResponse(e, public))
+	}
+	api.JSON(w, http.StatusOK, out)
 }
 
 // listTableRowEventsHandler — GET /tables/{id}/events/{key}. Per-row
@@ -823,40 +874,40 @@ func listTableRowEventsHandler(q *db.Queries) http.HandlerFunc {
 			api.BadRequest(w, "invalid table id")
 			return
 		}
-		entityKey := chi.URLParam(r, "key")
-		if entityKey == "" {
-			api.BadRequest(w, "empty entity_key")
-			return
-		}
-		if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
-			ID: sourceID, TenantID: tenantID,
-		}); err != nil {
-			api.NotFound(w, "table not found")
-			return
-		}
-		limit := int32(500)
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if parsed, err := strconv.ParseInt(v, 10, 32); err == nil && parsed > 0 && parsed <= 5000 {
-				limit = int32(parsed)
-			}
-		}
-		// Per-row trail defaults to ALL events for the key (no
-		// window) — the user explicitly asked for this row.
-		rows, err := q.ListDataSourceRowEventsForKey(r.Context(), db.ListDataSourceRowEventsForKeyParams{
-			SourceID: sourceID, EntityKey: entityKey, TenantID: tenantID,
-			Ts:    pgtype.Timestamptz{Time: time.Unix(0, 0).UTC(), Valid: true},
-			Limit: limit,
-		})
-		if err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-		out := make([]dataSourceRowEventResponse, 0, len(rows))
-		for _, e := range rows {
-			out = append(out, toDataSourceRowEventResponse(e))
-		}
-		api.JSON(w, http.StatusOK, out)
+		serveTableRowEvents(w, r, q, tenantID, sourceID, false)
 	}
+}
+
+// serveTableRowEvents answers one row's history trail; `public` as in
+// serveTableEvents.
+func serveTableRowEvents(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID, sourceID int64, public bool) {
+	entityKey := chi.URLParam(r, "key")
+	if entityKey == "" {
+		api.BadRequest(w, "empty entity_key")
+		return
+	}
+	if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
+		ID: sourceID, TenantID: tenantID,
+	}); err != nil {
+		api.NotFound(w, "table not found")
+		return
+	}
+	// Per-row trail defaults to ALL events for the key (no
+	// window) — the user explicitly asked for this row.
+	rows, err := q.ListDataSourceRowEventsForKey(r.Context(), db.ListDataSourceRowEventsForKeyParams{
+		SourceID: sourceID, EntityKey: entityKey, TenantID: tenantID,
+		Ts:    pgtype.Timestamptz{Time: time.Unix(0, 0).UTC(), Valid: true},
+		Limit: eventsLimit(r.URL.Query()),
+	})
+	if err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+	out := make([]dataSourceRowEventResponse, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, toDataSourceRowEventResponse(e, public))
+	}
+	api.JSON(w, http.StatusOK, out)
 }
 
 // buildTableResponse bundles a data_source row + its field defs + its

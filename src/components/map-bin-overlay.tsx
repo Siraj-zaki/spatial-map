@@ -6,10 +6,24 @@ import mapboxgl, {
 } from 'mapbox-gl'
 import type { Feature, FeatureCollection, Polygon } from 'geojson'
 import { buildGridFromLine } from '@/lib/grid-generators'
-import type { CommittedLine } from '@/components/map-grid-overlay'
+import {
+  cellRingCentroid,
+  committedCellRing,
+  gridBlockersOf,
+  gridCellRule,
+  onNextCameraSettle,
+  stableCollection,
+  trackCameraMotion,
+  type CollectionSlot,
+  type CommittedLine,
+  type GridCellRule,
+} from '@/components/map-grid-overlay'
 import type { Bin, BinStatus } from '@/lib/db'
 import { BinPopupContent } from '@/components/bin-popup-content'
 import { whenStyleLoaded } from '@/lib/mapbox-style-ready'
+import { isFocusFlying } from '@/lib/focus/focus-camera'
+import { canLiftExtrusions, FOCUS_LIFT_STATE, withFocusLift } from '@/lib/focus/focus-fade'
+import { useFocusBlockers, useFocusScene, type FocusBlockers, type FocusScene } from '@/lib/focus/focus-scene'
 
 const SOURCE_ID = 'bin-status-source'
 const LAYER_ID = 'bin-status-layer'
@@ -22,6 +36,21 @@ const LAYER_ID = 'bin-status-layer'
 const HOVER_SOURCE = 'data-link-hover-source'
 const HOVER_LAYER = 'data-link-hover-line-layer'
 
+/**
+ * The grid overlay's cell layers the hover popup listens on — layer ids
+ * owned by `map-grid-overlay.tsx`, hardcoded on purpose (part of the
+ * public layer contract that overlay exports). The 3D extrusion is split
+ * across 11 opacity-bucket layers (`grid-extrude-layer-op0` … `-op100`)
+ * since Mapbox doesn't support data-driven `fill-extrusion-opacity`;
+ * without enumerating them the hover popup silently dies over
+ * 3D-extruded racks. One shared array: Mapbox's `off` needs the same
+ * layer list it was given to `on`.
+ */
+const GRID_HOVER_LAYERS: string[] = [
+  'grid-fill-layer',
+  ...[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map((b) => `grid-extrude-layer-op${b}`),
+]
+
 // Solid hex colors. `fill-extrusion-color` strips alpha so we set
 // translucency via `fill-extrusion-opacity` on the layer instead.
 const STATUS_COLORS: Record<BinStatus, string> = {
@@ -31,6 +60,366 @@ const STATUS_COLORS: Record<BinStatus, string> = {
 }
 /** Layer-wide opacity for the status tint. Matches the prior 0.55 visual. */
 const STATUS_TINT_OPACITY = 0.55
+
+/**
+ * Focus mode (src/lib/focus/). The tint follows its racks: a rack the grid
+ * overlay lifts onto a faded twin — `focusTier` 'ghost' (a line-of-sight
+ * blocker) or 'near' (in the NEAR column around the item) — loses its
+ * tint where its cells fade. The layer colour is wrapped once with
+ * `withFocusLift` and the tint features carry id = gridId, so one
+ * feature-state write per rack hides its bands (GL 3.25 only — the same
+ * `canLiftExtrusions` gate as the grid overlay). A multi-level rack's
+ * bands are full-size boxes; left at 0.55 they would hide the focused item
+ * the faded rack no longer does.
+ *  - 'whole' rack (`gridCellRule`, the grid overlay's per-cell test): the
+ *    whole tint is lifted.
+ *  - 'cells' rack (much larger than the 5 m region): the tint is lifted
+ *    too, and its cells that do NOT fade are redrawn on REST_LAYER — the
+ *    same paint at the same constant opacity, colour not wrapped — so only
+ *    the tints of fading cells go.
+ * Every other rack's tint, and the layer itself, stay exactly as with
+ * focus off (no layer dim, no ordering pin). The rest twin is installed on
+ * first use, right after LAYER_ID, and removed when focus ends; changes of
+ * the same focus land at the next camera settle (`onNextCameraSettle`),
+ * with the grid overlay's twins. Outside a focus provider nothing is
+ * installed or written.
+ */
+const LIFTABLE = canLiftExtrusions()
+const REST_SOURCE = 'bin-status-focus-rest-source'
+const REST_LAYER = 'bin-status-focus-rest-layer'
+
+/** The tint colour by status (no focus wrapper). */
+function plainTintColor(): mapboxgl.ExpressionSpecification {
+  return [
+    'match',
+    ['get', 'binStatus'],
+    'occupied', STATUS_COLORS.occupied,
+    'reserved', STATUS_COLORS.reserved,
+    // Fallthrough: status the layer can't tint. Won't be visible
+    // because `fill-extrusion-opacity` below + the upstream filter
+    // (empty bins are skipped at the source level) keep it hidden.
+    '#000000',
+  ]
+}
+
+/**
+ * The tint colour by status — wrapped with `withFocusLift` where lifting
+ * works (no `focusLift` feature-state → exactly the plain colour).
+ */
+function binTintColor(): mapboxgl.ExpressionSpecification {
+  const color = plainTintColor()
+  return LIFTABLE ? withFocusLift(color) : color
+}
+
+const EMPTY_TINTS: FeatureCollection<Polygon> = { type: 'FeatureCollection', features: [] }
+
+/** What focus mode wants the tints to show. */
+export interface BinFocusPlan {
+  /** focusKey; '' = focus off. */
+  key: string
+  /** Racks whose tint is lifted out of LAYER_ID. */
+  lifted: ReadonlySet<number>
+  liftedKey: string
+  /** REST_SOURCE content: the non-fading tints of 'cells' racks (null = empty). */
+  rest: FeatureCollection<Polygon> | null
+}
+
+const NO_RACKS: ReadonlySet<number> = new Set()
+const BIN_FOCUS_OFF: BinFocusPlan = Object.freeze({ key: '', lifted: NO_RACKS, liftedKey: '', rest: null })
+
+type TintFeature = Feature<Polygon>
+
+/** The tint features of each rack, cached per source collection. */
+const tintsByGridCache = new WeakMap<FeatureCollection<Polygon>, Map<number, TintFeature[]>>()
+function tintsByGrid(data: FeatureCollection<Polygon>): Map<number, TintFeature[]> {
+  let out = tintsByGridCache.get(data)
+  if (out) return out
+  out = new Map()
+  for (const f of data.features) {
+    const gid = (f.properties as { gridId?: unknown } | null)?.gridId
+    if (typeof gid !== 'number') continue
+    let list = out.get(gid)
+    if (!list) {
+      list = []
+      out.set(gid, list)
+    }
+    list.push(f)
+  }
+  tintsByGridCache.set(data, out)
+  return out
+}
+
+/** A rack's tints whose cell `rule` does not fade, cached per (list, rule). */
+const restTintCache = new WeakMap<readonly TintFeature[], WeakMap<GridCellRule, TintFeature[]>>()
+function restTintsOf(list: readonly TintFeature[], rule: GridCellRule): TintFeature[] {
+  let byRule = restTintCache.get(list)
+  const hit = byRule?.get(rule)
+  if (hit) return hit
+  const out: TintFeature[] = []
+  for (const f of list) {
+    const p = f.properties as { row?: unknown; col?: unknown; level?: unknown } | null
+    const row = typeof p?.row === 'number' ? p.row : NaN
+    const col = typeof p?.col === 'number' ? p.col : NaN
+    const level = typeof p?.level === 'number' ? p.level : 0
+    const c = cellRingCentroid(f.geometry.coordinates[0])
+    if (!rule.fades(row, col, level, c[0], c[1])) out.push(f)
+  }
+  if (!byRule) {
+    byRule = new WeakMap()
+    restTintCache.set(list, byRule)
+  }
+  byRule.set(rule, out)
+  return out
+}
+
+/** What the focus pass last wrote on one map (tied to the source objects it wrote to). */
+export interface BinFocusRuntime {
+  map: MapboxMapInstance | null
+  /** Latest plan (the component sets it; a deferred pass reads it). */
+  plan: BinFocusPlan
+  /** The plan the lifts / rest twin on the map belong to. */
+  applied: BinFocusPlan
+  /** The source object the lifts were written to. */
+  liftSource: unknown
+  written: Set<number>
+  /** The REST_SOURCE object `restData` went to. */
+  restSource: unknown
+  restData: FeatureCollection<Polygon> | null
+  disarmSettle: (() => void) | null
+  disarmRender: (() => void) | null
+}
+
+export function createBinFocusRuntime(): BinFocusRuntime {
+  return {
+    map: null,
+    plan: BIN_FOCUS_OFF,
+    applied: BIN_FOCUS_OFF,
+    liftSource: null,
+    written: new Set(),
+    restSource: null,
+    restData: null,
+    disarmSettle: null,
+    disarmRender: null,
+  }
+}
+
+/** `style.getOwnLayer` (the live layer object) — `map.getLayer` serialises it. */
+function hasOwnLayer(map: MapboxMapInstance, id: string): boolean {
+  const style = (map as unknown as { style?: { getOwnLayer?: (id: string) => unknown } }).style
+  try {
+    if (style && typeof style.getOwnLayer === 'function') return !!style.getOwnLayer(id)
+    return !!map.getLayer(id)
+  } catch {
+    return false
+  }
+}
+
+/** The first own root layer after `id` (undefined: none, or `id` missing — append). */
+function layerAfter(map: MapboxMapInstance, id: string): string | undefined {
+  const order = (map as unknown as { style?: { _order?: unknown } }).style?._order
+  if (!Array.isArray(order)) return undefined
+  const ids = order as string[]
+  const i = ids.indexOf(id)
+  if (i < 0) return undefined
+  // Imported (basemap) layers read `id\u001fscope`; addLayer can't anchor on them.
+  for (let k = i + 1; k < ids.length; k++) if (!ids[k].includes('\u001f')) return ids[k]
+  return undefined
+}
+
+/** Add REST_SOURCE / REST_LAYER (empty, right after LAYER_ID) unless there. */
+function installRestTwin(map: MapboxMapInstance): void {
+  try {
+    if (!map.getSource(REST_SOURCE)) map.addSource(REST_SOURCE, { type: 'geojson', data: EMPTY_TINTS })
+    if (!hasOwnLayer(map, REST_LAYER)) {
+      map.addLayer(
+        {
+          id: REST_LAYER,
+          type: 'fill-extrusion',
+          source: REST_SOURCE,
+          paint: {
+            'fill-extrusion-color': plainTintColor(),
+            'fill-extrusion-base': ['coalesce', ['get', 'base'], 0],
+            'fill-extrusion-height': ['coalesce', ['get', 'top'], 0],
+            'fill-extrusion-opacity': STATUS_TINT_OPACITY,
+            'fill-extrusion-vertical-gradient': false,
+          },
+        },
+        hasOwnLayer(map, LAYER_ID) ? layerAfter(map, LAYER_ID) : undefined,
+      )
+    }
+  } catch { /* style torn down / mid swap: the next pass retries */ }
+}
+
+function removeRestTwin(map: MapboxMapInstance): void {
+  try {
+    if (hasOwnLayer(map, REST_LAYER)) map.removeLayer(REST_LAYER)
+    if (map.getSource(REST_SOURCE)) map.removeSource(REST_SOURCE)
+  } catch { /* style torn down */ }
+}
+
+/** Lift every rack of the applied plan not lifted yet (one feature-state write each). */
+function writeTintLifts(map: MapboxMapInstance, rt: BinFocusRuntime): void {
+  if (!map.getSource(SOURCE_ID) || map.getSource(SOURCE_ID) !== rt.liftSource) return
+  for (const id of rt.applied.lifted) {
+    if (rt.written.has(id)) continue
+    try {
+      map.setFeatureState({ source: SOURCE_ID, id }, { [FOCUS_LIFT_STATE]: true })
+    } catch { /* source went away */ }
+    rt.written.add(id)
+  }
+}
+
+function applyBinFocus(map: MapboxMapInstance, rt: BinFocusRuntime, plan: BinFocusPlan): void {
+  const src = map.getSource(SOURCE_ID)
+  if (src !== rt.liftSource) {
+    rt.liftSource = src
+    rt.written = new Set()
+  }
+  // 1. Un-lift first: LAYER_ID draws the tint again before the rest twin
+  //    lets go of it — both for a frame, never neither.
+  if (src) {
+    for (const id of [...rt.written]) {
+      if (plan.lifted.has(id)) continue
+      try {
+        map.removeFeatureState({ source: SOURCE_ID, id }, FOCUS_LIFT_STATE)
+      } catch { /* source went away */ }
+      rt.written.delete(id)
+    }
+  }
+  // 2. The rest twin: installed on first use, emptied while focus has no
+  //    'cells' rack, removed when focus ends.
+  let pushed = false
+  if (plan.key === '') {
+    if (rt.restSource !== null || map.getSource(REST_SOURCE)) removeRestTwin(map)
+    rt.restSource = null
+    rt.restData = null
+  } else if (plan.rest || rt.restData) {
+    if (plan.rest) installRestTwin(map)
+    const rest = map.getSource(REST_SOURCE) as GeoJSONSource | undefined
+    if (rest !== rt.restSource) {
+      rt.restSource = rest ?? null
+      rt.restData = null
+    }
+    if (rest && plan.rest !== rt.restData) {
+      rest.setData(plan.rest ?? EMPTY_TINTS)
+      rt.restData = plan.rest
+      pushed = plan.rest !== null
+    }
+  }
+  rt.applied = plan
+  // 3. Lifts: once the rest twin has drawn what it took over.
+  let pending = false
+  for (const id of plan.lifted) {
+    if (!rt.written.has(id)) {
+      pending = true
+      break
+    }
+  }
+  if (!pending) return
+  if (!pushed) {
+    writeTintLifts(map, rt)
+    return
+  }
+  if (rt.disarmRender) return
+  const onRender = () => {
+    try {
+      if (map.getSource(REST_SOURCE) && !map.isSourceLoaded(REST_SOURCE)) return
+    } catch { /* fall through: lift anyway */ }
+    map.off('render', onRender)
+    rt.disarmRender = null
+    writeTintLifts(map, rt)
+  }
+  map.on('render', onRender)
+  rt.disarmRender = () => map.off('render', onRender)
+  map.triggerRepaint()
+}
+
+/**
+ * Bring the map to `rt.plan` — the grid overlay's rule: entering, leaving
+ * and switching focus (and a focus fly) apply at once; any other change of
+ * the same focus waits for the next camera settle, so the rest twin is
+ * never re-uploaded mid-move. `settled`: called from that settle.
+ */
+export function syncBinFocus(map: MapboxMapInstance, rt: BinFocusRuntime, settled = false): void {
+  if (rt.map !== map) {
+    const plan = rt.plan
+    disposeBinFocusRuntime(rt)
+    rt.map = map
+    rt.plan = plan
+  }
+  const plan = rt.plan
+  const applied = rt.applied
+  const same = plan.key === applied.key && plan.liftedKey === applied.liftedKey && plan.rest === applied.rest
+  if (!settled && !same && plan.key !== '' && plan.key === applied.key && !isFocusFlying(map)) {
+    if (!rt.disarmSettle) {
+      rt.disarmSettle = onNextCameraSettle(map, () => {
+        rt.disarmSettle = null
+        if (rt.map === map) syncBinFocus(map, rt, true)
+      })
+    }
+    return
+  }
+  if (rt.disarmSettle) {
+    rt.disarmSettle()
+    rt.disarmSettle = null
+  }
+  applyBinFocus(map, rt, plan)
+}
+
+/** Stop listening, drop the rest twin, forget the map (unmount / map change). */
+function disposeBinFocusRuntime(rt: BinFocusRuntime): void {
+  rt.disarmSettle?.()
+  rt.disarmRender?.()
+  const map = rt.map
+  // After `map.remove()` the style is gone (and so is the twin).
+  if (map && rt.restSource !== null && (map as unknown as { style?: unknown }).style) removeRestTwin(map)
+  Object.assign(rt, createBinFocusRuntime())
+}
+
+export type LiftedSlot = { key: string; set: ReadonlySet<number> } | null
+
+/**
+ * The tint plan for one focus scene: every near / blocker rack is lifted;
+ * a 'cells' rack's non-fading tints go to the rest twin. `slots` keep the
+ * lifted set and the rest collection by identity while unchanged.
+ */
+export function buildBinFocusPlan(
+  scene: FocusScene,
+  blockers: FocusBlockers,
+  committedLines: readonly CommittedLine[],
+  data: FeatureCollection<Polygon> | null,
+  slots: { rest: { current: CollectionSlot<Polygon> }; lifted: { current: LiftedSlot } },
+): BinFocusPlan {
+  if (!LIFTABLE || !scene.active) return BIN_FOCUS_OFF
+  const lifted: number[] = []
+  const restLists: TintFeature[][] = []
+  const tints = data ? tintsByGrid(data) : null
+  for (const cl of committedLines) {
+    if (cl.visible === false) continue
+    let cells
+    try {
+      cells = rackCells(cl)
+    } catch {
+      continue
+    }
+    const rule = gridCellRule(scene, blockers, cl.id, cells)
+    if (!rule) continue
+    lifted.push(cl.id)
+    if (rule.plan.mode !== 'cells') continue
+    const list = tints?.get(cl.id)
+    if (!list) continue
+    const rest = restTintsOf(list, rule)
+    if (rest.length > 0) restLists.push(rest)
+  }
+  const liftedKey = lifted.sort((a, b) => a - b).join(',')
+  let liftedSet = slots.lifted.current?.key === liftedKey ? slots.lifted.current.set : null
+  if (!liftedSet) {
+    liftedSet = lifted.length > 0 ? new Set(lifted) : NO_RACKS
+    slots.lifted.current = { key: liftedKey, set: liftedSet }
+  }
+  const rest = restLists.length > 0 ? stableCollection<Polygon>(slots.rest, restLists) : null
+  return { key: scene.key, lifted: liftedSet, liftedKey, rest }
+}
 
 interface MapBinOverlayProps {
   map: MapboxMapInstance | null
@@ -130,14 +519,20 @@ export function MapBinOverlay({
         // The pitch is `levelHeight + levelGap` to match
         // `buildSquareGrid`'s altitude formula — otherwise tints land
         // in the wrong shelf when `levelGap > 0`.
-        const base =
-          totalLevels > 1
-            ? (cl.config.elevation ?? 0) + level * (levelHeight + levelGap)
-            : (cl.config.elevation ?? 0) + (cl.config.height ?? 0)
+        // The cell's own elevation already carries the level offset and,
+        // on a raked path grid, its row's rise.
+        const cellBase =
+          c.properties.elevation ??
+          (cl.config.elevation ?? 0) + (totalLevels > 1 ? level * (levelHeight + levelGap) : 0)
+        const base = totalLevels > 1 ? cellBase : cellBase + (cl.config.height ?? 0)
         const top =
           totalLevels > 1 ? base + levelHeight : base + 0.01
         features.push({
           type: 'Feature',
+          // One id per rack: focus mode hides a faded (near / blocking)
+          // rack's tint with a single feature-state write. (Nothing
+          // queries this layer.)
+          id: cl.id,
           properties: {
             gridId: cl.id,
             row: c.properties.row,
@@ -176,16 +571,7 @@ export function MapBinOverlay({
           type: 'fill-extrusion',
           source: SOURCE_ID,
           paint: {
-            'fill-extrusion-color': [
-              'match',
-              ['get', 'binStatus'],
-              'occupied', STATUS_COLORS.occupied,
-              'reserved', STATUS_COLORS.reserved,
-              // Fallthrough: status the layer can't tint. Won't be visible
-              // because `fill-extrusion-opacity` below + the upstream filter
-              // (empty bins are skipped at the source level) keep it hidden.
-              '#000000',
-            ],
+            'fill-extrusion-color': binTintColor(),
             'fill-extrusion-base': ['coalesce', ['get', 'base'], 0],
             'fill-extrusion-height': ['coalesce', ['get', 'top'], 0],
             // `fill-extrusion-color` strips alpha — drive translucency
@@ -283,6 +669,41 @@ export function MapBinOverlay({
     }, '[MapBinOverlay:setData]')
   }, [map, data])
 
+  // ---- Focus mode -------------------------------------------------------
+  // Per rack, the grid overlay's cell rule (`gridCellRule`): 'whole' racks
+  // lose their whole tint, 'cells' racks keep the tints of their cells that
+  // don't fade on the rest twin. The grid set / pierce discs / blocking
+  // cells only (`gridBlockersOf`), so another kind's blockers changing
+  // rebuilds nothing; the rest collection keeps its identity while its
+  // per-rack lists do, so an unchanged plan writes nothing.
+  const focusScene = useFocusScene()
+  const gridFocusBlockers = gridBlockersOf(useFocusBlockers())
+  const restSlot = useRef<CollectionSlot<Polygon>>(null)
+  const liftedSlot = useRef<LiftedSlot>(null)
+  // The slots are memo caches written idempotently during render, like the
+  // grid overlay's per-source slots.
+  const focusPlan = useMemo(
+    () =>
+      // eslint-disable-next-line react-hooks/refs
+      buildBinFocusPlan(focusScene, gridFocusBlockers, committedLines, data, { rest: restSlot, lifted: liftedSlot }),
+    [focusScene, gridFocusBlockers, committedLines, data],
+  )
+  const focusRtRef = useRef<BinFocusRuntime | null>(null)
+  useEffect(() => {
+    if (!map) return
+    trackCameraMotion(map)
+    const rt = (focusRtRef.current ??= createBinFocusRuntime())
+    return () => disposeBinFocusRuntime(rt)
+  }, [map])
+  useEffect(() => {
+    if (!map) return
+    const rt = (focusRtRef.current ??= createBinFocusRuntime())
+    rt.plan = focusPlan
+    // The pass skips a source that isn't there yet (style still loading);
+    // `data` is a dep so it catches up with the first push.
+    syncBinFocus(map, rt)
+  }, [map, focusPlan, data])
+
   // ---- Hover popup ------------------------------------------------------
   // Originally bound to `bin-status-layer`, but that layer filters out
   // bins with status='empty' (the default for imports without a status
@@ -299,26 +720,34 @@ export function MapBinOverlay({
   const popupRootRef = useRef<Root | null>(null)
   const popupNodeRef = useRef<HTMLElement | null>(null)
 
+  // Ref-mirror so the hover handler can find a hovered cell's grid
+  // without re-subscribing when the array changes.
+  const committedLinesRef = useRef(committedLines)
+  useEffect(() => {
+    committedLinesRef.current = committedLines
+  }, [committedLines])
+
   useEffect(() => {
     if (!map) return
-    // Layer IDs owned by `map-grid-overlay.tsx`. Hardcoded on purpose —
-    // these are part of the public layer contract that overlay exports.
-    // The 3D extrusion is split across 11 opacity-bucket layers
-    // (`grid-extrude-layer-op0` … `-op100`) since Mapbox doesn't support
-    // data-driven `fill-extrusion-opacity`. Without enumerating them
-    // here the hover popup silently dies over 3D-extruded racks.
-    const GRID_FILL = 'grid-fill-layer'
-    const GRID_EXTRUDE_LAYERS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map(
-      (b) => `grid-extrude-layer-op${b}`,
-    )
 
-    const setHoverFeature = (f: mapboxgl.MapboxGeoJSONFeature | null) => {
+    // What the hover source holds now, so a mousemove that lands on the
+    // same cell (with the same outline and altitude) skips the setData.
+    let shown: { ring: unknown; elevation: number; height: number } | null = null
+    const setHoverFeature = (
+      f: mapboxgl.MapboxGeoJSONFeature | null,
+      ring: GeoJSON.Position[] | null = null,
+    ) => {
       const src = map.getSource(HOVER_SOURCE) as GeoJSONSource | undefined
       if (!src) return
       if (!f) {
+        shown = null
         src.setData({ type: 'FeatureCollection', features: [] })
         return
       }
+      const elevation = (f.properties as { elevation?: number } | null)?.elevation ?? 0
+      const height = (f.properties as { height?: number } | null)?.height ?? 0
+      if (ring && shown && shown.ring === ring && Object.is(shown.elevation, elevation) && Object.is(shown.height, height)) return
+      shown = ring ? { ring, elevation, height } : null
       src.setData({
         type: 'FeatureCollection',
         features: [
@@ -326,11 +755,8 @@ export function MapBinOverlay({
             type: 'Feature',
             // Forward elevation/height so the line layer's z-offset
             // expression places the outline at the cell's top in 3D.
-            properties: {
-              elevation: (f.properties as { elevation?: number } | null)?.elevation ?? 0,
-              height: (f.properties as { height?: number } | null)?.height ?? 0,
-            },
-            geometry: f.geometry as Polygon,
+            properties: { elevation, height },
+            geometry: ring ? { type: 'Polygon', coordinates: [ring] } : (f.geometry as Polygon),
           },
         ],
       })
@@ -343,8 +769,17 @@ export function MapBinOverlay({
     // unnecessarily — so we short-circuit both when nothing changed.
     let renderedCellKey: string | null = null
 
+    // One delegated listener over every grid cell layer (one query per
+    // mousemove instead of twelve). It used to be one listener per layer,
+    // fired in GRID_HOVER_LAYERS order, so the hover ended on the top hit
+    // of the LAST layer under the cursor — the same pick is made here from
+    // the combined hit list.
     const onMove = (e: mapboxgl.MapLayerMouseEvent) => {
-      const f = e.features?.[0]
+      const hits = e.features ?? []
+      let f: mapboxgl.MapboxGeoJSONFeature | undefined
+      for (let i = GRID_HOVER_LAYERS.length - 1; i >= 0 && !f; i--) {
+        f = hits.find((h) => h.layer?.id === GRID_HOVER_LAYERS[i])
+      }
       if (!f) return clearHover()
       const props = f.properties as
         | { gridId?: number; row?: number; col?: number; level?: number }
@@ -357,13 +792,17 @@ export function MapBinOverlay({
       ) {
         return clearHover()
       }
+      const level = typeof props.level === 'number' ? props.level : 0
       // Highlight outline always paints — even on cells without linked
       // data — so the user gets a clear "this cell is under your cursor"
-      // affordance. The popup below is gated on bin content.
-      setHoverFeature(f)
+      // affordance. The popup below is gated on bin content. The outline
+      // is the cell itself (the rendered feature is its tile copy, which
+      // can be cut off at a tile edge); the tile copy is the fallback.
+      const gridId = props.gridId
+      const cl = committedLinesRef.current.find((l) => l.id === gridId)
+      setHoverFeature(f, cl ? committedCellRing(cl, props.row, props.col, level) : null)
       map.getCanvas().style.cursor = 'pointer'
 
-      const level = typeof props.level === 'number' ? props.level : 0
       const bin = binsRef.current.find(
         (b) =>
           b.targetKind === 'grid-cell' &&
@@ -413,19 +852,11 @@ export function MapBinOverlay({
       }
     }
     const hidePopup = clearHover
-    map.on('mousemove', GRID_FILL, onMove)
-    map.on('mouseleave', GRID_FILL, hidePopup)
-    for (const id of GRID_EXTRUDE_LAYERS) {
-      map.on('mousemove', id, onMove)
-      map.on('mouseleave', id, hidePopup)
-    }
+    map.on('mousemove', GRID_HOVER_LAYERS, onMove)
+    map.on('mouseleave', GRID_HOVER_LAYERS, hidePopup)
     return () => {
-      map.off('mousemove', GRID_FILL, onMove)
-      map.off('mouseleave', GRID_FILL, hidePopup)
-      for (const id of GRID_EXTRUDE_LAYERS) {
-        map.off('mousemove', id, onMove)
-        map.off('mouseleave', id, hidePopup)
-      }
+      map.off('mousemove', GRID_HOVER_LAYERS, onMove)
+      map.off('mouseleave', GRID_HOVER_LAYERS, hidePopup)
       // After `map.remove()` runs (e.g. on unmount or route change —
       // the sibling `MapboxMap` cleanup tears down the map before this
       // one fires), the map's internal `style` is undefined, so

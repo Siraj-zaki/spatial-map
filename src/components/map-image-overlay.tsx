@@ -9,8 +9,10 @@ import {
   imageLngLatToUV,
 } from '@/lib/image-generators'
 import { urlForImage } from '@/lib/binary-store'
+import { registerLayerFeaturePredicate, type LayerFeaturePredicate } from '@/lib/empty-layer-gate'
 import type { ImageShape, LineShape } from '@/lib/shapes'
 import { wallOutline } from '@/lib/floor-base'
+import { sameClipFootprints, syncBasemapClipLayer, useBasemapClipNeeded } from '@/lib/basemap-clip'
 import { buffer as turfBuffer } from '@turf/turf'
 import {
   TRANSFORM_ICON,
@@ -22,9 +24,23 @@ import {
 import {
   FloorPlanLayer,
   styleHasSlot,
+  type FloorPlanCut,
   type FloorPlanLayerState,
   type FloorPlanUV,
 } from '@/lib/floor-plan-layer'
+import { FOCUS_CUT_FEATHER_M, focusCutRegion, isCutWorthy } from '@/lib/focus/focus-cutaway'
+import {
+  NO_BLOCKERS,
+  NO_PIERCE,
+  blockerIdsOf,
+  blockerPierceOf,
+  focusFactor,
+  focusTier,
+  useFocusBlockers,
+  useFocusScene,
+  type FocusBlockers,
+  type FocusScene,
+} from '@/lib/focus/focus-scene'
 import type {
   GeoJSONSource,
   Map as MapboxMapInstance,
@@ -65,6 +81,14 @@ interface MapImageOverlayProps {
    * floor-plan mask. Omit to disable masking.
    */
   wallLines?: ReadonlyArray<LineShape>
+  /**
+   * Floor-plan alignment view (placing a floor plan, or moving / rotating /
+   * scaling one): every plan is drawn unclipped — "hide outside walls" would
+   * cut away the margins and grid lines you align against — the plan being
+   * aligned (`activeImageId`) is capped at `ALIGNING_OPACITY` and every other
+   * plan at `REFERENCE_OPACITY`, so each shows through the other.
+   */
+  alignment?: { activeImageId: number | null } | null
   onTransformChange?: (
     patch: {
       start?: [number, number]
@@ -105,6 +129,45 @@ const LABEL_INFLIGHT_LAYER = 'image-label-inflight-layer'
 const rasterLayerId = (id: number) => `image-raster-layer-${id}`
 const previewLayerId = 'image-raster-preview-layer'
 
+/**
+ * Empty-layer gate predicates (`src/lib/empty-layer-gate.ts`): each one
+ * mirrors its layer's `filter` exactly, so the gate can hide the layer
+ * while no feature of HIT_SOURCE passes it — the dashed preview outline
+ * outside a draw, the selection outline + tint while nothing is selected.
+ * HIT_SOURCE is always written with a full `setData`, so the gate can
+ * count them.
+ *
+ * PREVIEW_OUTLINE_LAYER — `['==', ['get', 'preview'], true]`. `==` is
+ * strict in Mapbox expressions (a missing property reads as null).
+ */
+const imagePreviewOutlinePredicate: LayerFeaturePredicate = (f) =>
+  f.properties?.preview === true
+
+/**
+ * SELECTION_LAYER / SELECTION_TINT_LAYER — mirrors the `in` half of the
+ * filter the selection effect sets: `['in', ['get', 'imageId'],
+ * ['literal', ids]]`. `in` over a literal array is strict `indexOf` (a
+ * missing id reads as null, which no id list contains).
+ *
+ * While a transform runs the filter is also AND-ed with
+ * `['!=', ['get', 'imageId'], excludeId]`. The predicate deliberately
+ * ignores that clause (a superset of the filter, which the gate allows):
+ * a static filter only takes effect once the worker re-parses HIT_SOURCE,
+ * so the old buckets keep drawing the moving image's outline + tint until
+ * the in-flight copies on HIT_INFLIGHT_SOURCE render. Counting the
+ * exclusion would hide both layers on the very next frame (visibility is
+ * applied on the main thread) and blink the highlight on every
+ * Move / Rotate / Scale start. The layers are still hidden whenever
+ * nothing is selected, which is the case that saves frames.
+ */
+function imageSelectionPredicate(ids: readonly number[]): LayerFeaturePredicate {
+  return (f) => {
+    const raw = f.properties?.imageId
+    const id = raw === undefined ? null : raw
+    return ids.indexOf(id as number) >= 0
+  }
+}
+
 /** Texture-space window for the shape's crop (percent inward per edge). */
 function cropUV(img: ImageShape): FloorPlanUV | undefined {
   const crop = effectiveImageCrop(img.config.crop)
@@ -128,12 +191,27 @@ function cropUV(img: ImageShape): FloorPlanUV | undefined {
  * on its floor, grown by `clipMargin`, in full-image UV. Null when the
  * option is off or the floor has no walls.
  */
+/** Walls that shape an image's mask: on its floor; failing that, walls not
+ *  assigned to any floor (single-floor facilities often leave floorPlanId empty). */
+function maskWalls(img: ImageShape, lines: ReadonlyArray<LineShape>): ReadonlyArray<LineShape> {
+  const own = lines.filter((l) => l.floorPlanId === img.id)
+  return own.length > 0 ? own : lines.filter((l) => l.floorPlanId === undefined || l.floorPlanId === null)
+}
+
+/** Cheap identity of the walls behind an image's mask (geometry + what decides inclusion). */
+function wallSignature(img: ImageShape, lines: ReadonlyArray<LineShape>): string {
+  return maskWalls(img, lines)
+    .map((l) => `${l.visible !== false ? 1 : 0}:${l.config.height ?? 0}:${l.config.elevation ?? 0}:${l.config.wallThickness ?? 0.3}:${l.vertices.flat().join(',')}`)
+    .join(';')
+}
+
+/** Last mask per image + what it was built from (module-level: the key
+ *  covers everything the mask depends on, so instances can share it). */
+const maskCache = new Map<number, { key: string; mask: number[][][][] | null }>()
+
 function wallMaskUV(img: ImageShape, lines: ReadonlyArray<LineShape> | undefined): number[][][][] | null {
   if (!img.config.clipToWalls || img.id === undefined || !lines) return null
-  // Walls on this floor; failing that, walls not assigned to any floor
-  // (single-floor facilities often leave floorPlanId empty).
-  const own = lines.filter((l) => l.floorPlanId === img.id)
-  const outline = wallOutline(own.length > 0 ? own : lines.filter((l) => l.floorPlanId === undefined || l.floorPlanId === null))
+  const outline = wallOutline(maskWalls(img, lines))
   if (!outline) return null
   const margin = Math.max(0, img.config.clipMargin ?? 0.5)
   let area = outline
@@ -158,7 +236,34 @@ function wallMaskUV(img: ImageShape, lines: ReadonlyArray<LineShape> | undefined
   return out.length ? out : null
 }
 
-function floorPlanState(img: ImageShape, visible: boolean, mask: number[][][][] | null = null): FloorPlanLayerState | null {
+/** Opacity caps during alignment: the reference plans, and the plan being
+ *  aligned — see-through too, or (drawn on top) it would hide the reference. */
+const REFERENCE_OPACITY = 0.5
+const ALIGNING_OPACITY = 0.65
+
+/**
+ * Focus mode, per plate (src/lib/focus/): `focusFade` = the opacity
+ * multiplier, `cuts` = the round holes of a local cut-away. Only a plate
+ * that is a line-of-sight blocker between the camera and the focused item
+ * changes (a floor plan is never in the NEAR column):
+ *  - a big plate (`isCutWorthy` — every real floor plan) keeps its opacity
+ *    and gets soft holes around the item column and where the camera rays
+ *    pierce it (`focusCutRegion(...).discs`, FloorPlanLayer cut-out); the
+ *    rest of the plate is unchanged and still hides what is below it;
+ *  - a small one, or one without a region, fades whole to
+ *    FOCUS_FACTOR.ghost (a plan under `SOLID_OPACITY` stops writing depth,
+ *    floor-plan-layer.ts, so it no longer hides what is below it).
+ * Every other plate gets factor 1 and no cuts: `x * 1 === x`, so it is
+ * exactly the old value.
+ */
+function floorPlanState(
+  img: ImageShape,
+  visible: boolean,
+  mask: number[][][][] | null = null,
+  maxOpacity = 1,
+  focusFade = 1,
+  cuts: ReadonlyArray<FloorPlanCut> | null = null,
+): FloorPlanLayerState | null {
   const corners = imageCroppedCorners(img)
   if (!corners) return null
   return {
@@ -167,9 +272,100 @@ function floorPlanState(img: ImageShape, visible: boolean, mask: number[][][][] 
     corners,
     uv: cropUV(img),
     elevation: img.config.elevation ?? 0,
-    opacity: Math.max(0, Math.min(1, (img.config.opacity ?? 100) / 100)),
+    opacity: Math.min(maxOpacity, Math.max(0, Math.min(1, (img.config.opacity ?? 100) / 100))) * focusFade,
     visible,
+    cuts,
+    cutFeatherM: FOCUS_CUT_FEATHER_M,
   }
+}
+
+/** A plate's focus treatment: a whole fade (`factor`) or a cut-away (`cuts`, factor 1). */
+interface PlanFocus {
+  factor: number
+  cuts: ReadonlyArray<FloorPlanCut> | null
+}
+
+const NO_PLAN_FOCUS: ReadonlyMap<number, PlanFocus> = new Map()
+const METERS_PER_DEG = 111_320
+
+/** bbox [w, s, e, n] and area (m², local equirectangular) of the drawn quad. */
+function plateExtent(img: ImageShape): { bbox: [number, number, number, number]; areaM2: number } | null {
+  const corners = imageCroppedCorners(img)
+  if (!corners) return null
+  let w = Infinity
+  let s = Infinity
+  let e = -Infinity
+  let n = -Infinity
+  for (const [x, y] of corners) {
+    if (x < w) w = x
+    if (x > e) e = x
+    if (y < s) s = y
+    if (y > n) n = y
+  }
+  if (!Number.isFinite(w) || !Number.isFinite(s) || !Number.isFinite(e) || !Number.isFinite(n)) return null
+  const kx = Math.cos((((s + n) / 2) * Math.PI) / 180) * METERS_PER_DEG
+  let a = 0
+  for (let i = 0, j = corners.length - 1; i < corners.length; j = i++) {
+    a += corners[j][0] * kx * corners[i][1] * METERS_PER_DEG - corners[i][0] * kx * corners[j][1] * METERS_PER_DEG
+  }
+  return { bbox: [w, s, e, n], areaM2: Math.abs(a / 2) }
+}
+
+/**
+ * Per-plate focus treatments that aren't "as drawn", as a value key
+ * (`id:factor` for a whole fade, `id:cut:lng,lat,r;…` for a cut-away,
+ * joined by '|'; '' when none — always while focus is off). The cut part
+ * spells out the region's discs (its value), so memos keyed on it keep
+ * their identity while no plate's factor or holes change — another focus
+ * with the same blockers and column re-runs nothing.
+ */
+function planFocusKey(
+  scene: FocusScene,
+  blockers: FocusBlockers,
+  images: ReadonlyArray<ImageShape> | undefined,
+): string {
+  if (!scene.active || !images) return ''
+  const parts: string[] = []
+  for (const img of images) {
+    if (img.id === undefined) continue
+    const f = focusFactor(scene, blockers, 'images', img.id)
+    if (f === 1) continue
+    if (focusTier(scene, blockers, 'images', img.id) === 'ghost') {
+      const region = focusCutRegion(scene, blockers, 'images', img.id)
+      const extent = region && region.discs.length > 0 ? plateExtent(img) : null
+      if (region && extent && isCutWorthy(extent.bbox, extent.areaM2)) {
+        const discs = region.discs.map((d) => `${d.center[0]},${d.center[1]},${d.radiusM}`).join(';')
+        parts.push(`${img.id}:cut:${discs}`)
+        continue
+      }
+    }
+    parts.push(`${img.id}:${f}`)
+  }
+  return parts.join('|')
+}
+
+/** Inverse of `planFocusKey` (number → string → number round-trips exactly). */
+function parsePlanFocusKey(key: string): ReadonlyMap<number, PlanFocus> {
+  if (key === '') return NO_PLAN_FOCUS
+  const out = new Map<number, PlanFocus>()
+  for (const part of key.split('|')) {
+    const i = part.indexOf(':')
+    const id = Number(part.slice(0, i))
+    const rest = part.slice(i + 1)
+    if (rest.startsWith('cut:')) {
+      const cuts = rest
+        .slice(4)
+        .split(';')
+        .map((d): FloorPlanCut => {
+          const [lng, lat, r] = d.split(',').map(Number)
+          return { center: [lng, lat], radiusM: r }
+        })
+      out.set(id, { factor: 1, cuts })
+    } else {
+      out.set(id, { factor: Number(rest), cuts: null })
+    }
+  }
+  return out
 }
 
 /**
@@ -220,6 +416,7 @@ export function MapImageOverlay({
   transformState = null,
   onTransformChange,
   wallLines,
+  alignment = null,
 }: MapImageOverlayProps) {
   const [styleLoaded, setStyleLoaded] = useState(false)
   // `styleGen` bumps on every style.load — see matching note in
@@ -260,6 +457,10 @@ export function MapImageOverlay({
   // (Removed) Old URL-polling style-swap detector. The `style.load`
   // listener above now bumps `styleGen`; see notes in
   // `map-polygon-overlay.tsx`.
+
+  // Whether the current basemap has anything a clip layer can hide
+  // (`src/lib/basemap-clip.ts`). CLIP_LAYER only exists while true.
+  const basemapClip = useBasemapClipNeeded(map)
 
   // ---- Data --------------------------------------------------------------
   const fc = useMemo(
@@ -394,7 +595,7 @@ export function MapImageOverlay({
             'fill-extrusion-color': '#facc15', // placeholder — theme effect overwrites
             'fill-extrusion-opacity': 0.18,
             // Base at the shape's elevation, height 5 cm above it —
-            // the "min-thickness paper slab" trick from AGENTS.md
+            // the "min-thickness paper slab" trick from CLAUDE.md
             // that prevents the layer from vanishing at grazing
             // pitch / low zoom. Vertical gradient disabled because
             // gradient over a 5 cm span collapses to near-black.
@@ -443,6 +644,12 @@ export function MapImageOverlay({
             'line-dasharray': [2, 2],
           },
         })
+      }
+      // Hidden by the empty-layer gate while no preview feature is in
+      // HIT_SOURCE (every moment outside a drag-to-place). Registered on
+      // every setup pass: the gate drops it whenever the layer is removed.
+      if (map.getLayer(PREVIEW_OUTLINE_LAYER)) {
+        registerLayerFeaturePredicate(map, PREVIEW_OUTLINE_LAYER, imagePreviewOutlinePredicate)
       }
       // Drop a stale LABEL_LAYER left over from the pre-Point-source
       // build (still bound to HIT_SOURCE) so HMR picks up the new wiring.
@@ -625,30 +832,8 @@ export function MapImageOverlay({
         map.addLayer(transformLayerDef)
       }
 
-      // Clip layer — erases basemap buildings + symbols inside every
-      // image footprint so an uploaded floor plan / site photo doesn't
-      // get visually intersected by Mapbox's own 3D buildings. Mapbox
-      // GL JS v3 + Standard style only; gracefully ignored elsewhere.
-      if (!map.getLayer(CLIP_LAYER)) {
-        try {
-          map.addLayer({
-            id: CLIP_LAYER,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            type: 'clip' as any,
-            source: CLIP_SOURCE,
-            layout: {
-              'clip-layer-types': ['symbol', 'model'],
-              'clip-layer-scope': ['basemap'],
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            } as any,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any)
-        } catch (err) {
-          if (import.meta.env.DEV) {
-            console.debug('[MapImageOverlay] clip layer not supported by this style', err)
-          }
-        }
-      }
+      // CLIP_LAYER sits here (before HIT_INFLIGHT_LAYER) — added by the
+      // basemap-clip effect below, only on styles where it clips anything.
 
       // In-flight sources + layers (transforming image). Same paint
       // recipes as HIT_LAYER / SELECTION_TINT_LAYER / SELECTION_LAYER /
@@ -790,6 +975,24 @@ export function MapImageOverlay({
     // styleGen forces re-mount on every basemap swap.
   }, [map, styleLoaded, styleGen])
 
+  // ---- Basemap clip layer ------------------------------------------------
+  // Erases basemap buildings + symbols inside every image footprint so an
+  // uploaded floor plan / site photo doesn't get visually intersected by
+  // Mapbox's own 3D buildings. Runs right after the setup pass above (same
+  // commit on style.load), so CLIP_LAYER lands at its old slot before
+  // HIT_INFLIGHT_LAYER; the setup cleanup still removes it ahead of
+  // CLIP_SOURCE. Not tied to `committedVisible` (it never was).
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    syncBasemapClipLayer(map, {
+      layerId: CLIP_LAYER,
+      sourceId: CLIP_SOURCE,
+      needed: basemapClip,
+      beforeId: HIT_INFLIGHT_LAYER,
+      label: 'MapImageOverlay',
+    })
+  }, [map, styleLoaded, styleGen, basemapClip])
+
   // ---- Theme-tinted transform-handle icons ------------------------------
   // Register the move / rotate / scale icons with the map whenever the
   // theme's `--primary` colour changes (palette pick or light/dark
@@ -888,9 +1091,66 @@ export function MapImageOverlay({
   const floorLayersRef = useRef<Map<number, FloorPlanLayer>>(new Map())
   // "Hide outside walls" masks, rebuilt only when images or walls change
   // (not on camera moves / unrelated renders).
+  // Each image keeps its previous mask array while nothing the mask depends
+  // on changed, so an opacity tweak (new `images` array) or an unrelated
+  // shape edit (new `wallLines` array, same walls) doesn't re-rasterise the
+  // mask texture. The outline itself is cached inside `wallOutline`.
+  // Focus mode: only a plate that is a line-of-sight blocker changes — a
+  // floor plan gets a soft round cut-out around the item column and the
+  // pierce points (a small plate fades whole to FOCUS_FACTOR.ghost); every
+  // other plate — the focused item's floor, the floors above it, a
+  // focused plan itself — stays as drawn (see `floorPlanState`). The
+  // narrowed FocusBlockers carries just the IMAGE blocker set and pierce
+  // discs (`blockerIdsOf` / `blockerPierceOf` keep their identity while
+  // their content is unchanged), which is all `focusTier` /
+  // `focusCutRegion` read for kind 'images', so a polygon or wall joining
+  // the blockers mid-orbit doesn't touch the plans. The per-plate
+  // treatments go through a value key, so the floor-plan sync below
+  // re-runs only when a plate's factor or holes change — not on every
+  // focus change — and never while focus is off.
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  const imageBlockerIds = blockerIdsOf(focusBlockers, 'images')
+  const imagePierce = blockerPierceOf(focusBlockers, 'images')
+  const planBlockers = useMemo<FocusBlockers>(
+    () =>
+      imageBlockerIds.size === 0
+        ? NO_BLOCKERS
+        : {
+            ...NO_BLOCKERS,
+            key: `images:${[...imageBlockerIds].join(',')}`,
+            images: imageBlockerIds,
+            pierce: { ...NO_PIERCE, images: imagePierce },
+          },
+    [imageBlockerIds, imagePierce],
+  )
+  const planFocusValue = useMemo(
+    () => planFocusKey(focusScene, planBlockers, images),
+    [focusScene, planBlockers, images],
+  )
+  const planFocus = useMemo(() => parsePlanFocusKey(planFocusValue), [planFocusValue])
   const masks = useMemo(() => {
     const m = new Map<number, number[][][][] | null>()
-    for (const img of images ?? []) if (img.id !== undefined) m.set(img.id, wallMaskUV(img, wallLines))
+    const cache = maskCache
+    for (const img of images ?? []) {
+      if (img.id === undefined) continue
+      if (!img.config.clipToWalls || !wallLines) {
+        m.set(img.id, null)
+        continue
+      }
+      const key = [
+        img.start.join(','), img.current.join(','), img.rotation ?? 0, img.config.clipMargin ?? 0.5,
+        wallSignature(img, wallLines),
+      ].join('|')
+      const prev = cache.get(img.id)
+      if (prev && prev.key === key) {
+        m.set(img.id, prev.mask)
+        continue
+      }
+      const mask = wallMaskUV(img, wallLines)
+      cache.set(img.id, { key, mask })
+      m.set(img.id, mask)
+    }
     return m
   }, [images, wallLines])
   useEffect(() => {
@@ -899,7 +1159,13 @@ export function MapImageOverlay({
     const wantedIds = new Set<number>()
     for (const img of images ?? []) {
       if (img.id === undefined || img.visible === false) continue
-      const state = floorPlanState(img, committedVisible, masks.get(img.id) ?? null)
+      // The alignment view has its own see-through policy (every plan
+      // capped so each shows through the others) — focus fades would
+      // only hide the reference you are aligning against.
+      const plan = alignment ? undefined : planFocus.get(img.id)
+      const state = alignment
+        ? floorPlanState(img, committedVisible, null, img.id === alignment.activeImageId ? ALIGNING_OPACITY : REFERENCE_OPACITY)
+        : floorPlanState(img, committedVisible, masks.get(img.id) ?? null, 1, plan?.factor ?? 1, plan?.cuts ?? null)
       if (!state) continue
       wantedIds.add(img.id)
       let layer = layers.get(img.id)
@@ -921,7 +1187,7 @@ export function MapImageOverlay({
       }
       layers.delete(id)
     }
-  }, [map, styleLoaded, styleGen, images, committedVisible, masks])
+  }, [map, styleLoaded, styleGen, images, committedVisible, masks, alignment, planFocus])
 
   // Cleanup on unmount — remove every floor-plan layer we added.
   useEffect(() => {
@@ -986,13 +1252,25 @@ export function MapImageOverlay({
         (labelPointData ?? { type: 'FeatureCollection', features: [] }) as GeoJSON.FeatureCollection
       )
     }
+  }, [map, styleLoaded, styleGen, fc, labelPointData])
+
+  // Clip footprints get their own push: `fc` also changes with the live
+  // preview while a bbox is dragged out, and the clip doesn't. Skipped when
+  // the source already holds the same rings, and while CLIP_LAYER is absent.
+  // See the matching note in `map-polygon-overlay.tsx`.
+  const lastClipPushRef = useRef<{
+    source: GeoJSONSource
+    data: GeoJSON.FeatureCollection<GeoJSON.Polygon> | null
+  } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded || !basemapClip) return
     const clipSrc = map.getSource(CLIP_SOURCE) as GeoJSONSource | undefined
-    if (clipSrc) {
-      clipSrc.setData(
-        clipData ?? { type: 'FeatureCollection', features: [] }
-      )
-    }
-  }, [map, styleLoaded, styleGen, fc, labelPointData, clipData])
+    if (!clipSrc) return
+    const last = lastClipPushRef.current
+    if (last && last.source === clipSrc && sameClipFootprints(last.data, clipData)) return
+    clipSrc.setData(clipData ?? { type: 'FeatureCollection', features: [] })
+    lastClipPushRef.current = { source: clipSrc, data: clipData }
+  }, [map, styleLoaded, styleGen, basemapClip, clipData])
 
   // Selection filter. Mirrored to the whole-area tint layer so the
   // wash appears + disappears with the border in perfect sync. Composed
@@ -1013,14 +1291,23 @@ export function MapImageOverlay({
       ? ['all', idFilter, ['!=', ['get', 'imageId'], excludeId]]
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       : (idFilter as unknown as any)
+    // The empty-layer gate hides both layers while no selected image is in
+    // HIT_SOURCE (nothing selected, or the selected image is hidden). The
+    // transform exclusion is left out of the predicate on purpose — see
+    // `imageSelectionPredicate`. The predicate is swapped right after
+    // `setFilter`, in the same task, so a new selection shows on the very
+    // next frame.
+    const predicate = imageSelectionPredicate(ids)
     try {
       if (map.getLayer(SELECTION_LAYER)) {
         map.setFilter(SELECTION_LAYER, filter)
+        registerLayerFeaturePredicate(map, SELECTION_LAYER, predicate)
       }
     } catch { /* ignore */ }
     try {
       if (map.getLayer(SELECTION_TINT_LAYER)) {
         map.setFilter(SELECTION_TINT_LAYER, filter)
+        registerLayerFeaturePredicate(map, SELECTION_TINT_LAYER, predicate)
       }
     } catch { /* ignore */ }
   }, [map, styleLoaded, styleGen, selectedImageIds, transformState])

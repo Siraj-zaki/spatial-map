@@ -17,6 +17,7 @@
  */
 
 import { apiDelete, apiGet, apiPost, apiPut } from '@/lib/api-client'
+import { reportShareToken, shareGet, sharePost } from '@/lib/reports/report-share'
 import { queryCache } from '@/lib/useApiQuery'
 import { facilityEntityName, facilityFieldLabel } from '@/lib/reports/facility-sources'
 import { isPresentationOnly, type WidgetKindV2 } from '@/lib/reports/v2-types'
@@ -502,7 +503,11 @@ export async function runReportV2(
   reportId: number,
   req: RunReportV2Request = {},
 ): Promise<RunReportV2Response> {
-  const raw = await apiPost<RunReportV2Response>(`/reports/${reportId}/run`, req)
+  // A shared report runs through its link (the token names the report).
+  const raw =
+    reportShareToken() !== null
+      ? await sharePost<RunReportV2Response>('/run', req)
+      : await apiPost<RunReportV2Response>(`/reports/${reportId}/run`, req)
   const queries: Record<string, QueryRunResult> = {}
   for (const [name, q] of Object.entries(raw.queries ?? {})) {
     queries[name] = normalizeQueryResult(q)
@@ -594,7 +599,10 @@ export async function fetchReportHistory(opts: {
   if (opts.windowDays !== undefined) params.set('windowDays', String(opts.windowDays))
   if (opts.bucket) params.set('bucket', opts.bucket)
   if (opts.recent !== undefined) params.set('recent', String(opts.recent))
-  const raw = await apiGet<HistoryResult>(`/reports/_/history?${params.toString()}`)
+  const raw =
+    reportShareToken() !== null
+      ? await shareGet<HistoryResult>(`/history?${params.toString()}`)
+      : await apiGet<HistoryResult>(`/reports/_/history?${params.toString()}`)
   // Normalize nil-slice-serializes-as-null the same way runReport does.
   return {
     ...raw,
@@ -617,7 +625,10 @@ export async function listReportSources(): Promise<ReportSourceHint[]> {
 
 /** Fetch the field schema for one source (typed for tables, sampled for the rest). */
 export async function getReportSourceSchema(sourceId: number): Promise<ReportSourceSchema> {
-  const schema = await apiGet<ReportSourceSchema>(`/reports/_/sources/${sourceId}/fields`)
+  const schema =
+    reportShareToken() !== null
+      ? await shareGet<ReportSourceSchema>(`/sources/${sourceId}/fields`)
+      : await apiGet<ReportSourceSchema>(`/reports/_/sources/${sourceId}/fields`)
   if (!schema.facilityEntity) return schema
   return {
     ...schema,

@@ -20,6 +20,7 @@ import {
   type GridConfig,
 } from './grid-generators'
 import type { CircleShape, FillShapeConfig } from './shapes'
+import { fillTapers } from './sloped-mesh'
 
 /** Approximate sides for the polygonal circle approximation. 64 is smooth at all zoom levels we care about. */
 const CIRCLE_STEPS = 64
@@ -77,6 +78,11 @@ export interface CirclePolygonProps {
   labelOffsetY?: number
   shapeRotation?: number
   /** Marks live-preview polygons (no circleId yet). */
+  /**
+   * Tapered / dome solid (sloped-mesh.ts): the overlay draws it as a mesh,
+   * and this feature sits in the zero-opacity bucket as its click target.
+   */
+  meshed?: boolean
   preview?: boolean
 }
 
@@ -337,10 +343,13 @@ export function buildCircleFeatureCollection(
     if (s.visible === false) continue
     const built = buildCircleFeatures(s)
     const override = s.id !== undefined ? extras?.get(s.id) : undefined
-    if (override) {
-      for (const f of built) features.push(applyCircleOverride(f, override))
+    const out = override ? built.map((f) => applyCircleOverride(f, override)) : built
+    // A single tapered / dome circle is drawn as a mesh by the overlay; its
+    // feature moves to the zero-opacity bucket as the click target.
+    if (s.mode === 'single' && out.length === 1 && fillTapers(s.config, out[0].properties.height)) {
+      features.push({ ...out[0], properties: { ...out[0].properties, meshed: true, opacityBucket: 0 } })
     } else {
-      features.push(...built)
+      features.push(...out)
     }
   }
   if (liveShape) {

@@ -197,6 +197,16 @@ export function MapboxMap({ onMapLoad, onMapDestroy, initialView, styleId = DEFA
    * Wrapped in try/catch because `setLights` only exists on GL JS
    * v3+ runtimes; on older builds we silently skip and the rest of
    * the rendering still works.
+   *
+   * The Shadows toggle sticks on Standard-import styles too (checked
+   * against GL JS 3.25): their root has no `lights`, so after load the
+   * root's `directionalLight` IS the basemap import's light object, and
+   * `setLights` overwrites its properties in place. A later `mergeAll`
+   * (import reload, HD-roads load) re-picks that same object, so
+   * `cast-shadows: false` survives, and as a non-transitionable property
+   * it applies on the very next frame. One leftover: the import's sources
+   * were flagged `castsShadows` while Standard's own light was still on,
+   * so they keep prefetching (never drawing) shadow-caster tiles.
    */
   const applyLights = (map: mapboxgl.Map) => {
     // Read the current graphics-quality setting at apply-time. The
@@ -309,8 +319,11 @@ export function MapboxMap({ onMapLoad, onMapDestroy, initialView, styleId = DEFA
       // Perf: warehouses live at metropolis-scale zoom, never at the
       // world seam, so multi-world rendering is wasted work.
       renderWorldCopies: false,
-      // Perf: symbol collision fades cost per-frame work on
-      // label-heavy scenes. 0 is instant with negligible UX loss.
+      // Labels pop in / out on collision instead of fading. Not a perf
+      // win while the camera moves: at 0, GL JS re-runs symbol placement
+      // synchronously on every moving frame (a non-zero fade throttles it
+      // to once per fade and time-slices it at ~2 ms/frame). Kept at 0
+      // because a fade is a visible change.
       fadeDuration: 0,
       // Perf: at warehouse zoom (17-19) GL JS auto-picks mercator
       // anyway; setting it explicitly skips the globe→mercator

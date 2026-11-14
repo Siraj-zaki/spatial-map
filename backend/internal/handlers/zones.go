@@ -106,6 +106,7 @@ func ZonesRouter(q *db.Queries, pool *pgxpool.Pool, s store.ObjectStore) chi.Rou
 	r.Post("/", createZone(q))
 	r.Route("/{id}", func(r chi.Router) {
 		r.Get("/", getZone(q))
+		r.Get("/view", getZoneView(q))
 		r.Patch("/", updateZone(q))
 		r.Delete("/", deleteZone(q, s))
 		// Mounted inside the /{id} group so the path param resolves
@@ -188,6 +189,35 @@ func getZone(q *db.Queries) http.HandlerFunc {
 			return
 		}
 		api.JSON(w, http.StatusOK, toZoneResponse(db.CreateZoneRow(row)))
+	}
+}
+
+// getZoneView returns the facility with every shape and bin in one call —
+// the same WarehouseView envelope a share link gets (buildWarehouseViewPayload),
+// for members of the facility's workspace whether or not it is public. The
+// mobile app loads a facility with it.
+func getZoneView(q *db.Queries) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := api.IDParam(r, "id")
+		if err != nil {
+			api.BadRequest(w, err.Error())
+			return
+		}
+		row, err := q.GetZone(r.Context(), db.GetZoneParams{ID: id, TenantID: api.TenantID(r.Context())})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				api.NotFound(w, "zone not found")
+				return
+			}
+			api.InternalError(w, r, err)
+			return
+		}
+		view, ok := buildWarehouseViewPayload(q, r, db.CreateZoneRow(row), true)
+		if !ok {
+			api.NotFound(w, "zone not found")
+			return
+		}
+		api.JSON(w, http.StatusOK, view)
 	}
 }
 

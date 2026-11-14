@@ -13,7 +13,7 @@
  * set. React callers subscribe via `useTablePlaybackState()`.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 
 import type { EntityState } from '@/lib/db'
 import type { TableRowEvent } from './table-events-client'
@@ -132,7 +132,10 @@ export const tablePlayback = {
       events,
       startMs,
       endMs,
-      currentMs: startMs,
+      // Parked at "now": a freshly loaded window shows the live map (see
+      // useTablePlaybackFor) until the viewer plays or scrubs back; play()
+      // at the end restarts from the beginning.
+      currentMs: endMs,
       playing: false,
       error: null,
     })
@@ -168,42 +171,122 @@ export const tablePlayback = {
   stop() {
     stopRaf()
     state = initial
+    cursor = null
     emit()
   },
+}
+
+/**
+ * Incremental reconstruction state for `visibleEntities`. Rebuilt from
+ * scratch whenever `state.events` is a different array (a new session)
+ * or the playhead moves backwards; otherwise the cursor only walks the
+ * events that crossed the playhead since the last call.
+ */
+interface PlaybackCursor {
+  /** The `state.events` array this cursor walks. */
+  events: TableRowEvent[]
+  /** `new Date(ev.ts).getTime()` per event, parsed once. */
+  tsMs: Float64Array
+  /** Index of the first event not yet applied. */
+  next: number
+  /** Playhead of the last call — a smaller one means a backwards seek. */
+  cutoff: number
+  /**
+   * Latest event per entity key, in first-seen order. A delete keeps the
+   * key's slot (flagged) so a later re-insert lands where it was — the
+   * same order the from-scratch walk produces.
+   */
+  current: Map<string, { ev: TableRowEvent; deleted: boolean }>
+  /** True once `current` changed since `snapshot` was built. */
+  dirty: boolean
+  /** Last result, returned as-is while nothing crossed the playhead. */
+  snapshot: EntityState[]
+}
+
+let cursor: PlaybackCursor | null = null
+
+/** One EntityState per event, so a rebuilt snapshot reuses unchanged rows. */
+const entityForEvent = new WeakMap<TableRowEvent, EntityState>()
+
+function entityStateFor(key: string, ev: TableRowEvent): EntityState {
+  const hit = entityForEvent.get(ev)
+  if (hit && hit.entityKey === key) return hit
+  const ts = new Date(ev.ts)
+  const out: EntityState = {
+    entityKey: key,
+    streamId: -1,
+    payload: ev.payload,
+    lastSeenAt: ts,
+    updatedAt: ts,
+  }
+  entityForEvent.set(ev, out)
+  return out
+}
+
+function freshCursor(events: TableRowEvent[]): PlaybackCursor {
+  const tsMs = new Float64Array(events.length)
+  for (let i = 0; i < events.length; i++) tsMs[i] = new Date(events[i]!.ts).getTime()
+  return {
+    events,
+    tsMs,
+    next: 0,
+    cutoff: -Infinity,
+    current: new Map(),
+    dirty: true,
+    snapshot: [],
+  }
 }
 
 /**
  * Reconstruct the entity states for `sourceId` at the current
  * playhead. Walks events ASC and keeps the last snapshot per
  * `entityKey`; `delete` operations remove the entity from the
- * result. Deliberately O(events) per call — playback windows
- * cap at 5000 events server-side (see `table-events-client.ts`),
- * so this is fine on every animation frame.
+ * result.
+ *
+ * Runs on every animation frame while playing, so the walk is
+ * incremental: a cursor remembers how far it got, only events that
+ * crossed the playhead since the last call are applied, and when none
+ * did the previous array is returned as-is — downstream memos and map
+ * pushes then skip the frame entirely. A rebuilt array reuses the
+ * EntityState object of every row whose event didn't change. Same
+ * entities, same order, same field values as the from-scratch walk
+ * (a backwards seek replays from the start).
  */
 export function visibleEntities(sourceId: number): EntityState[] {
   if (state.activeSourceId !== sourceId) return []
   const cutoff = state.currentMs
-  const bySnapshot = new Map<string, { ev: TableRowEvent; deleted: boolean }>()
-  for (const ev of state.events) {
-    if (new Date(ev.ts).getTime() > cutoff) break
-    if (ev.operation === 'delete') {
-      bySnapshot.set(ev.entityKey, { ev, deleted: true })
-    } else {
-      bySnapshot.set(ev.entityKey, { ev, deleted: false })
-    }
+  let c = cursor
+  // `!(cutoff >= …)` also replays after a NaN playhead, where the
+  // from-scratch walk would have answered differently.
+  if (!c || c.events !== state.events || !(cutoff >= c.cutoff)) {
+    const prev = c && c.events === state.events ? c : null
+    c = freshCursor(state.events)
+    // Keep the array identity across a seek that lands on the same set.
+    if (prev) c.snapshot = prev.snapshot
+    cursor = c
   }
+  c.cutoff = cutoff
+  const { events, tsMs, current } = c
+  // `!(ts > cutoff)` rather than `ts <= cutoff`: an unparseable ts (NaN)
+  // never stopped the from-scratch walk either.
+  while (c.next < events.length && !(tsMs[c.next]! > cutoff)) {
+    const ev = events[c.next]!
+    current.set(ev.entityKey, { ev, deleted: ev.operation === 'delete' })
+    c.next++
+    c.dirty = true
+  }
+  if (!c.dirty) return c.snapshot
+  c.dirty = false
   const out: EntityState[] = []
-  for (const [key, entry] of bySnapshot) {
+  for (const [key, entry] of current) {
     if (entry.deleted) continue
-    const ts = new Date(entry.ev.ts)
-    out.push({
-      entityKey: key,
-      streamId: -1,
-      payload: entry.ev.payload,
-      lastSeenAt: ts,
-      updatedAt: ts,
-    })
+    out.push(entityStateFor(key, entry.ev))
   }
+  const prevSnap = c.snapshot
+  let same = prevSnap.length === out.length
+  for (let i = 0; same && i < out.length; i++) same = prevSnap[i] === out[i]
+  if (same) return prevSnap
+  c.snapshot = out
   return out
 }
 
@@ -215,4 +298,35 @@ export function useTablePlaybackState(): TablePlaybackState {
   const [snap, setSnap] = useState<TablePlaybackState>(tablePlayback.getState())
   useEffect(() => tablePlayback.subscribe(setSnap), [])
   return snap
+}
+
+function subscribeRaw(fn: () => void): () => void {
+  listeners.add(fn)
+  return () => {
+    listeners.delete(fn)
+  }
+}
+
+/**
+ * Narrow subscription for one data source's map layer. Re-renders only
+ * when this source starts / stops playing back, or when the set of
+ * entities at the playhead actually changed — not on every playhead tick
+ * (60 per second while playing). Layers of other sources never re-render.
+ *
+ * `entities` is `visibleEntities(sourceId)` while active, else null.
+ */
+export function useTablePlaybackFor(sourceId: number | null | undefined): {
+  active: boolean
+  entities: EntityState[] | null
+} {
+  // Active = this source is loaded AND the playhead is somewhere in the past
+  // (playing, or scrubbed back). Parked at the end of the window and paused
+  // is "now": the layer draws its live rows, so items with no event in the
+  // window (a silent tag) don't vanish and new rows keep arriving.
+  const getSnapshot = (): EntityState[] | null =>
+    sourceId !== undefined && state.activeSourceId === sourceId && (state.playing || state.currentMs < state.endMs)
+      ? visibleEntities(sourceId as number)
+      : null
+  const entities = useSyncExternalStore(subscribeRaw, getSnapshot, getSnapshot)
+  return { active: entities !== null, entities }
 }

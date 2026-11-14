@@ -3,8 +3,34 @@ import {
   buildCircleFeatures,
   type CirclePolygonProps,
 } from '@/lib/circle-generators'
+import { taperedSolidMeshes } from '@/lib/sloped-mesh'
+import { useShapeMeshLayers } from '@/hooks/useShapeMeshLayers'
+import { sameClipFootprints, syncBasemapClipLayer, useBasemapClipNeeded } from '@/lib/basemap-clip'
 import { destination as turfDestination, point as turfPoint } from '@turf/turf'
 import { higherPriorityAt } from '@/lib/overlay-hit-priority'
+import {
+  hintLayerEmpty,
+  registerLayerFeaturePredicate,
+  type LayerFeaturePredicate,
+} from '@/lib/empty-layer-gate'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
+import { patchFeatureCollection } from '@/lib/focus/focus-fade'
+import {
+  cutRegionContains,
+  focusCutRegion,
+  focusFadeCollection,
+  isCutWorthy,
+  meshCutAway,
+  type FocusPiece,
+} from '@/lib/focus/focus-cutaway'
+import {
+  blockerIdsOf,
+  blockerPierceOf,
+  focusFactor,
+  useFocusBlockers,
+  useFocusScene,
+} from '@/lib/focus/focus-scene'
+import { stableDerivedCollection } from '@/components/map-line-overlay'
 import type { CircleShape } from '@/lib/shapes'
 import {
   TRANSFORM_ICON,
@@ -13,7 +39,12 @@ import {
   registerTransformHandleIcons,
   subscribeThemeChanges,
 } from '@/lib/map-transform-handles'
-import type { GeoJSONSource, Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
+import type {
+  ExpressionSpecification,
+  GeoJSONSource,
+  Map as MapboxMapInstance,
+  MapMouseEvent,
+} from 'mapbox-gl'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 interface MapCircleOverlayProps {
@@ -67,6 +98,104 @@ const EXTRUDE_LAYER_IDS = OPACITY_BUCKETS.map((b) => `${EXTRUDE_LAYER_BASE}-op${
 const extrudeLayerId = (bucket: number) => `${EXTRUDE_LAYER_BASE}-op${bucket}`
 const SELECTION_LAYER = 'circle-selection-line-layer'
 const SELECTION_TINT_LAYER = 'circle-selection-tint-layer'
+// Tapered / dome circles are drawn as meshes (useShapeMeshLayers); their
+// extruded feature stays in the zero-opacity bucket as the click target, so
+// the roof outline and the extruded selection wash must skip it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const NOT_MESHED: any = ['!=', ['get', 'meshed'], true]
+// Focus mode (src/lib/focus): a faded circle also carries its fade factor
+// as `focusFade`, so the border fades with the fill. No feature carries it
+// while nothing is focused, so the border draws at 1, its old default.
+const FOCUS_FADE_PROP = 'focusFade'
+const BORDER_OPACITY = ['coalesce', ['get', FOCUS_FADE_PROP], 1] as ExpressionSpecification
+
+// ---- Focus mode: circle-grid rows (local cut-away) -------------------------
+// A circle grid is many features sharing one `circleId`. When a near /
+// blocker grid is much larger than its cut region (isCutWorthy over the
+// union bbox and summed area of its pieces), only the pieces whose ring
+// centroid lies in the region fade — each whole — and the rest stay as
+// drawn. Pure lookups, cached per collection / geometry object, built
+// lazily (only for a faded row) and never per frame.
+
+const METERS_PER_DEG = 111_320
+
+interface GridRowIndex {
+  /** circleId → piece geometries, only for ids with more than one piece (grid rows). */
+  pieces: Map<number, GeoJSON.Polygon[]>
+  /** circleId → isCutWorthy of that row. */
+  worthy: Map<number, boolean>
+}
+
+const gridRowIndexCache = new WeakMap<object, GridRowIndex>()
+
+function gridRowsOf(fc: GeoJSON.FeatureCollection<GeoJSON.Polygon, CirclePolygonProps>): GridRowIndex {
+  let idx = gridRowIndexCache.get(fc)
+  if (!idx) {
+    const pieces = new Map<number, GeoJSON.Polygon[]>()
+    for (const f of fc.features) {
+      const id = f.properties.circleId
+      if (id === undefined) continue
+      const list = pieces.get(id)
+      if (list) list.push(f.geometry)
+      else pieces.set(id, [f.geometry])
+    }
+    for (const [id, list] of pieces) if (list.length < 2) pieces.delete(id)
+    idx = { pieces, worthy: new Map() }
+    gridRowIndexCache.set(fc, idx)
+  }
+  return idx
+}
+
+function gridRowCutWorthy(idx: GridRowIndex, id: number): boolean {
+  let hit = idx.worthy.get(id)
+  if (hit === undefined) {
+    let w = Infinity
+    let s = Infinity
+    let e = -Infinity
+    let n = -Infinity
+    let area = 0
+    for (const g of idx.pieces.get(id) ?? []) {
+      const ring = g.coordinates[0]
+      if (!ring || ring.length < 3) continue
+      const kx = Math.cos((ring[0][1] * Math.PI) / 180) * METERS_PER_DEG
+      let a = 0
+      for (let p = 0, q = ring.length - 1; p < ring.length; q = p++) {
+        a += ring[q][0] * kx * (ring[p][1] * METERS_PER_DEG) - ring[p][0] * kx * (ring[q][1] * METERS_PER_DEG)
+        if (ring[p][0] < w) w = ring[p][0]
+        if (ring[p][0] > e) e = ring[p][0]
+        if (ring[p][1] < s) s = ring[p][1]
+        if (ring[p][1] > n) n = ring[p][1]
+      }
+      area += Math.abs(a / 2)
+    }
+    hit = isCutWorthy([w, s, e, n], area)
+    idx.worthy.set(id, hit)
+  }
+  return hit
+}
+
+const ringCentroidCache = new WeakMap<object, readonly [number, number]>()
+
+/** Mean of a piece's outer-ring vertices (closing vertex excluded), cached per geometry. */
+function ringCentroid(g: GeoJSON.Polygon): readonly [number, number] {
+  let hit = ringCentroidCache.get(g)
+  if (!hit) {
+    const ring = g.coordinates[0] ?? []
+    const last = ring.length - 1
+    const closed = last > 0 && ring[0][0] === ring[last][0] && ring[0][1] === ring[last][1]
+    const count = closed ? last : ring.length
+    let x = 0
+    let y = 0
+    for (let i = 0; i < count; i++) {
+      x += ring[i][0]
+      y += ring[i][1]
+    }
+    hit = count > 0 ? [x / count, y / count] : [NaN, NaN]
+    ringCentroidCache.set(g, hit)
+  }
+  return hit
+}
+
 const LABEL_SOURCE = 'circle-label-source'
 // Billboard label — screen-space, always facing camera (default,
 // `labelFlat != true`).
@@ -100,6 +229,181 @@ const SELECTION_TINT_INFLIGHT_LAYER = 'circle-selection-tint-inflight-layer'
 const LABEL_INFLIGHT_SOURCE = 'circle-label-inflight-source'
 const LABEL_INFLIGHT_LAYER = 'circle-label-inflight-layer'
 
+// ---- Empty-layer gate (src/lib/empty-layer-gate.ts) ----------------------
+// Most opacity buckets hold no circle, and FILL_LAYER is empty unless a
+// circle is fully flat, yet Mapbox re-evaluates every visible layer on
+// every frame. Each of these layers registers a JS test mirroring its
+// filter and the gate hides it while no FILL_SOURCE feature passes. The
+// `!= circleId` clause the exclusion effect adds during a transform is
+// deliberately not mirrored: there the test is a superset, which can keep
+// a layer visible but never hide a feature the filter draws. See
+// `map-polygon-overlay.tsx` for the same wiring.
+type CircleGateFeature = {
+  properties?: { opacityBucket?: unknown; elevation?: unknown; height?: unknown } | null
+}
+// FILL_LAYER: `['all', ['==', ['get', 'elevation'], 0], ['==', ['get', 'height'], 0]]`.
+// Mapbox's `==` is strict equality, no coercion.
+const flatFillTest = (f: CircleGateFeature): boolean =>
+  f.properties?.elevation === 0 && f.properties?.height === 0
+// `['any', ['>', ['get', 'elevation'], 0], ['>', ['get', 'height'], 0]]`.
+// Mapbox wraps each `get` of an order comparison in a number assertion, so
+// a non-number elevation throws and fails the WHOLE filter (`height` is
+// never consulted); `any` short-circuits on the first true.
+const extrudedTest = (f: CircleGateFeature): boolean => {
+  const elevation = f.properties?.elevation
+  if (typeof elevation !== 'number') return false
+  if (elevation > 0) return true
+  const height = f.properties?.height
+  return typeof height === 'number' && height > 0
+}
+// EXTRUDE op<b>: `['all', ['==', ['get', 'opacityBucket'], b], <extruded>]`.
+const extrudeBucketTest =
+  (bucket: number) =>
+  (f: CircleGateFeature): boolean =>
+    f.properties?.opacityBucket === bucket && extrudedTest(f)
+const GATED_FILL_LAYERS: ReadonlyMap<string, (f: CircleGateFeature) => boolean> = new Map([
+  [FILL_LAYER, flatFillTest] as const,
+  ...OPACITY_BUCKETS.map((b) => [extrudeLayerId(b), extrudeBucketTest(b)] as const),
+])
+// Filter-empty (`circleId == -1`) while nothing is selected → hinted empty.
+const GATED_SELECTION_LAYERS = [SELECTION_LAYER, SELECTION_TINT_LAYER] as const
+
+/**
+ * Hide deferral for the gated layers — see GateHold in
+ * `map-polygon-overlay.tsx`. Showing is immediate; a layer that may still
+ * be drawing the previous tiles stays visible until the first frame in
+ * which FILL_SOURCE is fully loaded again, so a circle changing bucket
+ * (opacity edit, live-data restyle) never blinks out for a re-tile.
+ */
+interface GateHold {
+  /** Gated fill layers whose filter matched ≥1 feature in the last FILL_SOURCE push. */
+  matched: Set<string>
+  /** Layers kept visible until FILL_SOURCE has re-tiled the change that emptied them. */
+  held: Set<string>
+  /** True while the selection layers may be drawing a highlight. */
+  selectionShown: boolean
+  /** Detaches the pending release listener, when one is armed. */
+  disarm: (() => void) | null
+}
+
+function gatePredicate(
+  hold: GateHold,
+  layerId: string,
+  test: (f: CircleGateFeature) => boolean,
+): LayerFeaturePredicate {
+  return (f) => hold.held.has(layerId) || test(f)
+}
+
+/**
+ * Shadows ON (Graphics → Shadows) pins the gated layers that cast shadows:
+ * no predicate and no empty hint, which leaves them under the plain
+ * source-count gate they had before they were gated here. Mapbox anchors
+ * its ground-shadow pass after the last visible shadow caster, so hiding
+ * an empty caster (op10…op100, the selection tint) would brighten or
+ * darken every 2D layer in between, e.g. on every select / deselect. Full
+ * explanation at `pinnedShadowCaster` in `map-polygon-overlay.tsx`.
+ * Shadows OFF (the default) keeps full gating.
+ */
+function pinnedShadowCaster(map: MapboxMapInstance, layerId: string): boolean {
+  return useGraphicsSettings.getState().shadows && layerHasShadowPass(map, layerId)
+}
+
+/**
+ * Mirrors Mapbox's per-type `hasShadowPass()`. Fill-extrusion reads
+ * `fill-extrusion-cast-shadows`, whose spec default (unset, so `undefined`
+ * here) is true; a fill (FILL_LAYER) has one only with a
+ * `fill-elevation-reference` other than 'none'; line and symbol layers
+ * never do. When unsure it answers true, which keeps a layer visible: that
+ * costs perf, never pixels.
+ */
+function layerHasShadowPass(map: MapboxMapInstance, layerId: string): boolean {
+  try {
+    const type = map.getLayer(layerId)?.type
+    if (type === 'fill-extrusion') {
+      return map.getPaintProperty(layerId, 'fill-extrusion-cast-shadows') !== false
+    }
+    if (type === 'fill') {
+      const ref = map.getLayoutProperty(layerId, 'fill-elevation-reference')
+      return ref !== undefined && ref !== 'none'
+    }
+    return type === 'model'
+  } catch {
+    return true
+  }
+}
+
+/** (Re-)register a gated fill layer's predicate, or none while it is a pinned shadow caster. */
+function applyFillGate(
+  map: MapboxMapInstance,
+  hold: GateHold,
+  layerId: string,
+  test: (f: CircleGateFeature) => boolean,
+): void {
+  registerLayerFeaturePredicate(
+    map,
+    layerId,
+    pinnedShadowCaster(map, layerId) ? null : gatePredicate(hold, layerId, test),
+  )
+}
+
+/** Hint a selection layer empty (nothing selected), unless it is a pinned shadow caster. */
+function hintSelectionEmpty(map: MapboxMapInstance, layerId: string): void {
+  hintLayerEmpty(map, layerId, !pinnedShadowCaster(map, layerId))
+}
+
+/** Graphics → Shadows flipped: re-apply the gated shadow casters under the new pin state. */
+function reapplyShadowPins(map: MapboxMapInstance, hold: GateHold): void {
+  // The pin only ever changes a layer that has a shadow pass. A layer
+  // missing mid style swap has none here; the setup pass registers it anew.
+  for (const [layerId, test] of GATED_FILL_LAYERS) {
+    if (layerHasShadowPass(map, layerId)) applyFillGate(map, hold, layerId, test)
+  }
+  // While a selection is shown (or held until its re-tile) the hints stay
+  // cleared; the release or the next selection change re-hints under the
+  // new state.
+  if (!hold.selectionShown) {
+    for (const id of GATED_SELECTION_LAYERS) {
+      if (layerHasShadowPass(map, id)) hintSelectionEmpty(map, id)
+    }
+  }
+}
+
+/** Un-hold every held layer: fill layers get re-counted, selection layers hinted empty. */
+function releaseGateHolds(map: MapboxMapInstance, hold: GateHold): void {
+  const ids = [...hold.held]
+  hold.held.clear()
+  for (const id of ids) {
+    const test = GATED_FILL_LAYERS.get(id)
+    if (test) {
+      applyFillGate(map, hold, id, test)
+    } else {
+      // Only held while nothing is selected (a selection un-holds them).
+      hold.selectionShown = false
+      hintSelectionEmpty(map, id)
+    }
+  }
+}
+
+/**
+ * Release the held layers on the first `render` in which FILL_SOURCE is
+ * loaded (`render` fires after `style.update` applied any pending reload).
+ */
+function armGateRelease(map: MapboxMapInstance, hold: GateHold): void {
+  if (hold.disarm) return
+  const onRender = () => {
+    try {
+      if (!map.getSource(FILL_SOURCE) || !map.isSourceLoaded(FILL_SOURCE)) return
+    } catch {
+      return
+    }
+    map.off('render', onRender)
+    hold.disarm = null
+    releaseGateHolds(map, hold)
+  }
+  map.on('render', onRender)
+  hold.disarm = () => map.off('render', onRender)
+}
+
 /**
  * Renders saved circles (both single and circle-grid sub-modes) as
  * Mapbox polygon layers. Mirrors the grid overlay's architecture:
@@ -129,6 +433,15 @@ export function MapCircleOverlay({
   // `map-polygon-overlay.tsx`. Source/layer effect deps include it so
   // basemap swaps trigger a fresh setup pass.
   const [styleGen, setStyleGen] = useState(0)
+  // Empty-layer gate bookkeeping (see GateHold). Survives style swaps on
+  // purpose: a stale `matched` / `selectionShown` can only over-hold, i.e.
+  // keep a layer visible one re-tile longer.
+  const gateHoldRef = useRef<GateHold>({
+    matched: new Set(),
+    held: new Set(),
+    selectionShown: false,
+    disarm: null,
+  })
 
   // ---- Style readiness (matches the grid overlay pattern) ----------------
   useEffect(() => {
@@ -164,6 +477,10 @@ export function MapCircleOverlay({
   // listener above now bumps `styleGen`; see notes in
   // `map-polygon-overlay.tsx`.
 
+  // Whether the current basemap has anything a clip layer can hide
+  // (`src/lib/basemap-clip.ts`). CLIP_LAYER only exists while true.
+  const basemapClip = useBasemapClipNeeded(map)
+
   // ---- Theme-tinted handle icons -----------------------------------------
   const [primaryHex, setPrimaryHex] = useState<string>(() =>
     readThemePrimaryHex(),
@@ -189,6 +506,127 @@ export function MapCircleOverlay({
     () => buildCircleFeatureCollection(circles ?? [], livePreview, shapeStyleOverrides),
     [circles, livePreview, shapeStyleOverrides]
   )
+
+  // ---- Focus mode (src/lib/focus) ----------------------------------------
+  // Same post-pass as `map-polygon-overlay.tsx`: while an item is focused,
+  // only the circles between the camera and the item (blockers) and the
+  // ones in its NEAR column move to lower opacity buckets (re-stamped
+  // `opacity` / `opacityBucket`, + `focusFade` for the border); FILL_LAYER
+  // (flat circles) reads `opacity` directly. Every other circle keeps its
+  // feature object. Grid-mode circles share their `circleId`, so a whole
+  // circle grid fades as one shape. With nothing focused, or nothing to
+  // fade, `fc` ITSELF comes back. Clip footprints, labels and the
+  // selection / exclusion filters stay on `fc`.
+  //
+  // Local cut-away (focus-cutaway.ts), as in `map-polygon-overlay.tsx`: a
+  // single circle much bigger than its region splits into an 'in' and an
+  // 'out' feature with the SAME `circleId` / feature id (clicks resolve by
+  // `circleId`); a big circle grid fades only the pieces whose centroid
+  // lies in the region (see gridRowsOf); a tapered / dome circle keeps its
+  // hit target and its mesh is split per triangle (`meshCutAway`).
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  // Same Set / Map while the circle blockers and their pierce discs are
+  // unchanged: other kinds' blocker changes don't re-push this source.
+  const circleBlockers = blockerIdsOf(focusBlockers, 'circles')
+  const circlePierce = blockerPierceOf(focusBlockers, 'circles')
+  /** Fade factor / cut region by circle id, or null while nothing is focused. */
+  const circleFocus = useMemo(() => {
+    if (!focusScene.active) return null
+    return {
+      factorOf: (id: number | undefined): number =>
+        id === undefined ? 1 : focusFactor(focusScene, focusBlockers, 'circles', id),
+      regionOf: (id: number | undefined) =>
+        id === undefined ? null : focusCutRegion(focusScene, focusBlockers, 'circles', id),
+    }
+    // `focusBlockers` is read only through its circle set and pierce map.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusScene, circleBlockers, circlePierce])
+  const fadedFc = useMemo<
+    GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, CirclePolygonProps & { focusPiece?: FocusPiece }>
+  >(() => {
+    if (!circleFocus) return fc
+    // Factor of one feature. The live-draw preview has no id and is never
+    // faded. A piece of a cut-worthy grid row fades (whole) only when its
+    // centroid lies in the row's region; a small row fades whole.
+    const factorOf = (f: { geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon; properties: { circleId?: number } }) => {
+      const id = f.properties.circleId
+      const factor = circleFocus.factorOf(id)
+      if (factor === 1 || id === undefined || f.geometry.type !== 'Polygon') return factor
+      const rows = gridRowsOf(fc)
+      if (!rows.pieces.has(id) || !gridRowCutWorthy(rows, id)) return factor
+      const region = circleFocus.regionOf(id)
+      if (!region) return factor
+      const [lng, lat] = ringCentroid(f.geometry)
+      return cutRegionContains(region, lng, lat) ? factor : 1
+    }
+    // Grid-row pieces never split (regionOf null): they fade whole or not.
+    const regionOf = (f: { properties: { circleId?: number } }) => {
+      const id = f.properties.circleId
+      if (id === undefined || gridRowsOf(fc).pieces.has(id)) return null
+      return circleFocus.regionOf(id)
+    }
+    // stableDerivedCollection: a scene change that leaves this overlay's
+    // fades as they were (the NEAR column of another kind, a data-link
+    // anchor arriving) hands back the previous object, so nothing re-pushes.
+    // `focusFade` (the border) goes on faded features and 'in' pieces; an
+    // 'out' piece keeps the full border, cut arc included.
+    return stableDerivedCollection(
+      fc as GeoJSON.FeatureCollection<GeoJSON.Polygon | GeoJSON.MultiPolygon, CirclePolygonProps & { focusPiece?: FocusPiece }>,
+      patchFeatureCollection(
+        focusFadeCollection(fc, factorOf, regionOf),
+        (f) => {
+          const factor = factorOf(f)
+          return factor === 1 || f.properties.focusPiece === 'out' ? null : String(factor)
+        },
+        (props, tag) => ({ ...props, [FOCUS_FADE_PROP]: Number(tag) }),
+      ),
+    )
+  }, [fc, circleFocus])
+
+  // Tapered / dome circles (sloped-mesh.ts) — cones, domes, silos. The one
+  // being moved shows as its in-flight extrusion until it's dropped. Built
+  // from `fc` (focus-independent), so leaving focus hands back the very
+  // same array. While focused they're built from `fadedFc` (a whole-faded
+  // solid carries its faded `opacity` → translucent mesh layer), then
+  // `meshCutAway` splits a big near / blocker solid per triangle (inside:
+  // `circle:<id>#cut` at the tier's alpha). Meshed circles are single and
+  // never split into pieces, so every meshed feature is still a Polygon.
+  const baseSolidMeshes = useMemo(
+    () =>
+      taperedSolidMeshes('circle', circles ?? [], fc.features, {
+        selectedIds: selectedCircleIds,
+        tint: primaryHex,
+        skipId: transformState?.circleId ?? null,
+      }),
+    [circles, fc, selectedCircleIds, primaryHex, transformState],
+  )
+  const solidMeshes = useMemo(() => {
+    if (!circleFocus) return baseSolidMeshes
+    const built =
+      fadedFc === fc
+        ? baseSolidMeshes
+        : taperedSolidMeshes(
+            'circle',
+            circles ?? [],
+            fadedFc.features.filter((f) => f.properties.meshed === true) as GeoJSON.Feature<GeoJSON.Polygon, CirclePolygonProps>[],
+            {
+              selectedIds: selectedCircleIds,
+              tint: primaryHex,
+              skipId: transformState?.circleId ?? null,
+            },
+          )
+    const idOfKey = (key: string): number | undefined => {
+      const id = Number(key.slice(key.indexOf(':') + 1))
+      return Number.isInteger(id) ? id : undefined
+    }
+    return meshCutAway(
+      built,
+      (key) => circleFocus.regionOf(idOfKey(key)),
+      (key) => circleFocus.factorOf(idOfKey(key)),
+    )
+  }, [baseSolidMeshes, circleFocus, fadedFc, fc, circles, selectedCircleIds, primaryHex, transformState])
+  useShapeMeshLayers(map, styleLoaded, styleGen, 'circle', solidMeshes, committedVisible)
 
   // Clip footprint: one polygon per circle. Fed to the `clip` layer so
   // Mapbox erases basemap 3D buildings + symbols *under* every circle,
@@ -266,6 +704,7 @@ export function MapCircleOverlay({
   // ---- Register sources + layers when style is ready ---------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
     try {
       if (!map.getSource(FILL_SOURCE)) {
         // `lineMetrics: true` — silences the "line-progress evaluation
@@ -356,8 +795,10 @@ export function MapCircleOverlay({
               // `map-polygon-overlay.tsx`. A 5 cm elevation-only slab
               // paints as a shadow blob otherwise.
               'fill-extrusion-vertical-gradient': false,
+              // The 0% bucket is invisible (incl. tapered circles' hit
+              // targets) — it must not cast a box-shaped shadow.
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              ['fill-extrusion-cast-shadows' as any]: true,
+              ['fill-extrusion-cast-shadows' as any]: bucket > 0,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               ['fill-extrusion-ambient-occlusion-intensity' as any]: 0.35,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -368,6 +809,14 @@ export function MapCircleOverlay({
           console.warn('[MapCircleOverlay] failed to add extrude bucket', bucket, err)
         }
       }
+      // Gate FILL_LAYER + the bucket layers on their filters (see
+      // GATED_FILL_LAYERS). The gate drops registrations with the layer, so
+      // every setup pass re-registers. Shadow casters are skipped while
+      // Shadows is on (pinnedShadowCaster).
+      for (const [layerId, test] of GATED_FILL_LAYERS) {
+        applyFillGate(map, gateHold, layerId, test)
+      }
+      if (gateHold.held.size > 0) armGateRelease(map, gateHold)
 
       // Border line — lifted to the top of the extrusion via `line-z-offset`
       // so it never sits on the ground while the cylinder sits in the air.
@@ -380,12 +829,15 @@ export function MapCircleOverlay({
           id: LINE_LAYER,
           type: 'line',
           source: FILL_SOURCE,
+          filter: NOT_MESHED,
           paint: {
             'line-color': ['get', 'borderColor'],
             'line-width': ['to-number', ['get', 'borderWidth']],
             // Render at full color regardless of the v3 lighting model so
             // the border is visible on top of a lit 3D extrusion top.
             'line-emissive-strength': 1,
+            // Focus mode: fades with the fill (FOCUS_FADE_PROP).
+            'line-opacity': BORDER_OPACITY,
           },
           layout: {
             'line-elevation-reference': 'sea',
@@ -568,30 +1020,8 @@ export function MapCircleOverlay({
         })
       }
 
-      // Clip layer — erases basemap buildings/symbols inside every circle
-      // so the 3D extrusion isn't intersected by Mapbox's own building
-      // models. Mapbox GL JS v3 + Standard style only; gracefully ignored
-      // on other styles (we wrap in try/catch).
-      if (!map.getLayer(CLIP_LAYER)) {
-        try {
-          map.addLayer({
-            id: CLIP_LAYER,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            type: 'clip' as any,
-            source: CLIP_SOURCE,
-            layout: {
-              'clip-layer-types': ['symbol', 'model'],
-              'clip-layer-scope': ['basemap'],
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            } as any,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any)
-        } catch (err) {
-          if (import.meta.env.DEV) {
-            console.debug('[MapCircleOverlay] clip layer not supported by this style', err)
-          }
-        }
-      }
+      // CLIP_LAYER sits here (before TRANSFORM_LAYER) — added by the
+      // basemap-clip effect below, only on styles where it clips anything.
 
       // HMR guards for the old circle-typed transform layer + the
       // defunct TRANSFORM_ICON_LAYER (was a rotate-hint dot; the new
@@ -823,6 +1253,8 @@ export function MapCircleOverlay({
     }
 
     return () => {
+      gateHold.disarm?.()
+      gateHold.disarm = null
       for (const id of [
         TRANSFORM_ICON_LAYER,
         TRANSFORM_LAYER,
@@ -865,15 +1297,56 @@ export function MapCircleOverlay({
     // styleGen forces re-mount on every basemap swap.
   }, [map, styleLoaded, styleGen])
 
+  // ---- Basemap clip layer ------------------------------------------------
+  // Erases basemap buildings/symbols inside every circle so the 3D
+  // extrusion isn't intersected by Mapbox's own building models. Runs right
+  // after the setup pass above (same commit on style.load), so CLIP_LAYER
+  // lands at its old slot before TRANSFORM_LAYER; the setup cleanup still
+  // removes it ahead of CLIP_SOURCE. See `map-polygon-overlay.tsx`.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    syncBasemapClipLayer(map, {
+      layerId: CLIP_LAYER,
+      sourceId: CLIP_SOURCE,
+      needed: basemapClip,
+      beforeId: TRANSFORM_LAYER,
+      visible: committedVisible,
+      label: 'MapCircleOverlay',
+    })
+  }, [map, styleLoaded, styleGen, basemapClip, committedVisible])
+
   // ---- Push data into the sources ----------------------------------------
+  // FILL_SOURCE gets the focus-faded collection (`fadedFc`, which IS `fc`
+  // while nothing is focused). It has its own effect so a fade change
+  // (focus enter / exit, a blocker change at camera settle) pushes this
+  // source once and leaves the label source alone.
   useEffect(() => {
     if (!map || !styleLoaded) return
     const src = map.getSource(FILL_SOURCE) as
       | (mapboxgl.GeoJSONSource | undefined)
       | undefined
     if (src) {
-      src.setData(fc as GeoJSON.FeatureCollection<GeoJSON.Polygon, CirclePolygonProps>)
+      // A gated layer that matched the previous push but not this one may
+      // still be drawing the previous tiles: hold it visible until they're
+      // replaced (GateHold). Must happen before setData, where the gate
+      // re-counts. A focus fade moves circles between buckets the same
+      // way, so it shows the new bucket now and hides the old one late.
+      const hold = gateHoldRef.current
+      const matched = new Set<string>()
+      for (const [layerId, test] of GATED_FILL_LAYERS) {
+        if (fadedFc.features.some(test)) matched.add(layerId)
+      }
+      for (const layerId of hold.matched) {
+        if (!matched.has(layerId)) hold.held.add(layerId)
+      }
+      hold.matched = matched
+      src.setData(fadedFc)
+      if (hold.held.size > 0) armGateRelease(map, hold)
     }
+  }, [map, styleLoaded, styleGen, fadedFc])
+
+  useEffect(() => {
+    if (!map || !styleLoaded) return
     const labelSrc = map.getSource(LABEL_SOURCE) as
       | (mapboxgl.GeoJSONSource | undefined)
       | undefined
@@ -882,15 +1355,25 @@ export function MapCircleOverlay({
         (labelPointData ?? { type: 'FeatureCollection', features: [] }) as GeoJSON.FeatureCollection
       )
     }
-    const clipSrc = map.getSource(CLIP_SOURCE) as
-      | (mapboxgl.GeoJSONSource | undefined)
-      | undefined
-    if (clipSrc) {
-      clipSrc.setData(
-        clipData ?? { type: 'FeatureCollection', features: [] }
-      )
-    }
-  }, [map, styleLoaded, styleGen, fc, labelPointData, clipData])
+  }, [map, styleLoaded, styleGen, labelPointData])
+
+  // Clip footprints get their own push, skipped when the source already
+  // holds the same rings (`fc` is rebuilt on every style-rule resolve) or
+  // while CLIP_LAYER is absent. See the matching note in
+  // `map-polygon-overlay.tsx`.
+  const lastClipPushRef = useRef<{
+    source: GeoJSONSource
+    data: GeoJSON.FeatureCollection<GeoJSON.Polygon> | null
+  } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded || !basemapClip) return
+    const clipSrc = map.getSource(CLIP_SOURCE) as GeoJSONSource | undefined
+    if (!clipSrc) return
+    const last = lastClipPushRef.current
+    if (last && last.source === clipSrc && sameClipFootprints(last.data, clipData)) return
+    clipSrc.setData(clipData ?? { type: 'FeatureCollection', features: [] })
+    lastClipPushRef.current = { source: clipSrc, data: clipData }
+  }, [map, styleLoaded, styleGen, basemapClip, clipData])
 
   // ---- Update the selection filter when selection changes ----------------
   // Composed with the transform exclusion: while a transform is active,
@@ -898,9 +1381,8 @@ export function MapCircleOverlay({
   // / SELECTION_TINT_INFLIGHT_LAYER pick them up on the moving circle.
   useEffect(() => {
     if (!map || !styleLoaded) return
-    const ids = selectedCircleIds && selectedCircleIds.size > 0
-      ? [...selectedCircleIds]
-      : [-1]
+    const hasSelection = !!selectedCircleIds && selectedCircleIds.size > 0
+    const ids = hasSelection ? [...selectedCircleIds] : [-1]
     const excludeId = transformState?.circleId
     const idFilter = ['in', ['get', 'circleId'], ['literal', ids]]
     const filter = excludeId != null
@@ -915,11 +1397,41 @@ export function MapCircleOverlay({
     } catch { /* ignore */ }
     try {
       if (map.getLayer(SELECTION_TINT_LAYER)) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        map.setFilter(SELECTION_TINT_LAYER, filter as any)
+        // A tapered circle shows its selection on the mesh instead.
+        map.setFilter(SELECTION_TINT_LAYER, ['all', filter, NOT_MESHED])
       }
     } catch { /* ignore */ }
+    // Empty-layer gate: with nothing selected both filters match no id, so
+    // the layers are hinted empty. A new selection un-hints them right here,
+    // alongside its setFilter, so the highlight can't lag. Clearing a shown
+    // selection defers the hint until FILL_SOURCE has re-tiled the cleared
+    // filter (GateHold) — the moment today's highlight disappears.
+    const hold = gateHoldRef.current
+    if (hasSelection) {
+      hold.selectionShown = true
+      for (const id of GATED_SELECTION_LAYERS) {
+        hold.held.delete(id)
+        hintLayerEmpty(map, id, false)
+      }
+    } else if (hold.selectionShown) {
+      for (const id of GATED_SELECTION_LAYERS) hold.held.add(id)
+      armGateRelease(map, hold)
+    } else {
+      for (const id of GATED_SELECTION_LAYERS) hintSelectionEmpty(map, id)
+    }
   }, [map, styleLoaded, styleGen, selectedCircleIds, transformState])
+
+  // ---- Empty-layer gate × Shadows (see pinnedShadowCaster) --------------
+  // A store subscription rather than a React dep: it runs synchronously
+  // inside `setShadows`, in the same task as the `applyLights` that
+  // flips the light's `cast-shadows`, so no frame mixes the two states.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const hold = gateHoldRef.current
+    return useGraphicsSettings.subscribe((state, prev) => {
+      if (state.shadows !== prev.shadows) reapplyShadowPins(map, hold)
+    })
+  }, [map, styleLoaded])
 
   // ---- Exclusion filter (committed base layers) ------------------------
   // While a transform is active, hide the moving circle from the
@@ -966,8 +1478,12 @@ export function MapCircleOverlay({
         map.setFilter(layerId, filter)
       } catch { /* ignore */ }
     }
-    // LINE_LAYER + LABEL_LAYER + LABEL_LAYER_FLAT — no default filter.
-    for (const layerId of [LINE_LAYER, LABEL_LAYER, LABEL_LAYER_FLAT]) {
+    // LINE_LAYER skips meshed circles (their roof outline would float).
+    try {
+      if (map.getLayer(LINE_LAYER)) map.setFilter(LINE_LAYER, notMe ? ['all', notMe, NOT_MESHED] : NOT_MESHED)
+    } catch { /* ignore */ }
+    // LABEL_LAYER + LABEL_LAYER_FLAT — no default filter.
+    for (const layerId of [LABEL_LAYER, LABEL_LAYER_FLAT]) {
       try {
         if (map.getLayer(layerId)) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any

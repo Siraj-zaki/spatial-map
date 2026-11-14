@@ -33,7 +33,7 @@ type CreateDataSourceParams struct {
 
 // Column order below matches the auto-generated `db.DataSource` model
 // struct so sqlc reuses that type for every RETURNING/SELECT (see the
-// AGENTS.md note on column ordering).
+// CLAUDE.md note on column ordering).
 func (q *Queries) CreateDataSource(ctx context.Context, arg CreateDataSourceParams) (DataSource, error) {
 	row := q.db.QueryRow(ctx, createDataSource,
 		arg.TenantID,

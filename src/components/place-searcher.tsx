@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Search, MapPin, X, Loader2 } from 'lucide-react'
+import { Search, MapPin, X, Loader2, Crosshair } from 'lucide-react'
+import mapboxgl from 'mapbox-gl'
 import type { Map as MapboxMap } from 'mapbox-gl'
 import { cn } from '@/lib/utils'
-
-import { MAPBOX_TOKEN } from '@/config/runtime'
+import {
+  formatLatLng,
+  newSessionToken,
+  parseCoordinates,
+  resolvePlace,
+  searchPlaces,
+  type PlaceResult,
+} from '@/lib/place-search'
 
 interface PlaceSearcherProps {
   map: MapboxMap | null
@@ -19,52 +26,21 @@ interface PlaceSearcherProps {
   className?: string
 }
 
-interface GeocodeFeature {
-  id: string
-  place_name: string
-  text: string
-  center: [number, number]
-  bbox?: [number, number, number, number]
-  /** Short context like "France", "California, United States". */
-  context?: string
-  /** Feature type ("place", "poi", "address", ...). */
-  place_type?: string[]
-}
-
 const DEBOUNCE_MS = 250
+/** Zoom for a typed coordinate / a POI without a bbox — building level. */
+const POINT_ZOOM = 18
 
 /**
- * Mapbox Geocoding v5 — `mapbox.places` returns a FeatureCollection. We only
- * use the top 5 suggestions.
- */
-async function searchPlaces(query: string, language: string, signal: AbortSignal): Promise<GeocodeFeature[]> {
-  if (!MAPBOX_TOKEN || query.trim().length < 2) return []
-  const params = new URLSearchParams({
-    access_token: MAPBOX_TOKEN,
-    autocomplete: 'true',
-    limit: '5',
-    language,
-  })
-  const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?${params.toString()}`
-  const res = await fetch(url, { signal })
-  if (!res.ok) throw new Error(`Geocoding failed: ${res.status}`)
-  const data = (await res.json()) as { features?: GeocodeFeature[] }
-  return data.features ?? []
-}
-
-/**
- * Top-center map place searcher. Renders a search input that calls the
- * Mapbox Geocoding API, shows a dropdown of suggestions, and on click
- * flies the map to the chosen place. Empty state hides the dropdown;
- * loading state shows a spinner; error state shows a small message.
- *
- * The component is unmounted/disabled gracefully when the map hasn't
- * loaded yet.
+ * Map place searcher. Accepts place names (Mapbox Search Box + OpenStreetMap
+ * via Photon, see `lib/place-search.ts`) and typed coordinates / map links.
+ * Choosing a result flies the map there and drops a pin, which stays until
+ * the search is cleared.
  */
 export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) {
   const { t } = useTranslation()
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState<GeocodeFeature[]>([])
+  const [results, setResults] = useState<PlaceResult[]>([])
+  const [usedOsm, setUsedOsm] = useState(false)
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -75,55 +51,162 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
   // Latest request id — older responses are ignored to avoid race conditions
   // when the user types quickly.
   const reqIdRef = useRef(0)
+  // Mapbox Search Box bills per session (suggests … retrieve).
+  const sessionRef = useRef(newSessionToken())
+  const markerRef = useRef<mapboxgl.Marker | null>(null)
+
+  // Typed coordinates are parsed synchronously and listed first.
+  const coords = useMemo(() => parseCoordinates(query), [query])
+  const coordResults = useMemo<PlaceResult[]>(() => {
+    if (coords.kind !== 'ok') return []
+    const out: PlaceResult[] = [
+      {
+        id: 'coords',
+        source: 'coords',
+        title: formatLatLng(coords.lat, coords.lng),
+        subtitle: t('placeSearcher.coordinates'),
+        center: [coords.lng, coords.lat],
+      },
+    ]
+    if (coords.alt) {
+      out.push({
+        id: 'coords-alt',
+        source: 'coords',
+        title: formatLatLng(coords.alt.lat, coords.alt.lng),
+        subtitle: t('placeSearcher.coordinatesSwapped'),
+        center: [coords.alt.lng, coords.alt.lat],
+        swapped: true,
+      })
+    }
+    return out
+  }, [coords, t])
+  const isCoordQuery = coords.kind !== 'none'
+  const allResults = useMemo(() => [...coordResults, ...results], [coordResults, results])
+
+  // Pin ------------------------------------------------------------------------
+  const removeMarker = useCallback(() => {
+    markerRef.current?.remove()
+    markerRef.current = null
+  }, [])
+
+  const dropMarker = useCallback(
+    (lngLat: [number, number], label: string) => {
+      if (!map) return
+      removeMarker()
+      const el = document.createElement('div')
+      el.className = 'pointer-events-none flex flex-col items-center'
+      const chip = document.createElement('div')
+      chip.className =
+        'mb-1 max-w-[220px] truncate rounded-md border bg-card px-2 py-0.5 text-[11px] font-medium text-card-foreground shadow-md'
+      chip.textContent = label
+      const pin = document.createElement('div')
+      pin.className = 'relative flex h-4 w-4 items-center justify-center'
+      const ping = document.createElement('span')
+      ping.className = 'absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60'
+      const dot = document.createElement('span')
+      dot.className = 'relative inline-flex h-4 w-4 rounded-full border-2 border-background bg-primary shadow-md'
+      pin.append(ping, dot)
+      el.append(chip, pin)
+      el.setAttribute('aria-hidden', 'true')
+      // Anchor the dot's centre (8px above the element's bottom) on the spot.
+      markerRef.current = new mapboxgl.Marker({ element: el, anchor: 'bottom', offset: [0, 8] })
+        .setLngLat(lngLat)
+        .addTo(map)
+    },
+    [map, removeMarker]
+  )
+
+  // The map instance can be torn down (floor switch, unmount) — drop the pin
+  // with it.
+  useEffect(() => removeMarker, [map, removeMarker])
 
   // Fly to a chosen place ------------------------------------------------------
-  const selectPlace = useCallback(
-    (feature: GeocodeFeature) => {
-      if (!map) return
-      const [lng, lat] = feature.center
-      if (feature.bbox) {
+  const goTo = useCallback(
+    (r: PlaceResult) => {
+      if (!map || !r.center) return
+      const [lng, lat] = r.center
+      const isPoint =
+        !r.bbox || (Math.abs(r.bbox[2] - r.bbox[0]) < 1e-6 && Math.abs(r.bbox[3] - r.bbox[1]) < 1e-6)
+      if (isPoint) {
+        map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), POINT_ZOOM), duration: 1200, essential: true })
+      } else {
         map.fitBounds(
           [
-            [feature.bbox[0], feature.bbox[1]],
-            [feature.bbox[2], feature.bbox[3]],
+            [r.bbox![0], r.bbox![1]],
+            [r.bbox![2], r.bbox![3]],
           ],
-          { padding: 80, duration: 900, maxZoom: 16 }
+          { padding: 80, duration: 1200, maxZoom: POINT_ZOOM }
         )
-      } else {
-        map.flyTo({ center: [lng, lat], zoom: 13, duration: 900, essential: true })
       }
-      setQuery(feature.text)
-      setOpen(false)
+      dropMarker([lng, lat], r.title)
     },
-    [map]
+    [map, dropMarker]
+  )
+
+  const selectPlace = useCallback(
+    (r: PlaceResult) => {
+      setOpen(false)
+      if (r.source === 'coords') {
+        // Keep the typed coordinates in the box (normalised) so they can be
+        // copied or tweaked.
+        setQuery(r.title)
+        goTo(r)
+        return
+      }
+      setQuery(r.title)
+      if (r.center) {
+        goTo(r)
+        return
+      }
+      const token = sessionRef.current
+      sessionRef.current = newSessionToken()
+      setLoading(true)
+      resolvePlace(r, token)
+        .then((resolved) => {
+          setLoading(false)
+          goTo(resolved)
+        })
+        .catch(() => {
+          setLoading(false)
+          setError(t('placeSearcher.error'))
+          setOpen(true)
+        })
+    },
+    [goTo, t]
   )
 
   // Debounced search ------------------------------------------------------------
   useEffect(() => {
     const trimmed = query.trim()
-    // Too short — clear results by scheduling a no-op fetch that returns
-    // `[]` and resolves synchronously (the geocoder short-circuits inside
-    // `searchPlaces`). We can't call `setState` synchronously inside the
-    // effect body (would cause cascading renders), so we let the .then()
-    // branch handle the reset.
     const controller = new AbortController()
     const myReqId = ++reqIdRef.current
+    // Coordinates (or coordinate-looking text) never hit the geocoders.
+    const willSearch = trimmed.length >= 2 && !isCoordQuery
     const handle = setTimeout(() => {
-      const willSearch = trimmed.length >= 2
-      // setLoading is also a setState in effect, but it's setting a value
-      // derived from the current props (we only set it to true if we'll
-      // actually search), so it's safe and the linter's "set-state-in-effect"
-      // rule allows derived state updates.
-      if (willSearch) {
+      if (!willSearch) {
+        setResults([])
+        setUsedOsm(false)
+        setLoading(false)
         setError(null)
-        setLoading(true)
+        return
       }
-      void searchPlaces(trimmed, language, controller.signal)
-        .then((features) => {
+      setError(null)
+      setLoading(true)
+      const center = map?.getCenter()
+      void searchPlaces(trimmed, {
+        language,
+        proximity: center ? [center.lng, center.lat] : undefined,
+        zoom: map?.getZoom(),
+        sessionToken: sessionRef.current,
+        signal: controller.signal,
+      })
+        .then((outcome) => {
           if (myReqId !== reqIdRef.current) return
-          setResults(features)
+          setResults(outcome.results)
+          setUsedOsm(outcome.usedOsm)
           setHighlight(0)
           setLoading(false)
+          if (outcome.failed) setError(t('placeSearcher.error'))
         })
         .catch((err) => {
           if (myReqId !== reqIdRef.current) return
@@ -132,12 +215,12 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
           setLoading(false)
           setResults([])
         })
-    }, DEBOUNCE_MS)
+    }, willSearch ? DEBOUNCE_MS : 0)
     return () => {
       clearTimeout(handle)
       controller.abort()
     }
-  }, [query, language, t])
+  }, [query, language, t, map, isCoordQuery])
 
   // Click outside to close -----------------------------------------------------
   useEffect(() => {
@@ -154,25 +237,25 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
   // Keyboard navigation (arrow up/down + enter) --------------------------------
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (!open || results.length === 0) {
-        if (e.key === 'Escape') setOpen(false)
+      if (e.key === 'Escape') {
+        setOpen(false)
         return
       }
+      if (allResults.length === 0) return
       if (e.key === 'ArrowDown') {
         e.preventDefault()
-        setHighlight((h) => Math.min(h + 1, results.length - 1))
+        setOpen(true)
+        setHighlight((h) => Math.min(h + 1, allResults.length - 1))
       } else if (e.key === 'ArrowUp') {
         e.preventDefault()
         setHighlight((h) => Math.max(h - 1, 0))
       } else if (e.key === 'Enter') {
         e.preventDefault()
-        const r = results[highlight]
+        const r = allResults[Math.min(highlight, allResults.length - 1)]
         if (r) selectPlace(r)
-      } else if (e.key === 'Escape') {
-        setOpen(false)
       }
     },
-    [open, results, highlight, selectPlace]
+    [allResults, highlight, selectPlace]
   )
 
   const clear = useCallback(() => {
@@ -180,10 +263,13 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
     setResults([])
     setError(null)
     setOpen(false)
+    removeMarker()
     inputRef.current?.focus()
-  }, [])
+  }, [removeMarker])
 
-  const showDropdown = open && (loading || error || results.length > 0 || query.trim().length >= 2)
+  const trimmedLen = query.trim().length
+  const showDropdown =
+    open && (loading || error || allResults.length > 0 || coords.kind === 'outOfRange' || trimmedLen >= 2)
 
   return (
     <div
@@ -199,13 +285,15 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
             value={query}
             onChange={(e) => {
               setQuery(e.target.value)
+              setHighlight(0)
               setOpen(true)
             }}
             onFocus={() => setOpen(true)}
             onKeyDown={handleKeyDown}
             placeholder={t('placeSearcher.placeholder')}
             aria-label={t('placeSearcher.placeholder')}
-            className="flex-1 bg-transparent outline-none text-sm placeholder:text-muted-foreground"
+            title={t('placeSearcher.hint')}
+            className="flex-1 min-w-0 bg-transparent outline-none text-sm placeholder:text-muted-foreground"
           />
           {loading && <Loader2 className="w-4 h-4 text-muted-foreground animate-spin" />}
           {query && !loading && (
@@ -226,38 +314,52 @@ export function PlaceSearcher({ map, language, className }: PlaceSearcherProps) 
             className="absolute top-full left-0 right-0 mt-1.5 bg-popover border rounded-lg shadow-lg overflow-hidden"
             role="listbox"
           >
+            {coords.kind === 'outOfRange' && (
+              <div className="px-3 py-2 text-xs text-destructive" role="alert">
+                {t('placeSearcher.outOfRange')}
+              </div>
+            )}
             {error && (
               <div className="px-3 py-2 text-xs text-destructive" role="alert">
                 {error}
               </div>
             )}
-            {!error && !loading && results.length === 0 && query.trim().length >= 2 && (
+            {!error && !loading && !isCoordQuery && results.length === 0 && trimmedLen >= 2 && (
               <div className="px-3 py-2 text-xs text-muted-foreground">
                 {t('placeSearcher.noResults')}
+                <div className="mt-0.5">{t('placeSearcher.hint')}</div>
               </div>
             )}
-            {results.map((r, i) => (
-              <button
-                key={r.id}
-                type="button"
-                role="option"
-                aria-selected={i === highlight}
-                onClick={() => selectPlace(r)}
-                onMouseEnter={() => setHighlight(i)}
-                className={cn(
-                  'w-full flex items-start gap-2 px-3 py-2 text-start text-sm',
-                  i === highlight ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
-                )}
-              >
-                <MapPin className="w-3.5 h-3.5 mt-0.5 text-muted-foreground shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium">{r.text}</div>
-                  {r.context && (
-                    <div className="truncate text-xs text-muted-foreground">{r.place_name}</div>
+            {allResults.map((r, i) => {
+              const Icon = r.source === 'coords' ? Crosshair : MapPin
+              return (
+                <button
+                  key={r.id}
+                  type="button"
+                  role="option"
+                  aria-selected={i === highlight}
+                  onClick={() => selectPlace(r)}
+                  onMouseEnter={() => setHighlight(i)}
+                  className={cn(
+                    'w-full flex items-start gap-2 px-3 py-2 text-start text-sm',
+                    i === highlight ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'
                   )}
-                </div>
-              </button>
-            ))}
+                >
+                  <Icon className="w-3.5 h-3.5 mt-0.5 text-muted-foreground shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className={cn('truncate font-medium', r.source === 'coords' && 'font-mono text-xs leading-5')}>
+                      {r.title}
+                    </div>
+                    {r.subtitle && <div className="truncate text-xs text-muted-foreground">{r.subtitle}</div>}
+                  </div>
+                </button>
+              )
+            })}
+            {usedOsm && results.length > 0 && (
+              <div className="border-t px-3 py-1 text-[10px] text-muted-foreground">
+                {t('placeSearcher.attribution')}
+              </div>
+            )}
           </div>
         )}
       </div>

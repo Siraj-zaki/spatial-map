@@ -130,8 +130,9 @@ func TenantMiddleware(q *db.Queries) func(http.Handler) http.Handler {
 				Error(w, http.StatusBadRequest, "invalid X-Tenant-Id header")
 				return
 			}
-			if userID := UserID(r.Context()); userID != 0 {
-				_, err := q.GetUserTenantMembership(r.Context(), db.GetUserTenantMembershipParams{
+			ctx := r.Context()
+			if userID := UserID(ctx); userID != 0 {
+				m, err := q.GetUserTenantMembership(ctx, db.GetUserTenantMembershipParams{
 					UserID:   userID,
 					TenantID: tenantID,
 				})
@@ -143,8 +144,10 @@ func TenantMiddleware(q *db.Queries) func(http.Handler) http.Handler {
 					InternalError(w, r, err)
 					return
 				}
+				// The member's role decides their permissions (permissions.go).
+				ctx = context.WithValue(ctx, tenantRoleKey{}, m.Role)
 			}
-			ctx := context.WithValue(r.Context(), tenantKey{}, tenantID)
+			ctx = context.WithValue(ctx, tenantKey{}, tenantID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

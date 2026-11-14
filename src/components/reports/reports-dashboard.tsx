@@ -32,6 +32,7 @@ import {
   Globe2,
   LayoutGrid,
   List,
+  Map as MapIcon,
   Loader2,
   MoreHorizontal,
   PencilLine,
@@ -88,6 +89,8 @@ import {
   type ReportSpec,
 } from '@/lib/reports-client'
 import { apiDb } from '@/lib/api-db'
+import type { MasterReportText } from '@/lib/reports/master-report'
+import { MasterReportDialog } from '@/components/reports/master-report-dialog'
 import { useSpatialStore } from '@/lib/spatial-store'
 import type { Zone } from '@/lib/db'
 
@@ -127,7 +130,7 @@ export function ReportsDashboard() {
   const { t, i18n } = useTranslation()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('reports.create')
 
   const [reports, setReports] = useState<Report[]>([])
   const [loading, setLoading] = useState(true)
@@ -357,11 +360,44 @@ export function ReportsDashboard() {
 
   const [importOpen, setImportOpen] = useState(false)
 
+  // Master report: the picked facility's live full-map report, set up (or
+  // updated) in a dialog. `?master=1` opens it (the report's own menu links here).
+  const [masterOpen, setMasterOpen] = useState(() => new URLSearchParams(window.location.search).get('master') === '1')
+  const masterFacility = selectedFacility !== null ? allZones.find((z) => z.id === selectedFacility) : undefined
+  const masterText: MasterReportText = {
+    name: t('reports.master.name', { facility: masterFacility?.name ?? '', defaultValue: '{{facility}} · Master report' }),
+    description: t('reports.master.description', { defaultValue: 'Everything in one live view: the facility\'s data layers on the map with their history player, counts, status breakdowns and filters. Pick an item to follow it.' }),
+    mapTitle: t('reports.master.mapTitle', { defaultValue: 'Live map' }),
+    rowsLabel: t('reports.master.rows', { defaultValue: 'Rows' }),
+    byStatus: (layer, field) => t('reports.master.byStatus', { layer, field, defaultValue: '{{layer}} by {{field}}' }),
+  }
+  const closeMaster = () => {
+    setMasterOpen(false)
+    const url = new URL(window.location.href)
+    if (url.searchParams.has('master')) {
+      url.searchParams.delete('master')
+      window.history.replaceState(window.history.state, '', url)
+    }
+  }
+
   const createButton = canManage ? (
     <>
       <Button variant="outline" onClick={() => setImportOpen(true)}>
         <Upload className="h-4 w-4" />
         {t('reports.importJson', { defaultValue: 'Import JSON' })}
+      </Button>
+      <Button
+        variant="outline"
+        onClick={() => setMasterOpen(true)}
+        disabled={!masterFacility}
+        title={
+          masterFacility
+            ? t('reports.master.hint', { facility: masterFacility.name, defaultValue: 'Set up the live master report for {{facility}}' })
+            : t('reports.master.pickFacility', { defaultValue: 'Pick a facility first' })
+        }
+      >
+        <MapIcon className="h-4 w-4" />
+        {t('reports.master.button', { defaultValue: 'Master report' })}
       </Button>
       <Button onClick={() => navigate(solution ? `/reports/new?solution=${solution.id}` : '/reports/new')}>
         <Plus className="h-4 w-4" />
@@ -657,6 +693,19 @@ export function ReportsDashboard() {
           navigate(`/reports/${r.id}`)
         }}
       />
+      {masterOpen && canManage && masterFacility?.id !== undefined && (
+        <MasterReportDialog
+          open
+          onOpenChange={(o) => !o && closeMaster()}
+          zoneId={masterFacility.id}
+          facilityName={masterFacility.name}
+          text={masterText}
+          onSaved={(r) => {
+            toast.success(t('reports.master.saved', { name: r.name, defaultValue: '{{name}} saved' }))
+            navigate(`/reports/${r.id}`)
+          }}
+        />
+      )}
     </PageContainer>
   )
 }

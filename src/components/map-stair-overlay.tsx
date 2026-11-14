@@ -8,8 +8,14 @@
  */
 
 import type { Feature, FeatureCollection, Point, Polygon } from 'geojson'
-import type { GeoJSONSource, Map as MapboxMapInstance, MapMouseEvent } from 'mapbox-gl'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  ExpressionSpecification,
+  FillExtrusionLayerSpecification,
+  GeoJSONSource,
+  Map as MapboxMapInstance,
+  MapMouseEvent,
+} from 'mapbox-gl'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { LiftMeshLayer, type LiftMeshData } from '@/lib/lift-mesh-layer'
 import {
   buildStairFeatures,
@@ -31,6 +37,18 @@ import {
   subscribeThemeChanges,
 } from '@/lib/map-transform-handles'
 import { isLiftType, type StairShape } from '@/lib/shapes'
+import type { LayerFeaturePredicate } from '@/lib/empty-layer-gate'
+import { hasMapLayer, rootLayerOrder } from '@/lib/data-link/dl-layer-stack'
+import { fadeMeshData, patchFeatureCollection } from '@/lib/focus/focus-fade'
+import {
+  FOCUS_FACTOR,
+  blockerIdsOf,
+  focusTier,
+  useFocusBlockers,
+  useFocusScene,
+  type FocusTier,
+} from '@/lib/focus/focus-scene'
+import { GatedLayerHold, stableDerivedCollection, type GatedLayerSpec } from '@/components/map-line-overlay'
 
 interface MapStairOverlayProps {
   map: MapboxMapInstance | null
@@ -68,6 +86,16 @@ interface MapStairOverlayProps {
 
 const STEP_SOURCE = 'stair-step-source'
 const STEP_LAYER = 'stair-step-layer'
+// Focus mode (src/lib/focus) tier twins of STEP_LAYER. `fill-extrusion-
+// opacity` is a per-layer constant and STEP_LAYER has no opacity buckets,
+// so a faded stair's solid parts are stamped `focusTier: 'near' | 'ghost'`
+// and drawn by these instead (STEP_LAYER skips any stamped feature). Same
+// spec at FOCUS_FACTOR's opacity, shadows off. Nothing is stamped while
+// nothing is focused, so the gate keeps both hidden. overlay-hit-priority
+// maps both ids to 'stair' (a faded stair keeps its clicks over areas);
+// this overlay's own HIT_LAYERS has them too.
+const STEP_NEAR_LAYER = 'stair-step-near-layer'
+const STEP_GHOST_LAYER = 'stair-step-ghost-layer'
 const STEP_BORDER_LAYER = 'stair-step-border-layer'
 const SELECTION_LAYER = 'stair-selection-layer'
 const PREVIEW_SOURCE = 'stair-preview-source'
@@ -97,6 +125,19 @@ const MOTION_FRAME_MS = 50
 // shafts) — custom mesh layers, since extrusions can only be vertical boxes.
 const MESH_LAYER = 'stair-lift-mesh-layer'
 const GLASS_MESH_LAYER = 'stair-lift-glass-mesh-layer'
+// Focus mode: solid meshes of faded stairs, alpha × FOCUS_FACTOR. Solid
+// shading, no depth write (a faded solid must not hide what's behind it).
+// Inserted before GLASS_MESH_LAYER so lift glass stays the last pane drawn.
+// Empty, and never written, until something is focused.
+const FADED_MESH_LAYER = 'stair-mesh-faded-layer'
+const NO_MESHES: LiftMeshData[] = []
+
+/** Stair id of a mesh (`${stairId}:solid` / `${stairId}:glass`, stairMeshes keys). */
+function meshStairId(key: string): number | undefined {
+  const i = key.indexOf(':')
+  const id = i > 0 ? Number(key.slice(0, i)) : NaN
+  return Number.isFinite(id) ? id : undefined
+}
 
 /** Meshes per stair row, rebuilt only when the row or floor heights change. */
 const meshCache = new WeakMap<StairShape, { fe: ReadonlyMap<number, number> | undefined; meshes: ReturnType<typeof stairMeshes> }>()
@@ -114,8 +155,8 @@ function cachedStairMeshes(s: StairShape, fe: ReadonlyMap<number, number> | unde
 // and hovers land on.
 const HIT_FILL_LAYER = 'stair-lift-hit-layer'
 
-/** Layers a click or hover can land on. */
-const HIT_LAYERS = [STEP_LAYER, GLASS_LAYER, MOTION_LAYER, ICON_LAYER, HIT_FILL_LAYER]
+/** Layers a click or hover can land on (a faded escalator's steps are on the tier layers). */
+const HIT_LAYERS = [STEP_LAYER, STEP_NEAR_LAYER, STEP_GHOST_LAYER, GLASS_LAYER, MOTION_LAYER, ICON_LAYER, HIT_FILL_LAYER]
 
 const IS_HIT = ['==', ['get', 'hit'], true]
 const NOT_HIT = ['!=', ['get', 'hit'], true]
@@ -123,9 +164,143 @@ const IS_GLASS = ['all', ['==', ['get', 'glass'], true], NOT_HIT]
 const NOT_GLASS = ['all', ['!=', ['get', 'glass'], true], NOT_HIT]
 const NO_SHAPE_FILTER = ['!=', ['get', 'shapeId'], -1]
 
+/** A focus tier that moves a stair's solid parts to a tier layer. */
+type StepTier = 'near' | 'ghost'
+const FOCUS_TIER_PROP = 'focusTier'
+// Focus mode: the fade factor of a faded stair, on every feature of it, so
+// STEP_BORDER_LAYER's outlines fade with the steps. Absent = 1.
+const FOCUS_FADE_PROP = 'focusFade'
+/** STEP_BORDER_LAYER's `line-opacity` as installed, and whenever no stair is faded. */
+const STEP_BORDER_OPACITY = 0.9
+/**
+ * STEP_BORDER_LAYER's `line-opacity` while at least one stair is faded:
+ * 0.9 × the stair's `focusFade` (absent = 1). Swapped in only then, so
+ * with focus off the layer keeps the constant it had before focus mode.
+ */
+const STEP_BORDER_OPACITY_FADED: ExpressionSpecification = ['*', STEP_BORDER_OPACITY, ['coalesce', ['get', FOCUS_FADE_PROP], 1]]
+/** STEP_LAYER's tier clause: no tier stamped. */
+const NO_TIER = ['!', ['has', FOCUS_TIER_PROP]]
+const tierIs = (tier: StepTier) => ['==', ['get', FOCUS_TIER_PROP], tier]
+const STEP_TIER_LAYERS: ReadonlyArray<readonly [string, StepTier]> = [
+  [STEP_NEAR_LAYER, 'near'],
+  [STEP_GHOST_LAYER, 'ghost'],
+]
+/** A faded stair's tier, or null (focus / normal: drawn as before). */
+function stepTierOf(tier: FocusTier): StepTier | null {
+  return tier === 'near' || tier === 'ghost' ? tier : null
+}
+
+/** Step features as this overlay pushes them (focus stamps included). */
+type StepProps = StairFeatureProps & { focusTier?: StepTier; focusFade?: number }
+
+// ---- Empty-layer gate predicates (lib/empty-layer-gate.ts) ----------------
+// JS transcriptions of the filters above, so the gate can hide a layer whose
+// filter passes nothing. On most facilities that is every one of the solid /
+// glass split layers: stairs and elevators are drawn as meshes, and their
+// extruded features all carry `hit: true` (invisible click targets), which
+// NOT_GLASS and IS_GLASS both exclude; only escalators emit non-hit parts
+// (comb plates + static treads), and no generator stamps `glass: true` any
+// more (lift glass is mesh). Registered right after every `addLayer` /
+// `setFilter` of the layer, with the same inputs. Mapbox `get` reads a
+// missing property as null and `==` / `!=` / `in` are strict, so `?.` +
+// `===` match it value for value.
+type StairSplit = 'solid' | 'glass' | 'hit'
+type GateProps = Parameters<LayerFeaturePredicate>[0]['properties']
+const SPLIT_TESTS: Record<StairSplit, (p: GateProps) => boolean> = {
+  // NOT_GLASS: ['all', ['!=', ['get', 'glass'], true], NOT_HIT]
+  solid: (p) => p?.glass !== true && p?.hit !== true,
+  // IS_GLASS: ['all', ['==', ['get', 'glass'], true], NOT_HIT]
+  glass: (p) => p?.glass === true && p?.hit !== true,
+  // IS_HIT: ['==', ['get', 'hit'], true]
+  hit: (p) => p?.hit === true,
+}
+
+/**
+ * The exclusion effect's `shapeFilter`: `['!=', ['get', 'shapeId'], excludeId]`
+ * while a transform is active, else NO_SHAPE_FILTER (`!= -1`).
+ */
+export function stairShapeFilterPredicate(excludeId: number | null | undefined): LayerFeaturePredicate {
+  const blocked = excludeId != null ? excludeId : -1
+  return (f) => f.properties?.shapeId !== blocked
+}
+
+/**
+ * STEP_LAYER (`'solid'`, NOT_GLASS), GLASS_LAYER (IS_GLASS) or HIT_FILL_LAYER
+ * (IS_HIT). Without `shapeFilter` it mirrors the addLayer filter; with it,
+ * the exclusion effect's `['all', <split>, shapeFilter]`.
+ */
+export function stairSplitPredicate(split: StairSplit, shapeFilter?: LayerFeaturePredicate): LayerFeaturePredicate {
+  const test = SPLIT_TESTS[split]
+  return shapeFilter ? (f) => test(f.properties) && shapeFilter(f) : (f) => test(f.properties)
+}
+
+/**
+ * STEP_LAYER (`tier` null: `['all', NOT_GLASS, ['!', ['has', 'focusTier']]]`)
+ * or a focus tier layer (`['all', NOT_GLASS, ['==', ['get', 'focusTier'], tier]]`);
+ * with `shapeFilter`, the exclusion effect's `['all', …, shapeFilter]`.
+ * `has` is true for a present-but-null property, so the STEP_LAYER mirror
+ * (`== null`) is a superset there, never a subset.
+ */
+export function stairStepPredicate(tier: StepTier | null, shapeFilter?: LayerFeaturePredicate): LayerFeaturePredicate {
+  const solid = SPLIT_TESTS.solid
+  const tierTest: (p: GateProps) => boolean =
+    tier === null ? (p) => p?.[FOCUS_TIER_PROP] == null : (p) => p?.[FOCUS_TIER_PROP] === tier
+  return shapeFilter
+    ? (f) => solid(f.properties) && tierTest(f.properties) && shapeFilter(f)
+    : (f) => solid(f.properties) && tierTest(f.properties)
+}
+
+/**
+ * SELECTION_LAYER as the selection effect filters it: `== -1` with nothing
+ * selected, `== id` for one, `in [ids]` for several (also its addLayer
+ * filter when `ids` is empty).
+ */
+export function stairSelectionPredicate(ids: ReadonlyArray<number>): LayerFeaturePredicate {
+  if (ids.length === 0) return (f) => f.properties?.shapeId === -1
+  if (ids.length === 1) {
+    const only = ids[0]
+    return (f) => f.properties?.shapeId === only
+  }
+  const selected = new Set<unknown>(ids)
+  return (f) => selected.has(f.properties?.shapeId)
+}
+
+/**
+ * The layers gated through GatedLayerHold (map-line-overlay.tsx), which
+ * holds an emptied layer until STEP_SOURCE re-tiles and keeps the shadow
+ * casters on the source-count rule while shadows are on. `castsShadows`
+ * mirrors each layer's paint: STEP_LAYER sets it, HIT_FILL_LAYER leaves the
+ * spec default (true), GLASS_LAYER and the focus tier layers turn it off,
+ * SELECTION_LAYER is a line. The tier layers are therefore never pinned
+ * for shadows: hidden while nothing is focused, shown the moment a stamp
+ * lands (and STEP_LAYER held until STEP_SOURCE re-tiles), hidden late on exit.
+ */
+const STAIR_GATED_LAYERS: ReadonlyMap<string, GatedLayerSpec> = new Map<string, GatedLayerSpec>([
+  [STEP_LAYER, { sourceId: STEP_SOURCE, castsShadows: true }],
+  [STEP_NEAR_LAYER, { sourceId: STEP_SOURCE, castsShadows: false }],
+  [STEP_GHOST_LAYER, { sourceId: STEP_SOURCE, castsShadows: false }],
+  [GLASS_LAYER, { sourceId: STEP_SOURCE, castsShadows: false }],
+  [HIT_FILL_LAYER, { sourceId: STEP_SOURCE, castsShadows: true }],
+  [SELECTION_LAYER, { sourceId: STEP_SOURCE, castsShadows: false }],
+])
+
 const EMPTY_FC: FeatureCollection<Polygon, StairFeatureProps> = {
   type: 'FeatureCollection',
   features: [],
+}
+
+/** STEP_LAYER's paint at `opacity` — the focus tier twins use it with shadows off. */
+function stepPaint(opacity: number, castShadows: boolean): FillExtrusionLayerSpecification['paint'] {
+  return {
+    'fill-extrusion-color': ['get', 'color'],
+    'fill-extrusion-base': ['to-number', ['get', 'base_height']],
+    'fill-extrusion-height': ['to-number', ['get', 'height']],
+    'fill-extrusion-opacity': opacity,
+    'fill-extrusion-vertical-gradient': true,
+    'fill-extrusion-cast-shadows': castShadows,
+    'fill-extrusion-ambient-occlusion-intensity': 0.35,
+    'fill-extrusion-ambient-occlusion-radius': 2.5,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +419,32 @@ export function MapStairOverlay({
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches,
     [],
   )
-  const animatedStairs = useMemo(() => {
+
+  // ---- Focus mode (src/lib/focus) ----------------------------------------
+  // While an item is focused, only two kinds of stair / lift fade: the ones
+  // between the camera and the item (blockers, tier 'ghost') and the ones
+  // right next to it (the NEAR column, tier 'near'). The focused stair
+  // itself is tier 'focus' and every other one 'normal' — both drawn
+  // exactly as before. Solid step parts of a faded stair move to the tier
+  // layers (stamped `focusTier`), meshes to FADED_MESH_LAYER (alpha ×
+  // factor), and every feature of it carries `focusFade` for the outlines.
+  // Glass and the HIT_FILL click prisms keep their layers. Lift icons are
+  // left as they are. With nothing focused `stairTierOf` is null and every
+  // memo below hands back its input, so no push re-runs.
+  const focusScene = useFocusScene()
+  const focusBlockers = useFocusBlockers()
+  // Same Set while the stair blockers are unchanged: other kinds' blocker
+  // changes don't re-push STEP_SOURCE.
+  const stairBlockers = blockerIdsOf(focusBlockers, 'stairs')
+  /** Focus tier of a stair id, or null while nothing is focused. */
+  const stairTierOf = useMemo(() => {
+    if (!focusScene.active) return null
+    return (id: number | undefined): FocusTier => focusTier(focusScene, focusBlockers, 'stairs', id)
+    // `focusBlockers` is read only through its stair set (`stairBlockers`).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusScene, stairBlockers])
+
+  const animatedBase = useMemo(() => {
     if (reducedMotion || !stairs || !committedVisible) return []
     return stairs.filter(
       (s) =>
@@ -255,6 +455,24 @@ export function MapStairOverlay({
         s.config.status !== 'out-of-service',
     )
   }, [stairs, committedVisible, reducedMotion])
+  // Focus mode: a faded escalator stands still. Its treads go back to the
+  // static STEP_SOURCE, where they fade with the rest of it (MOTION_SOURCE
+  // is rewritten ~20×/s and has no tier layers). A string key, so a focus
+  // change that pauses the same escalators keeps `animatedStairs` (and the
+  // step features) as they were. '' while nothing is focused.
+  const pausedKey = useMemo(() => {
+    if (!stairTierOf) return ''
+    const ids: number[] = []
+    for (const s of animatedBase) {
+      if (stepTierOf(stairTierOf(s.id)) !== null) ids.push(s.id as number)
+    }
+    return ids.join(',')
+  }, [animatedBase, stairTierOf])
+  const animatedStairs = useMemo(() => {
+    if (pausedKey === '') return animatedBase
+    const paused = new Set(pausedKey.split(',').map(Number))
+    return animatedBase.filter((s) => !paused.has(s.id as number))
+  }, [animatedBase, pausedKey])
   const animatedIds = useMemo(() => new Set(animatedStairs.map((s) => s.id)), [animatedStairs])
 
   // Build the combined FeatureCollection — every committed stair plus
@@ -276,6 +494,44 @@ export function MapStairOverlay({
     }
     return { type: 'FeatureCollection', features }
   }, [stairs, committedVisible, floorElevations, animatedIds])
+
+  // Focus mode: stamp a faded stair's features (copy-on-write, cached per
+  // feature and tag). Solid parts get `focusTier` (→ a tier layer) and
+  // `focusFade`; glass / click prisms only `focusFade` (outline). The same
+  // collection object as long as the stamps are the same.
+  const tieredStepFeatures = useMemo<FeatureCollection<Polygon, StepProps>>(() => {
+    if (!stairTierOf) return stepFeatures
+    const base = stepFeatures as FeatureCollection<Polygon, StepProps>
+    return stableDerivedCollection(
+      base,
+      patchFeatureCollection(
+        base,
+        (f) => {
+          const tier = stepTierOf(stairTierOf(f.properties.shapeId))
+          if (tier === null) return null
+          // SPLIT_TESTS.solid: what STEP_LAYER / the tier layers draw.
+          const solid = f.properties.glass !== true && f.properties.hit !== true
+          // Namespaced: the patch cache keys on (feature, tag) only.
+          return solid ? tier : `outline:${tier}`
+        },
+        (props, tag) => {
+          if (tag === 'near' || tag === 'ghost') {
+            return { ...props, [FOCUS_TIER_PROP]: tag, [FOCUS_FADE_PROP]: FOCUS_FACTOR[tag] }
+          }
+          return { ...props, [FOCUS_FADE_PROP]: FOCUS_FACTOR[tag === 'outline:ghost' ? 'ghost' : 'near'] }
+        },
+      ),
+    )
+  }, [stepFeatures, stairTierOf])
+  // Whether some pushed step feature carries `focusFade` (drives the
+  // STEP_BORDER_LAYER opacity swap). The stamped collection is a different
+  // object only when something was stamped; the scan confirms it.
+  const anyStairFaded = useMemo(
+    () =>
+      tieredStepFeatures !== stepFeatures &&
+      tieredStepFeatures.features.some((f) => f.properties[FOCUS_FADE_PROP] !== undefined),
+    [tieredStepFeatures, stepFeatures],
+  )
 
   const iconFeatures = useMemo<FeatureCollection<Point, LiftIconProps>>(() => {
     const features: Feature<Point, LiftIconProps>[] = []
@@ -302,17 +558,51 @@ export function MapStairOverlay({
     }
     return { solid, glass }
   }, [stairs, committedVisible, floorElevations])
-  const meshLayersRef = useRef<{ solid: LiftMeshLayer; glass: LiftMeshLayer } | null>(null)
+  // Focus mode: a faded stair's solid mesh goes to FADED_MESH_LAYER and its
+  // glass is faded in place (alpha × factor; fadeMeshData caches per mesh
+  // and factor, and keeps the key, so only those stairs re-upload). With
+  // nothing faded, `meshData`'s own arrays and no faded meshes.
+  const routedMeshes = useMemo(() => {
+    if (!stairTierOf) return { solid: meshData.solid, glass: meshData.glass, faded: NO_MESHES }
+    const solid: LiftMeshData[] = []
+    const faded: LiftMeshData[] = []
+    for (const m of meshData.solid) {
+      const factor = FOCUS_FACTOR[stairTierOf(meshStairId(m.key))]
+      if (factor < 1) faded.push(fadeMeshData(m, factor))
+      else solid.push(m)
+    }
+    let glassFaded = false
+    const glass = meshData.glass.map((m) => {
+      const factor = FOCUS_FACTOR[stairTierOf(meshStairId(m.key))]
+      if (factor >= 1) return m
+      glassFaded = true
+      return fadeMeshData(m, factor)
+    })
+    if (faded.length === 0 && !glassFaded) return { solid: meshData.solid, glass: meshData.glass, faded: NO_MESHES }
+    return { solid, glass: glassFaded ? glass : meshData.glass, faded }
+  }, [meshData, stairTierOf])
+  const meshLayersRef = useRef<{ solid: LiftMeshLayer; glass: LiftMeshLayer; faded: LiftMeshLayer } | null>(null)
   if (meshLayersRef.current === null) {
     meshLayersRef.current = {
       solid: new LiftMeshLayer(MESH_LAYER),
       glass: new LiftMeshLayer(GLASS_MESH_LAYER, true),
+      // Translucent, solid shading (not glass).
+      faded: new LiftMeshLayer(FADED_MESH_LAYER, true, false),
     }
   }
+
+  // ---- Empty-layer gate --------------------------------------------------
+  // Every gate predicate goes through this hold (GatedLayerHold).
+  const gateHoldRef = useRef(new GatedLayerHold(STAIR_GATED_LAYERS))
+  useEffect(() => {
+    if (!map) return
+    return gateHoldRef.current.attach(map)
+  }, [map])
 
   // ---- Source + layer mount ----------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
     if (!map.getSource(STEP_SOURCE)) {
       try {
         map.addSource(STEP_SOURCE, {
@@ -320,6 +610,7 @@ export function MapStairOverlay({
           data: EMPTY_FC,
           lineMetrics: true,
         })
+        gateHold.resetSource(STEP_SOURCE)
       } catch (err) {
         console.warn('[stair-overlay] addSource failed', err)
         return
@@ -331,24 +622,44 @@ export function MapStairOverlay({
           id: STEP_LAYER,
           type: 'fill-extrusion',
           source: STEP_SOURCE,
+          // NO_TIER: a focus-faded stair's steps are drawn by the tier layers.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          filter: NOT_GLASS as any,
-          paint: {
-            'fill-extrusion-color': ['get', 'color'],
-            'fill-extrusion-base': ['to-number', ['get', 'base_height']],
-            'fill-extrusion-height': ['to-number', ['get', 'height']],
-            'fill-extrusion-opacity': 1,
-            'fill-extrusion-vertical-gradient': true,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ['fill-extrusion-cast-shadows' as any]: true,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ['fill-extrusion-ambient-occlusion-intensity' as any]: 0.35,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ['fill-extrusion-ambient-occlusion-radius' as any]: 2.5,
-          },
+          filter: ['all', NOT_GLASS, NO_TIER] as any,
+          paint: stepPaint(1, true),
         })
+        gateHold.register(map, STEP_LAYER, stairStepPredicate(null))
       } catch (err) {
         console.warn('[stair-overlay] addLayer failed', err)
+      }
+    }
+    // Focus tier twins, directly after STEP_LAYER in tier order (the
+    // translucent-order pass then files them with the other translucent
+    // extrusions, as it does every opacity bucket). Hidden by the gate
+    // until a stamp lands.
+    let afterId = STEP_LAYER
+    for (const [layerId, tier] of STEP_TIER_LAYERS) {
+      const after = afterId
+      afterId = layerId
+      if (map.getLayer(layerId)) continue
+      try {
+        const order = rootLayerOrder(map)
+        const at = order.indexOf(after)
+        // Skip imported basemap ids (`id\u001fscope`) — never a valid anchor here.
+        const beforeId = at >= 0 ? order.slice(at + 1).find((id) => !id.includes('\u001f')) : undefined
+        map.addLayer(
+          {
+            id: layerId,
+            type: 'fill-extrusion',
+            source: STEP_SOURCE,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            filter: ['all', NOT_GLASS, tierIs(tier)] as any,
+            paint: stepPaint(FOCUS_FACTOR[tier], false),
+          },
+          beforeId,
+        )
+        gateHold.register(map, layerId, stairStepPredicate(tier))
+      } catch (err) {
+        console.warn('[stair-overlay] focus tier layer failed', layerId, err)
       }
     }
     if (!map.getLayer(GLASS_LAYER)) {
@@ -370,6 +681,7 @@ export function MapStairOverlay({
             ['fill-extrusion-cast-shadows' as any]: false,
           },
         })
+        gateHold.register(map, GLASS_LAYER, stairSplitPredicate('glass'))
       } catch (err) {
         console.warn('[stair-overlay] glass layer failed', err)
       }
@@ -389,6 +701,7 @@ export function MapStairOverlay({
             'fill-extrusion-opacity': 0,
           },
         })
+        gateHold.register(map, HIT_FILL_LAYER, stairSplitPredicate('hit'))
       } catch (err) {
         console.warn('[stair-overlay] hit layer failed', err)
       }
@@ -398,6 +711,7 @@ export function MapStairOverlay({
       try {
         if (!map.getLayer(MESH_LAYER)) map.addLayer(meshLayers.solid)
         if (!map.getLayer(GLASS_MESH_LAYER)) map.addLayer(meshLayers.glass)
+        if (!map.getLayer(FADED_MESH_LAYER)) map.addLayer(meshLayers.faded, GLASS_MESH_LAYER)
       } catch (err) {
         console.warn('[stair-overlay] mesh layers failed', err)
       }
@@ -501,7 +815,9 @@ export function MapStairOverlay({
               ['to-number', ['get', 'borderWidth']],
               1.2,
             ],
-            'line-opacity': 0.9,
+            // Constant, as before focus mode. The border-opacity effect
+            // swaps in STEP_BORDER_OPACITY_FADED only while a stair is faded.
+            'line-opacity': STEP_BORDER_OPACITY,
             'line-emissive-strength': 1,
           },
           layout: {
@@ -538,6 +854,7 @@ export function MapStairOverlay({
           },
           filter: ['==', ['get', 'shapeId'], -1],
         })
+        gateHold.register(map, SELECTION_LAYER, stairSelectionPredicate([]))
       } catch (err) {
         console.warn('[stair-overlay] selection layer failed', err)
       }
@@ -645,13 +962,38 @@ export function MapStairOverlay({
     }
   }, [map, styleLoaded, styleGen])
 
-  // Push the latest FeatureCollection into the committed source.
+  // Push the latest FeatureCollection into the committed source — the
+  // focus-stamped one, which IS `stepFeatures` while nothing is focused and
+  // keeps its identity while the stamps don't change (so the push re-runs
+  // only when they do).
   useEffect(() => {
     if (!map || !styleLoaded) return
     const src = map.getSource(STEP_SOURCE) as GeoJSONSource | undefined
     if (!src) return
-    src.setData(stepFeatures as unknown as Parameters<GeoJSONSource['setData']>[0])
-  }, [map, styleLoaded, styleGen, stepFeatures])
+    // Before setData, where the gate re-counts: a layer this push empties
+    // is held until STEP_SOURCE re-tiles (GatedLayerHold). A focus stamp
+    // shows its tier layer now and holds STEP_LAYER the same way.
+    gateHoldRef.current.push(map, STEP_SOURCE, tieredStepFeatures)
+    src.setData(tieredStepFeatures as unknown as Parameters<GeoJSONSource['setData']>[0])
+  }, [map, styleLoaded, styleGen, tieredStepFeatures])
+
+  // Focus mode: STEP_BORDER_LAYER's outlines fade with their stair. The
+  // layer is installed with the constant 0.9 (focus off draws exactly as
+  // before) and switches to the data-driven STEP_BORDER_OPACITY_FADED only
+  // while some stair is faded — a data-driven setPaintProperty re-tiles
+  // STEP_SOURCE, so it is written once on the way in and once on the way
+  // out, and only when the live value differs (never while focus is off).
+  // Declared after the STEP_SOURCE push, so it lands after the stamped push
+  // when turning on and after the unstamped one when turning off; styleGen
+  // re-applies it after a style re-install (which brings back the constant).
+  useEffect(() => {
+    if (!map || !styleLoaded || !hasMapLayer(map, STEP_BORDER_LAYER)) return
+    const next = anyStairFaded ? STEP_BORDER_OPACITY_FADED : STEP_BORDER_OPACITY
+    try {
+      if (JSON.stringify(map.getPaintProperty(STEP_BORDER_LAYER, 'line-opacity')) === JSON.stringify(next)) return
+      map.setPaintProperty(STEP_BORDER_LAYER, 'line-opacity', next)
+    } catch { /* style mid-swap: the next styleGen re-applies */ }
+  }, [map, styleLoaded, styleGen, anyStairFaded])
 
   useEffect(() => {
     if (!map || !styleLoaded) return
@@ -661,22 +1003,31 @@ export function MapStairOverlay({
 
   // Stair and lift meshes. The transforming stair is drawn from the in-flight
   // copy instead (pushInflight), like its extruded parts.
-  const baseMeshesRef = useRef(meshData)
+  const baseMeshesRef = useRef(routedMeshes)
+  // Whether FADED_MESH_LAYER holds meshes: it is written only while focus
+  // mode uses it (and once more to empty it), never on a map that doesn't.
+  const fadedMeshesShownRef = useRef(false)
   useEffect(() => {
-    baseMeshesRef.current = meshData
+    baseMeshesRef.current = routedMeshes
     const layers = meshLayersRef.current
     if (!layers) return
     const skip = transformState ? `${transformState.stairId}:` : null
-    layers.solid.setMeshes(skip ? meshData.solid.filter((m) => !m.key.startsWith(skip)) : meshData.solid)
-    layers.glass.setMeshes(skip ? meshData.glass.filter((m) => !m.key.startsWith(skip)) : meshData.glass)
-  }, [meshData, transformState])
+    const pick = (list: LiftMeshData[]) => (skip ? list.filter((m) => !m.key.startsWith(skip)) : list)
+    layers.solid.setMeshes(pick(routedMeshes.solid))
+    layers.glass.setMeshes(pick(routedMeshes.glass))
+    const faded = pick(routedMeshes.faded)
+    if (faded.length > 0 || fadedMeshesShownRef.current) {
+      layers.faded.setMeshes(faded)
+      fadedMeshesShownRef.current = faded.length > 0
+    }
+  }, [routedMeshes, transformState])
 
   // Remove the mesh layers with the overlay.
   useEffect(() => {
     const layers = meshLayersRef.current
     return () => {
       if (!map || !layers) return
-      for (const id of [MESH_LAYER, GLASS_MESH_LAYER]) {
+      for (const id of [MESH_LAYER, FADED_MESH_LAYER, GLASS_MESH_LAYER]) {
         try {
           if (map.getLayer(id)) map.removeLayer(id)
         } catch { /* map gone */ }
@@ -734,21 +1085,38 @@ export function MapStairOverlay({
     const shapeFilter = excludeId != null
       ? ['!=', ['get', 'shapeId'], excludeId]
       : NO_SHAPE_FILTER
+    const shapePredicate = stairShapeFilterPredicate(excludeId)
     // Solid and glass layers share a source, so each filter combines the
-    // glass split with the transform exclusion.
-    const filters: [string, unknown][] = [
-      [STEP_LAYER, ['all', NOT_GLASS, shapeFilter]],
-      [GLASS_LAYER, ['all', IS_GLASS, shapeFilter]],
-      [HIT_FILL_LAYER, ['all', IS_HIT, shapeFilter]],
-      [STEP_BORDER_LAYER, shapeFilter],
-      [SELECTION_LAYER, shapeFilter],
-      [ICON_LAYER, shapeFilter],
+    // glass split (and, for the solid layer and its focus tier twins, the
+    // tier clause) with the transform exclusion. The third entry is the
+    // matching empty-layer gate predicate (null: the layer is never empty
+    // while its source has features, so the source count alone gates it).
+    // This write replaces the selection effect's SELECTION_LAYER filter
+    // too, so its predicate is replaced along with it. A layer the
+    // exclusion empties (the moving escalator was STEP_LAYER's only
+    // member) is held visible until STEP_SOURCE re-tiles (GatedLayerHold).
+    const filters: [string, unknown, LayerFeaturePredicate | null][] = [
+      [STEP_LAYER, ['all', NOT_GLASS, NO_TIER, shapeFilter], stairStepPredicate(null, shapePredicate)],
+      ...STEP_TIER_LAYERS.map(
+        ([layerId, tier]) =>
+          [layerId, ['all', NOT_GLASS, tierIs(tier), shapeFilter], stairStepPredicate(tier, shapePredicate)] as [
+            string,
+            unknown,
+            LayerFeaturePredicate,
+          ],
+      ),
+      [GLASS_LAYER, ['all', IS_GLASS, shapeFilter], stairSplitPredicate('glass', shapePredicate)],
+      [HIT_FILL_LAYER, ['all', IS_HIT, shapeFilter], stairSplitPredicate('hit', shapePredicate)],
+      [STEP_BORDER_LAYER, shapeFilter, null],
+      [SELECTION_LAYER, shapeFilter, shapePredicate],
+      [ICON_LAYER, shapeFilter, null],
     ]
-    for (const [layerId, filter] of filters) {
+    for (const [layerId, filter, predicate] of filters) {
       if (!map.getLayer(layerId)) continue
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         map.setFilter(layerId, filter as any)
+        if (predicate) gateHoldRef.current.register(map, layerId, predicate)
       } catch { /* ignore */ }
     }
   }, [map, styleLoaded, styleGen, transformState])
@@ -762,7 +1130,8 @@ export function MapStairOverlay({
     const visibility = committedVisible ? 'visible' : 'none'
     meshLayersRef.current?.solid.setVisible(committedVisible)
     meshLayersRef.current?.glass.setVisible(committedVisible)
-    for (const layerId of [STEP_LAYER, GLASS_LAYER, HIT_FILL_LAYER, STEP_BORDER_LAYER, SELECTION_LAYER, ICON_LAYER, MOTION_LAYER, MOTION_BORDER_LAYER]) {
+    meshLayersRef.current?.faded.setVisible(committedVisible)
+    for (const layerId of [STEP_LAYER, STEP_NEAR_LAYER, STEP_GHOST_LAYER, GLASS_LAYER, HIT_FILL_LAYER, STEP_BORDER_LAYER, SELECTION_LAYER, ICON_LAYER, MOTION_LAYER, MOTION_BORDER_LAYER]) {
       if (!map.getLayer(layerId)) continue
       try {
         map.setLayoutProperty(layerId, 'visibility', layerId === ICON_LAYER && !liftIcons ? 'none' : visibility)
@@ -796,6 +1165,9 @@ export function MapStairOverlay({
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       map.setFilter(SELECTION_LAYER, filter as any)
+      // Same synchronous pass as the filter: a new selection's outline
+      // shows from the very next frame.
+      gateHoldRef.current.register(map, SELECTION_LAYER, stairSelectionPredicate(ids))
     } catch {
       /* ignore */
     }
@@ -983,12 +1355,15 @@ export function MapStairOverlay({
   }, [map, styleLoaded, styleGen, previewFC])
 
   // ---- Drag interaction for transform handles ----------------------------
+  // Synced inside the commit (a layout effect runs before the browser can
+  // dispatch another event), so the drag handlers always see the
+  // callbacks of the committed render.
   const transformChangeRef = useRef(onTransformChange)
-  // eslint-disable-next-line react-hooks/refs -- latest-value ref, read/written outside effects intentionally
-  transformChangeRef.current = onTransformChange
   const transformEndRef = useRef(onTransformEnd)
-  // eslint-disable-next-line react-hooks/refs -- latest-value ref, read/written outside effects intentionally
-  transformEndRef.current = onTransformEnd
+  useLayoutEffect(() => {
+    transformChangeRef.current = onTransformChange
+    transformEndRef.current = onTransformEnd
+  }, [onTransformChange, onTransformEnd])
 
   const dragRef = useRef<{
     dragging: boolean
@@ -1173,7 +1548,7 @@ export function MapStairOverlay({
       ]
       let hits: GeoJSON.Feature[]
       try {
-        hits = map.queryRenderedFeatures(bbox, { layers: HIT_LAYERS.filter((id) => map.getLayer(id)) })
+        hits = map.queryRenderedFeatures(bbox, { layers: HIT_LAYERS.filter((id) => hasMapLayer(map, id)) })
       } catch {
         return
       }
@@ -1196,7 +1571,7 @@ export function MapStairOverlay({
       ]
       let hits: GeoJSON.Feature[]
       try {
-        hits = map.queryRenderedFeatures(bbox, { layers: HIT_LAYERS.filter((id) => map.getLayer(id)) })
+        hits = map.queryRenderedFeatures(bbox, { layers: HIT_LAYERS.filter((id) => hasMapLayer(map, id)) })
       } catch {
         return
       }

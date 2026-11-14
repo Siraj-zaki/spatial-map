@@ -17,8 +17,11 @@
  *   3. Run A* (4-connected, Manhattan heuristic, small turn penalty,
  *      centre bias when a DT is present).
  *
- *   4. Post-process: collapse collinear runs → centre each straight
- *      segment inside its corridor → convert back to lng/lat.
+ *   4. Post-process (`orthogonal.ts`): right-angle runs along the
+ *      building's axis, through door centres, down corridor middles,
+ *      with small zig-zags merged → convert back to lng/lat. The grid is
+ *      compiled in the building's frame (projection.ts), so "along the
+ *      walls" is horizontal / vertical on the grid.
  *
  * The whole thing is a pure function of `(scene, request)`. No React,
  * no map instance, no store — so the same function runs identically
@@ -32,6 +35,7 @@ import {
   llToCell,
   type CompiledGrid,
 } from './occupancy-grid.ts'
+import { orthogonalPath, type OrthogonalOptions } from './orthogonal.ts'
 import {
   cellsToLngLatFractional,
   centreOnCorridor,
@@ -40,6 +44,7 @@ import {
   simplifyByLineOfSight,
   simplifyByLineOfSightFractional,
 } from './postprocess.ts'
+import { toLocal } from './projection.ts'
 import type { RouteRequest, RouteResult, RoutingScene } from './types.ts'
 
 /** Default cell size — fine enough for a 0.9 m door, coarse enough to be quick. */
@@ -49,9 +54,15 @@ const DEFAULT_AGENT_RADIUS_M = 0.3
 /** Default bbox padding around the scene. */
 const DEFAULT_PADDING_M = 2
 
-export interface ComputeRouteOptions extends AStarOptions {
+export interface ComputeRouteOptions extends AStarOptions, OrthogonalOptions {
   /** Return the compiled grid alongside the result for debug overlays. */
   returnGrid?: boolean
+  /**
+   * `orthogonal` (default): runs parallel to the walls, right-angle turns,
+   * through door centres and corridor middles. `any-angle`: the older
+   * string-pulled shortest line (diagonals across open space).
+   */
+  pathStyle?: 'orthogonal' | 'any-angle'
 }
 
 /**
@@ -94,6 +105,7 @@ export function computeRoute(
     start,
     end,
     withDistanceTransform: true,
+    axisDeg: request.axisDeg,
   })
 
   const snapRadiusMeters = opts.snapRadiusMeters ?? 3
@@ -149,10 +161,27 @@ export function computeRoute(
   //   4. Re-simplify: centring can make some waypoints collinear or
   //      redundant, so run string-pulling one more time to keep the
   //      polyline minimal + turns sharp.
-  const collapsed = collapseCollinear(astar.cells)
-  const strung = simplifyByLineOfSight(grid, collapsed)
-  const centred = centreOnCorridor(grid, strung, 12)
-  const finalCells = simplifyByLineOfSightFractional(grid, centred)
+  let finalCells: [number, number][]
+  if (opts.pathStyle === 'any-angle') {
+    const collapsed = collapseCollinear(astar.cells)
+    const strung = simplifyByLineOfSight(grid, collapsed)
+    const centred = centreOnCorridor(grid, strung, 12)
+    finalCells = simplifyByLineOfSightFractional(grid, centred)
+  } else {
+    // The exact click (fractional cells) unless it sat in an obstacle.
+    const frac = (ll: [number, number], blocked: boolean, snap: [number, number]): [number, number] => {
+      if (blocked) return [snap[0] + 0.5, snap[1] + 0.5]
+      const [x, y] = toLocal(grid.frame, ll)
+      return [(x - grid.originX) / grid.cellSize, (y - grid.originY) / grid.cellSize]
+    }
+    finalCells = orthogonalPath(
+      grid,
+      astar.cells,
+      frac(start, startBlocked, startSnap),
+      frac(end, endBlocked, endSnap),
+      opts,
+    )
+  }
   // Endpoint replacement in `cellsToLngLat` normally snaps the first
   // and last emitted waypoints to the user's exact click. That's the
   // right thing UNLESS the click landed INSIDE an obstacle — in that

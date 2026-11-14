@@ -1,11 +1,18 @@
 /**
  * Full-screen premium loader for data-link layers.
  *
- * Shows when at least one MapDataLinkedOverlay sub-renderer's fetch is
- * in flight. Reads from `useDataLinkLoadingStore` — no React re-render
+ * Shows while at least one MapDataLinkedOverlay layer is loading with no
+ * rows yet. Reads from `useDataLinkLoadingStore` — no React re-render
  * unless the aggregate flips or the loading-layer set changes.
  *
  * Behaviour:
+ *   • No-rows loads only: the card covers a layer whose query holds no
+ *     rows (its first load, or a remount after its cache entry was
+ *     dropped). A refetch of a layer that already has rows (SSE
+ *     invalidation, floor switch) is flagged `refreshing` in the store and
+ *     doesn't raise the card — it used to flash over a live venue on every
+ *     refresh slower than the grace period, and the backdrop blur
+ *     re-composited the map each frame. The editor pill shows every load.
  *   • Grace period (200 ms): a fetch that completes fast doesn't
  *     produce a flash. Skips mount until loading has been sustained.
  *   • Progress readout: shows N loading + names of up to 3 layers so
@@ -17,7 +24,7 @@
  *     already used in the app.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Loader2, Radio, Sparkles } from 'lucide-react'
 import { useDataLinkLoadingStore } from '@/lib/data-link/loading-store'
@@ -41,7 +48,13 @@ export function DataLinkFullScreenLoader({
 }) {
   const { t } = useTranslation()
   const loading = useDataLinkLoadingStore((s) => s.loading)
-  const anyLoading = loading.size > 0
+  // The pill doesn't block the editor, so it reports every load. The card
+  // covers only layers with no rows on the map yet.
+  const pending = useMemo(
+    () => Array.from(loading.values()).filter((v) => variant === 'pill' || !v.refreshing),
+    [loading, variant],
+  )
+  const anyLoading = pending.length > 0
   // Shown only once loading has lasted GRACE_MS (fast loads never flash).
   const [graceDone, setGraceDone] = useState(false)
   if (!anyLoading && graceDone) setGraceDone(false)
@@ -53,11 +66,11 @@ export function DataLinkFullScreenLoader({
 
   if (!anyLoading || !graceDone) return null
 
-  const names = Array.from(loading.values())
+  const names = pending
     .map((v) => v.configName)
     .slice(0, 3)
-  const overflow = loading.size - names.length
-  const title = t('dataLink.loadingLayers', { count: loading.size, defaultValue: 'Loading {{count}} layers' })
+  const overflow = pending.length - names.length
+  const title = t('dataLink.loadingLayers', { count: pending.length, defaultValue: 'Loading {{count}} layers' })
 
   if (variant === 'pill') {
     return (

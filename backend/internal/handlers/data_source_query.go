@@ -305,114 +305,120 @@ func dataSourceQueryHandler(q *db.Queries, pool *pgxpool.Pool) http.HandlerFunc 
 			api.BadRequest(w, "invalid data-source id")
 			return
 		}
-		if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
-			ID: sourceID, TenantID: tenantID,
-		}); err != nil {
-			api.NotFound(w, "data_source not found")
-			return
-		}
-
-		var req QueryRequest
-		if err := api.DecodeBody(r, &req); err != nil {
-			api.BadRequest(w, "invalid request body")
-			return
-		}
-		if req.Limit <= 0 {
-			req.Limit = defaultQueryLimit
-		}
-		if req.Limit > maxQueryLimit {
-			req.Limit = maxQueryLimit
-		}
-		if req.Offset < 0 {
-			req.Offset = 0
-		}
-
-		// Compile the filter tree into an SQL fragment + arg list.
-		compiler := NewFilterCompiler(tenantID, sourceID)
-		if err := compiler.PushBase(); err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-		if req.Filter != nil {
-			if err := compiler.PushFilter(req.Filter, 0, 0); err != nil {
-				api.BadRequest(w, err.Error())
-				return
-			}
-		}
-		if req.FloorPlanID != nil {
-			compiler.PushFloor(*req.FloorPlanID)
-		}
-
-		whereSQL := strings.Join(compiler.wheres, " AND ")
-		listSQL := fmt.Sprintf(`
-			SELECT id, source_id, entity_key, payload,
-			       ST_AsText(position) AS position_wkt,
-			       COALESCE(linked_shape_name, '') AS linked_shape_name,
-			       ts, updated_at
-			FROM data_source_rows
-			WHERE %s
-			ORDER BY ts DESC
-			LIMIT $%d OFFSET $%d
-		`, whereSQL, len(compiler.args)+1, len(compiler.args)+2)
-		listArgs := append(append([]any{}, compiler.args...), req.Limit, req.Offset)
-
-		rowsQ, err := pool.Query(r.Context(), listSQL, listArgs...)
-		if err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-		defer rowsQ.Close()
-
-		out := QueryResponse{Rows: []DataSourceRowResponse{}}
-		for rowsQ.Next() {
-			var (
-				id, sid                int64
-				entityKey, linkedShape string
-				payload                []byte
-				wkt                    *string
-				ts, updatedAt          time.Time
-			)
-			if err := rowsQ.Scan(&id, &sid, &entityKey, &payload, &wkt, &linkedShape, &ts, &updatedAt); err != nil {
-				api.InternalError(w, r, err)
-				return
-			}
-			var wktStr string
-			if wkt != nil {
-				wktStr = *wkt
-			}
-			out.Rows = append(out.Rows, DataSourceRowResponse{
-				ID:              id,
-				SourceID:        sid,
-				EntityKey:       entityKey,
-				Payload:         json.RawMessage(payload),
-				Position:        parseWktPoint(wktStr),
-				LinkedShapeName: linkedShape,
-				TS:              ts.Format(time.RFC3339),
-				UpdatedAt:       updatedAt.Format(time.RFC3339),
-			})
-		}
-		if err := rowsQ.Err(); err != nil {
-			api.InternalError(w, r, err)
-			return
-		}
-
-		if len(out.Rows) == req.Limit {
-			out.Truncated = true
-		}
-
-		if req.IncludeCount {
-			countSQL := fmt.Sprintf(
-				`SELECT COUNT(*) FROM data_source_rows WHERE %s`, whereSQL,
-			)
-			var total int64
-			if err := pool.QueryRow(r.Context(), countSQL, compiler.args...).Scan(&total); err != nil {
-				api.InternalError(w, r, err)
-				return
-			}
-			out.TotalCount = &total
-		}
-		api.JSON(w, http.StatusOK, out)
+		serveDataSourceQuery(w, r, pool, q, tenantID, sourceID)
 	}
+}
+
+// serveDataSourceQuery runs a filtered row query on a source in the given
+// tenant. Shared by the signed-in route and the report share-link route.
+func serveDataSourceQuery(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, q *db.Queries, tenantID, sourceID int64) {
+	if _, err := q.GetDataSource(r.Context(), db.GetDataSourceParams{
+		ID: sourceID, TenantID: tenantID,
+	}); err != nil {
+		api.NotFound(w, "data_source not found")
+		return
+	}
+
+	var req QueryRequest
+	if err := api.DecodeBody(r, &req); err != nil {
+		api.BadRequest(w, "invalid request body")
+		return
+	}
+	if req.Limit <= 0 {
+		req.Limit = defaultQueryLimit
+	}
+	if req.Limit > maxQueryLimit {
+		req.Limit = maxQueryLimit
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
+
+	// Compile the filter tree into an SQL fragment + arg list.
+	compiler := NewFilterCompiler(tenantID, sourceID)
+	if err := compiler.PushBase(); err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+	if req.Filter != nil {
+		if err := compiler.PushFilter(req.Filter, 0, 0); err != nil {
+			api.BadRequest(w, err.Error())
+			return
+		}
+	}
+	if req.FloorPlanID != nil {
+		compiler.PushFloor(*req.FloorPlanID)
+	}
+
+	whereSQL := strings.Join(compiler.wheres, " AND ")
+	listSQL := fmt.Sprintf(`
+		SELECT id, source_id, entity_key, payload,
+		       ST_AsText(position) AS position_wkt,
+		       COALESCE(linked_shape_name, '') AS linked_shape_name,
+		       ts, updated_at
+		FROM data_source_rows
+		WHERE %s
+		ORDER BY ts DESC
+		LIMIT $%d OFFSET $%d
+	`, whereSQL, len(compiler.args)+1, len(compiler.args)+2)
+	listArgs := append(append([]any{}, compiler.args...), req.Limit, req.Offset)
+
+	rowsQ, err := pool.Query(r.Context(), listSQL, listArgs...)
+	if err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+	defer rowsQ.Close()
+
+	out := QueryResponse{Rows: []DataSourceRowResponse{}}
+	for rowsQ.Next() {
+		var (
+			id, sid                int64
+			entityKey, linkedShape string
+			payload                []byte
+			wkt                    *string
+			ts, updatedAt          time.Time
+		)
+		if err := rowsQ.Scan(&id, &sid, &entityKey, &payload, &wkt, &linkedShape, &ts, &updatedAt); err != nil {
+			api.InternalError(w, r, err)
+			return
+		}
+		var wktStr string
+		if wkt != nil {
+			wktStr = *wkt
+		}
+		out.Rows = append(out.Rows, DataSourceRowResponse{
+			ID:              id,
+			SourceID:        sid,
+			EntityKey:       entityKey,
+			Payload:         json.RawMessage(payload),
+			Position:        parseWktPoint(wktStr),
+			LinkedShapeName: linkedShape,
+			TS:              ts.Format(time.RFC3339),
+			UpdatedAt:       updatedAt.Format(time.RFC3339),
+		})
+	}
+	if err := rowsQ.Err(); err != nil {
+		api.InternalError(w, r, err)
+		return
+	}
+
+	if len(out.Rows) == req.Limit {
+		out.Truncated = true
+	}
+
+	if req.IncludeCount {
+		countSQL := fmt.Sprintf(
+			`SELECT COUNT(*) FROM data_source_rows WHERE %s`, whereSQL,
+		)
+		var total int64
+		if err := pool.QueryRow(r.Context(), countSQL, compiler.args...).Scan(&total); err != nil {
+			api.InternalError(w, r, err)
+			return
+		}
+		out.TotalCount = &total
+	}
+	api.JSON(w, http.StatusOK, out)
 }
 
 // -------------------------------------------- compiler

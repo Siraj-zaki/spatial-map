@@ -15,72 +15,17 @@
  *
  * One instance draws opaque meshes (writes depth); a second, `translucent`
  * instance draws glass (no depth write) and is kept after every opaque 3D
- * layer by translucent-layer-order.ts.
+ * layer by translucent-layer-order.ts. Sloped walls / tapered solids
+ * (sloped-mesh.ts) reuse it, with `glass: false` for see-through shapes
+ * that should still shade like a solid.
  */
 
 import mapboxgl, { type CustomLayerInterface, type Map as MapboxMapInstance } from 'mapbox-gl'
 
-export interface LiftMeshData {
-  /** Stable key (shape id + part) — GPU buffers are reused while it lives. */
-  key: string
-  /** Mesh origin. */
-  origin: [number, number]
-  /** (east, north, up) metres from the origin, 3 floats per vertex. */
-  positions: Float32Array
-  /** Per-vertex normals, same layout. */
-  normals: Float32Array
-  /** Per-vertex RGBA 0–1 (straight alpha). */
-  colors: Float32Array
-}
+import type { LiftMeshData } from './lift-mesh'
 
-/**
- * A mesh in (east, north, up) metres from `origin`, turned clockwise by
- * `rotation` degrees about `pivot` (metres) — like turf's
- * transformRotate on the extruded parts — with flat per-triangle normals.
- */
-export function placeMesh(
-  en: ArrayLike<number>,
-  colors: number[],
-  origin: [number, number],
-  pivot: [number, number],
-  rotation: number,
-  key: string,
-): LiftMeshData {
-  const r = (rotation * Math.PI) / 180
-  const cos = Math.cos(r)
-  const sin = Math.sin(r)
-  const [pe, pn] = pivot
-  const positions = new Float32Array(en.length)
-  for (let i = 0; i < en.length; i += 3) {
-    const e = en[i] - pe
-    const n = en[i + 1] - pn
-    positions[i] = pe + e * cos + n * sin
-    positions[i + 1] = pn - e * sin + n * cos
-    positions[i + 2] = en[i + 2]
-  }
-  const normals = new Float32Array(en.length)
-  for (let i = 0; i < positions.length; i += 9) {
-    const ax = positions[i + 3] - positions[i]
-    const ay = positions[i + 4] - positions[i + 1]
-    const az = positions[i + 5] - positions[i + 2]
-    const bx = positions[i + 6] - positions[i]
-    const by = positions[i + 7] - positions[i + 1]
-    const bz = positions[i + 8] - positions[i + 2]
-    let nx = ay * bz - az * by
-    let ny = az * bx - ax * bz
-    let nz = ax * by - ay * bx
-    const len = Math.hypot(nx, ny, nz) || 1
-    nx /= len
-    ny /= len
-    nz /= len
-    for (let k = 0; k < 9; k += 3) {
-      normals[i + k] = nx
-      normals[i + k + 1] = ny
-      normals[i + k + 2] = nz
-    }
-  }
-  return { key, origin, positions, normals, colors: new Float32Array(colors) }
-}
+// Kept here too so existing imports of the layer module keep working.
+export { placeMesh, type LiftMeshData } from './lift-mesh'
 
 const VERTEX_SHADER = `#version 300 es
 in vec3 a_pos;
@@ -179,6 +124,8 @@ export class LiftMeshLayer implements CustomLayerInterface {
   readonly renderingMode = '3d' as const
   /** Read by translucent-layer-order.ts to keep glass after opaque 3D. */
   readonly translucent: boolean
+  /** Glass shading (Fresnel, streaks); off = solid shading, even when translucent. */
+  readonly glass: boolean
 
   private map: MapboxMapInstance | null = null
   private gl: WebGL2RenderingContext | null = null
@@ -190,9 +137,10 @@ export class LiftMeshLayer implements CustomLayerInterface {
   private pending: LiftMeshData[] | null = []
   private visible = true
 
-  constructor(id: string, translucent = false) {
+  constructor(id: string, translucent = false, glass = translucent) {
     this.id = id
     this.translucent = translucent
+    this.glass = glass
   }
 
   /** Replace every mesh; uploaded on the next frame. */
@@ -235,7 +183,7 @@ export class LiftMeshLayer implements CustomLayerInterface {
     if (!this.program) this.createProgram(gl)
     if (!this.program) return
     gl.useProgram(this.program)
-    gl.uniform1f(this.uGlass, this.translucent ? 1 : 0)
+    gl.uniform1f(this.uGlass, this.glass ? 1 : 0)
     // Camera position (Mercator) for view-dependent shading.
     let cam: { x: number; y: number; z: number } | null = null
     try {

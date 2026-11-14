@@ -68,7 +68,7 @@ export function useSolutionLocation(): { id: number | null; tab: SolutionTab | n
 
 export function SidebarSolutions({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: () => void }) {
   const { t } = useTranslation()
-  const { canEdit } = useWorkspaceRole()
+  const canEdit = useWorkspaceRole().can('solutions.manage')
   const { data, isLoading } = useSolutions()
   const here = useSolutionLocation()
   const [creating, setCreating] = useState(false)

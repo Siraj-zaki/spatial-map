@@ -42,7 +42,7 @@ export function TableTokensPanel({
   onChanged?: () => void
 }) {
   const { t, i18n } = useTranslation()
-  const { canManage } = useWorkspaceRole()
+  const canManage = useWorkspaceRole().can('data.manage')
   const manageOnly = t('common.needsAdmin', { defaultValue: 'Only workspace owners and admins can do this.' })
 
   // Local copy so create/revoke show at once; re-seeded when the parent

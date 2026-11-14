@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -131,6 +132,44 @@ func (q *Queries) GetUserModel(ctx context.Context, arg GetUserModelParams) (Use
 		&i.Thumbnail,
 	)
 	return i, err
+}
+
+const listUserModelBounds = `-- name: ListUserModelBounds :many
+SELECT id, coalesce(inspector->'bounds', 'null'::jsonb)::jsonb AS bounds
+FROM user_models
+WHERE tenant_id = $1 AND id = ANY($2::bigint[])
+`
+
+type ListUserModelBoundsParams struct {
+	TenantID int64   `json:"tenant_id"`
+	Ids      []int64 `json:"ids"`
+}
+
+type ListUserModelBoundsRow struct {
+	ID     int64           `json:"id"`
+	Bounds json.RawMessage `json:"bounds"`
+}
+
+// The local bounding boxes (inspector.bounds) of a facility's 3D models,
+// for the facility envelope: the mobile app routes around their footprints.
+func (q *Queries) ListUserModelBounds(ctx context.Context, arg ListUserModelBoundsParams) ([]ListUserModelBoundsRow, error) {
+	rows, err := q.db.Query(ctx, listUserModelBounds, arg.TenantID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserModelBoundsRow{}
+	for rows.Next() {
+		var i ListUserModelBoundsRow
+		if err := rows.Scan(&i.ID, &i.Bounds); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listUserModels = `-- name: ListUserModels :many

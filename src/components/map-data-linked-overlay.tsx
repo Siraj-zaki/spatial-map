@@ -19,27 +19,28 @@
  * the same map never collide.
  */
 
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import mapboxgl, { type Map as MapboxMapInstance } from 'mapbox-gl'
 import { useApiQuery, queryCache } from '@/lib/useApiQuery'
 import { subscribeExternalSSE } from '@/lib/useSSE'
+import { useStableCallback } from '@/hooks/useStableCallback'
 import { useCurrentTenantId } from '@/lib/data-link/tenant-service'
 import { listEntityEventsForStream } from '@/lib/data-link/entity-state-service'
 import { fetchLayerRows } from '@/lib/data-link/layer-rows'
+import { getRowForSource } from '@/lib/data-link/data-source-rows'
 import { whenStyleLoaded } from '@/lib/mapbox-style-ready'
-import { ensureDataLinkSpritesFor, mapboxImageIdFor } from '@/lib/data-link/lucide-icon-sprites'
-import { polygonCentroid } from '@/lib/polygon-generators'
-import { lineCentroid } from '@/lib/line-generators'
-import { buildCircleFeatures } from '@/lib/circle-generators'
+import { ensureDataLinkSpritesFor } from '@/lib/data-link/lucide-icon-sprites'
 import {
-  evaluateEntityRules,
+  compileEntityRules,
+  nextRuleClockChange,
   resolveLabelTemplate,
 } from '@/lib/data-link/style-rule-evaluator'
 import {
   readPayloadPath,
-  resolveMatchTargets,
   resolvePayloadCoord,
+  type MatchableShape,
+  type MatchStoreSnapshot,
 } from '@/lib/data-link/match-resolver'
 import { useSpatialStore } from '@/lib/spatial-store'
 import { emitDataLinkClick } from '@/lib/data-link/data-link-events'
@@ -57,32 +58,86 @@ import type {
   Bin,
   DataLinkConfig,
   DataLinkFilter,
-  ElevationSpec,
   EntityState,
   EntityEvent,
 } from '@/lib/db'
 import {
   evaluateDataLinkFilter,
   passesFloorScope,
+  resolveEntityFloor,
   activeFloorKey,
   type ActiveFloors,
-  shapeOnEntityFloor,
 } from '@/lib/data-link/filter-evaluator'
 import {
   listTableEvents,
   type TableRowEvent,
 } from '@/lib/data-link/table-events-client'
-import {
-  useTablePlaybackState,
-  visibleEntities,
-} from '@/lib/data-link/table-playback-store'
+import { useTablePlaybackFor } from '@/lib/data-link/table-playback-store'
+import { useLayerPollMs } from '@/lib/data-link/layer-refresh'
 import {
   buildOccluders,
-  computeOccludedIds,
+  createOcclusionState,
+  resetOcclusionState,
+  updateOcclusion,
   type OccludableTarget,
 } from '@/lib/marker-occlusion'
 import { BinPopupContent } from './bin-popup-content'
 import { useLayerLoading } from '@/lib/data-link/loading-store'
+import {
+  buildCoordFeatures,
+  buildFovFeatures,
+  buildGaugeFeatures,
+  buildHeatmapFeatures,
+  buildPointOnShapeFeatures,
+  buildRoiFeatures,
+  buildShapeTintFeatures,
+  buildTrackFeatures,
+  createRowBuildCache,
+  eventsToEntities,
+  focusedAnchorOf,
+  matchReadsBins,
+  matchShapesLoaded,
+  narrowMatchSnapshot,
+  resolveAnchorElevation,
+  type CoordFeaturesResult,
+  type CoordFocusOptions,
+  type RowAnchors,
+  type RowBuildCache,
+} from '@/lib/data-link/feature-builders'
+import {
+  hasMapLayer,
+  noteNewDataLinkLayers,
+  raiseDataLinkLayers,
+  registerDataLinkLayers,
+  rootLayerOrder,
+  rootSourceIds,
+  settleDataLinkMerge,
+} from '@/lib/data-link/dl-layer-stack'
+import { useSharedRows } from '@/lib/data-link/row-sharing'
+import { anyManualClusterFeature, manualClusterLayersAlwaysEmpty } from '@/lib/data-link/dl-layer-gate'
+import { createGeoJSONDiffWriter, type GeoJSONDiffWriter } from '@/lib/geojson-diff-writer'
+import { hintLayerEmpty } from '@/lib/empty-layer-gate'
+import { FOCUS_FACTOR, GHOST_OCCLUDED_OPACITY, useFocusScene } from '@/lib/focus/focus-scene'
+import type { FocusNearRegion } from '@/lib/focus/focus-near'
+import type { DlAnchor } from '@/lib/focus/focus-target'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
+import {
+  buildRoomIndex,
+  clearRuntimeClusterMembers,
+  clusterPoints,
+  colorToken,
+  setRuntimeClusterMembers,
+  type ClusterItem,
+  type PointClusterSpec,
+  type RoomIndex,
+} from '@/lib/data-link/point-clusters'
+import {
+  runtimeClusterIds,
+  useClusterZoomBucket,
+  useDlClusterLayer,
+  type DlClusterLayerHandle,
+} from './map-dl-cluster-overlay'
+import { heatmapCovers, heatCells, useDlHeatmapLayer, type PointHeatmapSpec } from './map-dl-heatmap-overlay'
 
 /**
  * Depth handling shared by every render mode.
@@ -138,6 +193,24 @@ const RING_LAYOUT: mapboxgl.SymbolLayerSpecification['layout'] = {
   ...DISC_LAYOUT,
   'text-field': '○',
 }
+
+/**
+ * Shared empty arrays for absent props. A `= []` default is a NEW array on
+ * every render, which re-ran every memo and push effect keyed on it (and
+ * rebuilt every config's occluder prisms) whenever the host re-rendered.
+ */
+const EMPTY_POLYGONS: ReadonlyArray<PolygonShape> = []
+const EMPTY_CIRCLES: ReadonlyArray<CircleShape> = []
+const EMPTY_MARKERS: ReadonlyArray<MarkerShape> = []
+const EMPTY_LINES: ReadonlyArray<LineShape> = []
+const EMPTY_MODELS: ReadonlyArray<ModelShape> = []
+const EMPTY_IMAGES: ReadonlyArray<ImageShape> = []
+const EMPTY_STAIRS: ReadonlyArray<StairShape> = []
+const EMPTY_RULES: ReadonlyArray<StyleRule> = []
+const EMPTY_ENTITIES: EntityState[] = []
+const EMPTY_EVENTS: EntityEvent[] = []
+const EMPTY_BINS: readonly Bin[] = []
+const NO_SHAPES: readonly MatchableShape[] = []
 
 interface MapDataLinkedOverlayProps {
   map: MapboxMapInstance | null
@@ -272,6 +345,22 @@ interface MapDataLinkedOverlayProps {
      *  streaming features may not carry a stable key. */
     entityKey?: string,
   ) => void
+  /**
+   * Runtime clustering for point-at-coord / history-movement configs
+   * (`@/lib/data-link/point-clusters`): rows that sit close together on
+   * screen (or share a room / field value) fold into donut bubbles on
+   * `dl-<id>-rc-*`. The host must memoise it (a new object re-clusters).
+   * null / unset = today's path, untouched: no extra layers, listeners or
+   * writes.
+   */
+  pointCluster?: PointClusterSpec | null
+  /**
+   * Viewer-chosen heatmap over point-at-coord / history-movement layers
+   * (`map-dl-heatmap-overlay.tsx`): `dl-<id>-rh-heat` under the config's
+   * points, or instead of them (`mode: 'only'`). Memoise it like
+   * `pointCluster`. null / unset = off, nothing installed.
+   */
+  pointHeatmap?: PointHeatmapSpec | null
 }
 
 /**
@@ -305,7 +394,6 @@ const DataLinkTooltipContext = createContext<DataLinkTooltipCtx>({ disable: fals
  * within a paint tick — the poll is just a safety net for the "another
  * tab wrote something" case where our local invalidation didn't fire.
  */
-const LAYER_ROWS_POLL_MS = 30_000
 
 /**
  * v5.4 — resolve the effective entity list for a sub-renderer. When
@@ -313,94 +401,326 @@ const LAYER_ROWS_POLL_MS = 30_000
  * bypass the live query and read reconstructed entities at the
  * playhead; otherwise we return the live query's data. Centralised
  * so every sub-renderer picks up playback support in one edit.
+ *
+ * The playback subscription is per source and only wakes this
+ * component when the entity set at the playhead changes — not on every
+ * playhead tick, and never for another source's playback.
  */
 function useEffectiveEntities(
   config: DataLinkConfig,
   liveEntities: readonly EntityState[] | undefined,
 ): { entities: EntityState[]; playbackActive: boolean } {
-  const playback = useTablePlaybackState()
-  const playbackActive =
-    config.sourceId !== undefined && playback.activeSourceId === config.sourceId
+  const playback = useTablePlaybackFor(config.sourceId)
   const entities = useMemo(
     () =>
-      playbackActive
-        ? visibleEntities(config.sourceId!)
-        : (liveEntities ?? []) as EntityState[],
-    // playback.currentMs is intentional so the render follows the scrubber.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [playbackActive, playback.currentMs, playback.events, liveEntities, config.sourceId],
+      playback.active && playback.entities
+        ? playback.entities
+        : (liveEntities ?? EMPTY_ENTITIES) as EntityState[],
+    [playback.active, playback.entities, liveEntities],
   )
-  return { entities, playbackActive }
+  return { entities, playbackActive: playback.active }
 }
 
 /**
- * v5.4 — paint expressions that fade a feature to opacity 0 when the
- * analytic occlusion pass (`useDataLinkOcclusion`) has marked it
- * hidden. Used across every sub-renderer's disc / icon / label /
- * ring paint block so occlusion behaves identically regardless of
- * render mode. The `1` fallback is the layer's normal opacity — a
- * layer that wants a data-driven base opacity can inline the case
- * around that expression instead of these constants.
+ * The layer's rows, with unchanged rows keeping their object identity
+ * across refetches (see row-sharing.ts), and its loading flag reported
+ * to the data-link loader along with whether rows are already held. The
+ * viewer's blocking card covers only loads with no rows (useApiQuery
+ * keeps `data` across a key change, so `data` is undefined until the
+ * first response or after the cache entry was dropped); a refresh (SSE
+ * invalidation, floor switch) shows only in the editor's pill.
  */
-// v5.4 — property-based, NOT feature-state. GeoJSON `source.setData(...)`
-// wipes feature-state on every call (a lot: SSE update, poll tick, style
-// rule refetch, entity edit — the whole point of the overlay is that
-// data updates often), which was silently un-hiding markers between
-// occlusion recomputes. Stamping `occluded` in `feature.properties`
-// instead makes hiding persist across every setData because Mapbox
-// copies properties verbatim into the source cache.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const OCCLUSION_TEXT_OPACITY: any = [
-  'case',
-  ['boolean', ['get', 'occluded'], false],
-  0,
-  1,
-]
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const OCCLUSION_ICON_OPACITY: any = [
-  'case',
-  ['boolean', ['get', 'occluded'], false],
-  0,
-  1,
-]
+function useLayerRows(
+  config: DataLinkConfig,
+  query: { data: EntityState[] | undefined; isLoading: boolean },
+): readonly EntityState[] | undefined {
+  useLayerLoading(config.id, config.name, query.isLoading, query.data !== undefined)
+  return useSharedRows(query.data)
+}
+
+/** `data_source_rows` row → the `EntityState` the builders read (as `fetchLayerRows` maps it). */
+function focusRowToEntity(row: Awaited<ReturnType<typeof getRowForSource>>): EntityState | null {
+  if (!row) return null
+  return {
+    id: row.id,
+    streamId: 0,
+    entityKey: row.entityKey,
+    payload: row.payload,
+    position: row.position,
+    lastSeenAt: new Date(row.ts),
+    updatedAt: new Date(row.updatedAt),
+  }
+}
 
 /**
- * Coerce a payload coord value to a finite number, or `undefined` when
- * the value can't be parsed. Handles the three common cases: native
- * number, numeric string (`"-121.76"` — how file-imported rows land in
- * `data_source_rows.payload`), and missing / non-numeric values.
+ * Fetches the focused row by key when the layer's own query doesn't hold
+ * it — a filter preset or the active floor is pushed to the server
+ * (`fetchLayerRows`), so a row the user asked to see can be missing from
+ * `query.data`. Mounted only while that is the case, so it costs nothing
+ * otherwise. Its key sits under `layer-rows` with the source id at
+ * deps[2], so the same SSE invalidations refresh it.
  */
+function FocusedRowLoader({
+  sourceId,
+  entityKey,
+  onRow,
+}: {
+  sourceId: number
+  entityKey: string
+  onRow: (entityKey: string, row: EntityState | null) => void
+}) {
+  const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
+  const query = useApiQuery(
+    () => getRowForSource(sourceId, entityKey).then(focusRowToEntity),
+    ['layer-rows', tenantId, sourceId, 'focus-row', entityKey],
+    { intervalMs: layerPollMs },
+  )
+  const done = query.data !== undefined || (!query.isLoading && query.error !== null)
+  const row = query.data ?? null
+  useEffect(() => {
+    if (done) onRow(entityKey, row)
+  }, [done, row, entityKey, onRow])
+  return null
+}
+
 /**
- * v5.4 — adapt a `data_source_row_events` list to the `EntityState`
- * shape the heatmap sub-renderer already consumes, so the history vs
- * live source swap is invisible to the render code. `entityKey` is
- * preserved so tooltips still identify the record; `payload` is the
- * per-event snapshot so lng/lat & style-rule inputs come out of it
- * unchanged. `streamId` is a synthetic negative placeholder — nothing
- * downstream keys off it once `sourceId` is set, but a numeric value
- * keeps existing code happy.
+ * The rows a sub-renderer builds from, with the focused row of this
+ * config added when the layer's query left it out (see FocusedRowLoader).
+ * `settled` is true once the focused row is known to be in `rows` or known
+ * to be absent — the moment a missing anchor can be reported as "not
+ * drawn". With no focus here, `rows` is `entities` itself.
  */
-function eventsToEntities(events: readonly TableRowEvent[]): EntityState[] {
-  return events.map((e) => {
-    const ts = new Date(e.ts)
-    return {
-      entityKey: e.entityKey,
-      streamId: -1,
-      payload: e.payload,
-      lastSeenAt: ts,
-      updatedAt: ts,
-    }
+function useFocusedRows(
+  config: DataLinkConfig,
+  entities: EntityState[],
+  focusKey: string | null,
+  loaded: boolean,
+  canFetch: boolean,
+): { rows: EntityState[]; settled: boolean; loader: React.ReactNode } {
+  const present = useMemo(
+    () => focusKey === null || entities.some((e) => e.entityKey === focusKey),
+    [entities, focusKey],
+  )
+  const sourceId = config.sourceId
+  const fetchable = canFetch && sourceId !== undefined && sourceId !== null
+  const [fetched, setFetched] = useState<{ key: string; row: EntityState | null } | null>(null)
+  const got = fetched !== null && fetched.key === focusKey ? fetched : null
+  const extra = !present && got !== null ? got.row : null
+  const rows = useMemo(() => (extra ? [...entities, extra] : entities), [entities, extra])
+  const settled = focusKey === null || (loaded && (present || !fetchable || got !== null))
+  const onRow = useStableCallback((key: string, row: EntityState | null) => {
+    setFetched((prev) => (prev && prev.key === key && prev.row === row ? prev : { key, row }))
+  })
+  const loader =
+    focusKey !== null && loaded && !present && fetchable ? (
+      <FocusedRowLoader
+        key={focusKey}
+        sourceId={sourceId as number}
+        entityKey={focusKey}
+        onRow={onRow}
+      />
+    ) : null
+  return { rows, settled, loader }
+}
+
+/**
+ * Anchor reporting for a pending dl focus target (`FocusScene.needsDlAnchor`).
+ * The push effect hands every build to the returned `onDrawn(features,
+ * complete)`. As soon as a build drew the focused row, the anchor the
+ * builder actually used goes to the host. "Not drawn" (null) goes only
+ * from a COMPLETE build — rows loaded, the focused row present or known
+ * absent, the bound shapes arrived — so a row that is merely still
+ * loading is never reported missing. The overlay forwards each request
+ * once. Also answers when the host asks again for a row it already drew
+ * (no re-push needed).
+ */
+function useFocusAnchorReport(
+  config: DataLinkConfig,
+  focus: ConfigFocus,
+  liveFloorPlanIds: ReadonlySet<number> | undefined,
+): (features: readonly GeoJSON.Feature[], complete: boolean) => void {
+  const drawn = useRef<{ key: string; features: readonly GeoJSON.Feature[]; complete: boolean } | null>(null)
+  const send = useStableCallback(() => {
+    const d = drawn.current
+    const configId = config.id
+    if (configId === undefined || focus.key === null || !focus.needsAnchor) return
+    if (!d || d.key !== focus.key) return
+    const anchor = focusedAnchorOf(d.features, config, liveFloorPlanIds)
+    if (anchor || d.complete) focus.report(configId, focus.key, anchor)
+  })
+  const needsAnchor = focus.needsAnchor
+  useEffect(() => {
+    if (needsAnchor) send()
+  }, [needsAnchor, send])
+  return useStableCallback((features: readonly GeoJSON.Feature[], complete: boolean) => {
+    drawn.current = focus.key !== null ? { key: focus.key, features, complete } : null
+    send()
   })
 }
 
-function coerceCoord(v: unknown): number | undefined {
-  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined
-  if (typeof v === 'string' && v.trim().length > 0) {
-    const n = Number(v)
-    return Number.isFinite(n) ? n : undefined
-  }
-  return undefined
+// ---------------------------------------------------------------------------
+// Focus mode paint (see src/lib/focus/)
+// ---------------------------------------------------------------------------
+//
+// Three feature properties drive it, all stamped by the builders on cached
+// copies of a row's feature (`@/lib/data-link/feature-builders`):
+//
+//   - `focused: true` — the one row the user asked to see. It is never
+//     occluded, passes the layer filter and floor gate, and draws at its
+//     own opacity THROUGH floors and walls (`*-occlusion-opacity` 1).
+//   - `occluded: true` — a ghost row (Graphics → "Show hidden items as
+//     faint ghosts"): an analytically occluded row kept in the source,
+//     drawn at GHOST_OCCLUDED_OPACITY × its opacity, also through 3D
+//     content, so it reads as a consistent 25 % at every zoom (the depth
+//     test alone is too coarse at low zoom, which is why the analytic
+//     pass exists).
+//   - `focusNear: true` — a point row drawn inside the focused item's
+//     NEAR column (`FocusScene.near.region`, `isFocusNearPoint`), drawn at
+//     FOCUS_FACTOR.near × its opacity so it doesn't crowd the item.
+//     Unclustered point symbols only; every other row, and every
+//     aggregate (clusters, heatmap, tints, cones, roi rings, tracks),
+//     stays exactly as drawn without focus — there is no global dim.
+//
+// Properties, not feature-state: a GeoJSON `setData` wipes feature-state,
+// and stamping the row keeps it across every write (v5.4). The paint is
+// installed once in its focus-aware form and NEVER swapped on focus enter
+// / exit: a data-driven `setPaintProperty` re-lays out the whole source,
+// and racing that against the floor gate's `setData` during a focus
+// flight made GL's symbol placement read a feature index that no longer
+// matched its tile ("reading '0'" in FeatureIndex.loadFeature).
+//
+// While no row carries any flag (focus off, ghosts off) every expression
+// below evaluates to exactly the value the layer had before focus mode —
+// `*-occlusion-opacity` 0, opacity = the layer's base — so installing them
+// changes nothing on screen. The `*-occlusion-opacity` properties stay in
+// `layer.paint`, so GL's symbol-merge classification
+// (`hasOcclusionOpacityProperties`) is unchanged too.
+
+type PaintValue = number | mapboxgl.ExpressionSpecification
+
+const FOCUSED_ROW: mapboxgl.ExpressionSpecification = ['boolean', ['get', 'focused'], false]
+const GHOST_ROW: mapboxgl.ExpressionSpecification = ['boolean', ['get', 'occluded'], false]
+const NEAR_ROW: mapboxgl.ExpressionSpecification = ['boolean', ['get', 'focusNear'], false]
+
+/** Point symbols: hidden behind 3D content, except the focused row and ghost rows. */
+const POINT_OCCLUSION_OPACITY: mapboxgl.ExpressionSpecification = [
+  'case', FOCUSED_ROW, 1, GHOST_ROW, 1, 0,
+]
+/** Aggregate / track / heatmap symbols (no ghost rows): only the focused row shows through. */
+const FOCUS_OCCLUSION_OPACITY: mapboxgl.ExpressionSpecification = ['case', FOCUSED_ROW, 1, 0]
+
+/** `base × f`, folded when `base` is a constant. */
+function scaleOpacity(base: PaintValue, f: number): PaintValue {
+  return typeof base === 'number' ? Math.round(base * f * 1e6) / 1e6 : ['*', f, base]
 }
+
+/**
+ * A point symbol's opacity: the focused row at `base`, ghost rows at
+ * GHOST × `base`, rows in the focused item's NEAR column at NEAR × `base`,
+ * every other row at `base` (precedence focused > ghost > near).
+ */
+function pointSymbolOpacity(base: PaintValue): mapboxgl.ExpressionSpecification {
+  return [
+    'case',
+    FOCUSED_ROW, base,
+    GHOST_ROW, scaleOpacity(base, GHOST_OCCLUDED_OPACITY),
+    NEAR_ROW, scaleOpacity(base, FOCUS_FACTOR.near),
+    base,
+  ]
+}
+
+/**
+ * Set a paint property only when the layer holds a different value. GL
+ * already skips an identical write, but a style-sync effect that re-runs
+ * on every install tick then reads as no write at all — the focus proofs
+ * count paint writes.
+ */
+function setPaintIfChanged(map: MapboxMapInstance, layerId: string, prop: string, value: PaintValue): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = map as any
+  const held: unknown = m.getPaintProperty(layerId, prop)
+  if (held === value || JSON.stringify(held) === JSON.stringify(value)) return
+  m.setPaintProperty(layerId, prop, value)
+}
+
+/** `value` in a ref that is current by the time any passive effect runs. */
+function useLatest<T>(value: T): React.RefObject<T> {
+  const ref = useRef(value)
+  useLayoutEffect(() => {
+    ref.current = value
+  })
+  return ref
+}
+
+/**
+ * Focus state as the sub-renderers see it — primitives (and the NEAR
+ * region, whose identity is stable per focus) only, so the memo'd
+ * sub-renderers never hold the host's FocusScene object. One value per
+ * focus enter / exit / NEAR column / anchor request / ghost toggle.
+ */
+interface DataLinkFocusCtx {
+  /** Config of the focused data-link row (`FocusScene.dl`), else null. */
+  configId: number | null
+  /** Entity key of the focused row, else null. */
+  entityKey: string | null
+  /**
+   * `FocusScene.near.region`: point rows drawn inside it are stamped
+   * `focusNear` (null = no column: focus off, pending, a floor plan).
+   */
+  nearRegion: FocusNearRegion | null
+  /** Graphics → "Show hidden items as faint ghosts". */
+  ghosts: boolean
+  /** The host waits for the focused row's drawn anchor. */
+  needsAnchor: boolean
+  /** Report where the focused row is drawn (null = not drawn). Stable. */
+  report: (configId: number, entityKey: string, anchor: DlAnchor | null) => void
+}
+const DataLinkFocusContext = createContext<DataLinkFocusCtx>({
+  configId: null,
+  entityKey: null,
+  nearRegion: null,
+  ghosts: false,
+  needsAnchor: false,
+  report: () => {},
+})
+
+/** The focus context narrowed to one config. */
+interface ConfigFocus {
+  /** The focused row's entity key when it belongs to this config, else null. */
+  key: string | null
+  /** The focused item's NEAR column (see DataLinkFocusCtx.nearRegion). */
+  near: FocusNearRegion | null
+  ghosts: boolean
+  /** `key !== null` and the host waits for its anchor. */
+  needsAnchor: boolean
+  report: DataLinkFocusCtx['report']
+}
+
+function useConfigFocus(config: DataLinkConfig): ConfigFocus {
+  const ctx = useContext(DataLinkFocusContext)
+  const key = ctx.configId !== null && ctx.configId === config.id ? ctx.entityKey : null
+  return {
+    key,
+    near: ctx.nearRegion,
+    ghosts: ctx.ghosts,
+    needsAnchor: key !== null && ctx.needsAnchor,
+    report: ctx.report,
+  }
+}
+
+/** Render modes that mount a sub-renderer (`ActiveConfigsRenderer`). */
+const RENDERED_MODES: ReadonlySet<string> = new Set([
+  'point-at-coord',
+  'history-movement',
+  'point-on-shape',
+  'gauge-on-shape',
+  'shape-tint',
+  'heatmap',
+  'track',
+  'fov-cone',
+  'roi-pulse',
+])
 
 export function MapDataLinkedOverlay({
   map,
@@ -408,22 +728,24 @@ export function MapDataLinkedOverlay({
   configs,
   visible = true,
   enabled = true,
-  polygons = [],
-  circles = [],
-  markers = [],
-  lines = [],
-  models = [],
-  occluderImages = [],
-  occluderStairs = [],
+  polygons = EMPTY_POLYGONS,
+  circles = EMPTY_CIRCLES,
+  markers = EMPTY_MARKERS,
+  lines = EMPTY_LINES,
+  models = EMPTY_MODELS,
+  occluderImages = EMPTY_IMAGES,
+  occluderStairs = EMPTY_STAIRS,
   occluderPolygons,
   occluderCircles,
   occluderLines,
-  styleRules = [],
+  styleRules = EMPTY_RULES,
   disableTooltips = false,
   activeFloorPlanId = null,
   liveFloorPlanIds,
   configFilters,
   onEntityViewMore,
+  pointCluster = null,
+  pointHeatmap = null,
 }: MapDataLinkedOverlayProps) {
   // v5.5 — separate occluder + shape-anchor arrays. Host may pin
   // occluders to the visible-floor filtered set while still passing
@@ -432,11 +754,17 @@ export function MapDataLinkedOverlay({
   const effectiveOccluderPolygons = occluderPolygons ?? polygons
   const effectiveOccluderCircles = occluderCircles ?? circles
   const effectiveOccluderLines = occluderLines ?? lines
-  // Set form for O(1) orphan lookups. Memoised on the id list so
-  // sub-renderers don't rebuild it every render.
+  // Set form for O(1) orphan lookups. Keyed on the id list's CONTENT, not
+  // its reference: a host that rebuilds the list every render (the editor
+  // did) would otherwise hand every sub-renderer a new Set each time and
+  // re-run every config's filter + push.
+  const liveFloorPlanIdKey = (liveFloorPlanIds ?? []).join(',')
   const liveFloorPlanIdSet = useMemo(
-    () => new Set(liveFloorPlanIds ?? []),
-    [liveFloorPlanIds],
+    () =>
+      new Set(
+        liveFloorPlanIdKey === '' ? [] : liveFloorPlanIdKey.split(',').map(Number),
+      ),
+    [liveFloorPlanIdKey],
   )
   // Only render configs scoped to the active warehouse. Multiple
   // configs can share the map (e.g. one for forklifts + one for
@@ -453,14 +781,51 @@ export function MapDataLinkedOverlay({
   // broadcast a `data-sources` SSE event. That kind is deliberately absent
   // from useSSE's VALID_KINDS (it is not a spatial entity), so it arrives on
   // the external channel — without this, table-backed layers would only
-  // refresh on the LAYER_ROWS_POLL_MS tick.
-  useEffect(
-    () =>
-      subscribeExternalSSE((kind) => {
-        if (kind === 'data-sources') queryCache.invalidate('layer-rows')
-      }),
-    [],
-  )
+  // refresh on the layer poll tick (`useLayerPollMs`, 30 s by default).
+  //
+  // The event's id is the source that changed, so only the layers reading
+  // that table refetch (`layer-rows` keys carry the source id at deps[2]);
+  // an id of 0 means "reload the kind" and refreshes every layer, as all
+  // events used to. A burst of writes (a simulator tick, an import)
+  // arrives as many events, each in its own task; they are folded into
+  // one invalidation per animation frame (the timeout covers a hidden
+  // tab, where frames don't run).
+  useEffect(() => {
+    let raf: number | null = null
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let all = false
+    const sourceIds = new Set<number>()
+    const cancel = () => {
+      if (raf !== null) cancelAnimationFrame(raf)
+      if (timer !== null) clearTimeout(timer)
+      raf = null
+      timer = null
+    }
+    const flush = () => {
+      cancel()
+      if (all) {
+        queryCache.invalidate('layer-rows')
+      } else if (sourceIds.size > 0) {
+        const ids = new Set(sourceIds)
+        queryCache.invalidateWhere('layer-rows', (deps) => ids.has(deps[2] as number))
+      }
+      all = false
+      sourceIds.clear()
+    }
+    const unsubscribe = subscribeExternalSSE((kind, ev) => {
+      if (kind !== 'data-sources') return
+      const id = Number(ev?.id)
+      if (Number.isInteger(id) && id > 0) sourceIds.add(id)
+      else all = true
+      if (raf !== null || timer !== null) return
+      raf = requestAnimationFrame(flush)
+      timer = setTimeout(flush, 50)
+    })
+    return () => {
+      unsubscribe()
+      cancel()
+    }
+  }, [])
 
   // (Removed) Diagnostic breadcrumb that logged on every re-render.
   // Even under `import.meta.env.DEV` it spammed the console because
@@ -477,11 +842,19 @@ export function MapDataLinkedOverlay({
   //       `styledata` event — because sub-renderers repeatedly emit
   //       `styledata` while installing, and re-running the sweep on
   //       each of those would race the install and remove
-  //       just-installed layers.
-  //   (b) On every `styledata` event, re-raise the surviving `dl-*`
-  //       layers to the top of the stack so widgets stay visible
-  //       above any overlay whose layers get pushed on top of ours
-  //       during a style swap.
+  //       just-installed layers. Reads the style's own layer order and
+  //       source list (`dl-layer-stack.ts`), not `getStyle()`, which
+  //       serialises the whole style including the imported basemap.
+  //   (b) On every `styledata` event, keep the `dl-*` layers on top of
+  //       the stack as one block (`raiseDataLinkLayers`) so widgets stay
+  //       visible above any overlay whose layers get pushed on top of
+  //       ours during a style swap. The raise moves nothing when the
+  //       block is already on top. It used to move every `dl-*` layer
+  //       unconditionally, and since every `moveLayer` dirties the style,
+  //       the next frame fired `styledata` again: with one data-link layer
+  //       on the map, the map re-ran full symbol placement every frame and
+  //       never went idle. Only registered while a config is active, so a
+  //       facility without live data pays nothing.
   useEffect(() => {
     if (!map) return
     const activeIds = new Set(
@@ -496,65 +869,153 @@ export function MapDataLinkedOverlay({
       const n = Number(dash === -1 ? rest : rest.slice(0, dash))
       return Number.isFinite(n) ? n : null
     }
-    // (a) One-shot orphan removal on activeConfigs change.
+    // (a) One-shot orphan removal on activeConfigs change. Copies of the
+    // id lists: `removeLayer` / `removeSource` edit the live ones.
     try {
-      const style = map.getStyle()
-      if (style) {
-        for (const l of style.layers ?? []) {
-          if (typeof l.id !== 'string') continue
-          const cfgId = parseConfigId(l.id)
-          if (cfgId === null || activeIds.has(cfgId)) continue
-          try { map.removeLayer(l.id) } catch { /* concurrent */ }
-        }
-        for (const sourceId of Object.keys(style.sources ?? {})) {
-          const cfgId = parseConfigId(sourceId)
-          if (cfgId === null || activeIds.has(cfgId)) continue
-          try { map.removeSource(sourceId) } catch { /* concurrent */ }
-        }
+      for (const id of [...rootLayerOrder(map)]) {
+        const cfgId = parseConfigId(id)
+        if (cfgId === null || activeIds.has(cfgId)) continue
+        try { map.removeLayer(id) } catch { /* concurrent */ }
+      }
+      for (const sourceId of rootSourceIds(map)) {
+        const cfgId = parseConfigId(sourceId)
+        if (cfgId === null || activeIds.has(cfgId)) continue
+        try { map.removeSource(sourceId) } catch { /* concurrent */ }
       }
     } catch { /* style not ready */ }
-    // (b) Ongoing raise-to-top on styledata (no removals here).
+  }, [map, activeConfigs])
+
+  const hasActiveConfigs = activeConfigs.length > 0
+  useEffect(() => {
+    if (!map || !hasActiveConfigs) return
+    // (b) Guarded raise-to-top on styledata (no removals here).
     const raise = () => {
       try {
-        for (const l of map.getStyle()?.layers ?? []) {
-          if (typeof l.id !== 'string' || !l.id.startsWith('dl-')) continue
-          try { map.moveLayer(l.id) } catch { /* mid-swap */ }
-        }
+        raiseDataLinkLayers(map)
+        noteNewDataLinkLayers(map)
+      } catch { /* style not ready */ }
+    }
+    // One re-merge per new dl layer once its paint is evaluated (3D tints
+    // must sort below the markers) — see settleDataLinkMerge.
+    const settle = () => {
+      try {
+        settleDataLinkMerge(map)
       } catch { /* style not ready */ }
     }
     raise()
     map.on('styledata', raise)
+    map.on('render', settle)
     return () => {
       map.off('styledata', raise)
+      map.off('render', settle)
     }
-  }, [map, activeConfigs])
+  }, [map, hasActiveConfigs])
+
+  // Stable context value: a new object here re-rendered every tooltip on
+  // every host render. The "View more" callback keeps its identity too
+  // and always calls the host's latest handler.
+  const hasViewMore = onEntityViewMore !== undefined
+  const viewMore = useStableCallback(
+    (...args: Parameters<NonNullable<DataLinkTooltipCtx['onEntityViewMore']>>) =>
+      onEntityViewMore?.(...args),
+  )
+  const tooltipCtx = useMemo<DataLinkTooltipCtx>(
+    () => ({
+      disable: disableTooltips,
+      onEntityViewMore: hasViewMore ? viewMore : undefined,
+    }),
+    [disableTooltips, hasViewMore, viewMore],
+  )
+
+  // ---- focus mode ---------------------------------------------------------
+  // The host's FocusScene (viewer / report map / editor) narrowed to the
+  // primitives the sub-renderers need; the memo'd sub-renderers only ever
+  // see these, never the scene object.
+  const scene = useFocusScene()
+  const ghosts = useGraphicsSettings((s) => s.occlusionGhosts)
+  const focusConfigId = scene.dl?.configId ?? null
+  const focusEntityKey = scene.dl?.entityKey ?? null
+  // Stable per focus (and per NEAR content): a camera move never changes it.
+  const nearRegion = scene.near.region
+  const needsAnchor = scene.needsDlAnchor
+  const sceneKey = scene.key
+  const onDlAnchor = scene.onDlAnchor
+  // Latest request, current before any sub-renderer's effect runs (layout
+  // effects precede every passive effect of the commit).
+  const anchorRequest = useRef({ sceneKey, needsAnchor, focusConfigId, focusEntityKey, onDlAnchor })
+  // The sceneKey whose anchor went out; cleared once the host stops asking,
+  // so focusing the same row again later asks (and answers) again.
+  const anchorSentFor = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    anchorRequest.current = { sceneKey, needsAnchor, focusConfigId, focusEntityKey, onDlAnchor }
+    if (!needsAnchor) anchorSentFor.current = null
+  })
+  /** Forward a drawn anchor to the host: once per request, for the row it asked about. */
+  const reportAnchor = useStableCallback(
+    (configId: number, entityKey: string, anchor: DlAnchor | null) => {
+      const req = anchorRequest.current
+      if (!req.needsAnchor || !req.onDlAnchor) return
+      if (req.focusConfigId !== configId || req.focusEntityKey !== entityKey) return
+      if (anchorSentFor.current === req.sceneKey) return
+      anchorSentFor.current = req.sceneKey
+      req.onDlAnchor(req.sceneKey, anchor)
+    },
+  )
+  const focusCtx = useMemo<DataLinkFocusCtx>(
+    () => ({
+      configId: focusConfigId,
+      entityKey: focusEntityKey,
+      nearRegion,
+      ghosts,
+      needsAnchor,
+      report: reportAnchor,
+    }),
+    [focusConfigId, focusEntityKey, nearRegion, ghosts, needsAnchor, reportAnchor],
+  )
+  // No sub-renderer will ever draw the requested row: its config isn't
+  // active on this map (disabled, another facility, hidden by the host) or
+  // the overlay is switched off. An empty `configs` list is still loading,
+  // so it isn't an answer yet.
+  const configCount = configs.length
+  useEffect(() => {
+    if (!needsAnchor || focusConfigId === null || focusEntityKey === null) return
+    if (!map || activeZoneId === null) return
+    if (enabled) {
+      if (configCount === 0) return
+      const cfg = activeConfigs.find((c) => c.id === focusConfigId)
+      if (cfg && RENDERED_MODES.has(cfg.renderMode)) return
+    }
+    reportAnchor(focusConfigId, focusEntityKey, null)
+  }, [needsAnchor, focusConfigId, focusEntityKey, map, activeZoneId, enabled, configCount, activeConfigs, reportAnchor])
 
   if (!map || !enabled || activeZoneId === null) return null
 
   return (
-    <DataLinkTooltipContext.Provider
-      value={{ disable: disableTooltips, onEntityViewMore }}
-    >
-      <ActiveConfigsRenderer
-        activeConfigs={activeConfigs}
-        map={map}
-        visible={visible}
-        enabled={enabled}
-        styleRules={styleRules}
-        activeFloorPlanId={activeFloorPlanId}
-        liveFloorPlanIds={liveFloorPlanIdSet}
-        configFilters={configFilters}
-        polygons={polygons}
-        circles={circles}
-        markers={markers}
-        lines={lines}
-        models={models}
-        occluderImages={occluderImages}
-        occluderStairs={occluderStairs}
-        occluderPolygons={effectiveOccluderPolygons}
-        occluderCircles={effectiveOccluderCircles}
-        occluderLines={effectiveOccluderLines}
-      />
+    <DataLinkTooltipContext.Provider value={tooltipCtx}>
+      <DataLinkFocusContext.Provider value={focusCtx}>
+        <ActiveConfigsRenderer
+          activeConfigs={activeConfigs}
+          map={map}
+          visible={visible}
+          enabled={enabled}
+          styleRules={styleRules}
+          activeFloorPlanId={activeFloorPlanId}
+          liveFloorPlanIds={liveFloorPlanIdSet}
+          configFilters={configFilters}
+          polygons={polygons}
+          circles={circles}
+          markers={markers}
+          lines={lines}
+          models={models}
+          occluderImages={occluderImages}
+          occluderStairs={occluderStairs}
+          occluderPolygons={effectiveOccluderPolygons}
+          occluderCircles={effectiveOccluderCircles}
+          occluderLines={effectiveOccluderLines}
+          pointCluster={pointCluster}
+          pointHeatmap={pointHeatmap}
+        />
+      </DataLinkFocusContext.Provider>
     </DataLinkTooltipContext.Provider>
   )
 }
@@ -562,9 +1023,11 @@ export function MapDataLinkedOverlay({
 /**
  * Split out so the parent's `activeConfigs.map(config => ...)` can
  * memo the shape props array ONCE per parent render instead of once
- * per config. The individual sub-renderer components stay
- * unmemoised for now (memoising them would need stable per-config
- * `filter` refs which we compute here).
+ * per config. The sub-renderers are `memo` components: every prop
+ * handed down here is either a host array, a memo, or the per-config
+ * `configFilters[id]` entry (stable while the filter map is), so a host
+ * re-render that changed nothing they read no longer re-runs their
+ * filter, rule and push effects.
  */
 function ActiveConfigsRenderer({
   activeConfigs,
@@ -585,6 +1048,8 @@ function ActiveConfigsRenderer({
   occluderPolygons,
   occluderCircles,
   occluderLines,
+  pointCluster,
+  pointHeatmap,
 }: {
   activeConfigs: readonly DataLinkConfig[]
   map: MapboxMapInstance
@@ -604,6 +1069,8 @@ function ActiveConfigsRenderer({
   occluderPolygons: ReadonlyArray<PolygonShape>
   occluderCircles: ReadonlyArray<CircleShape>
   occluderLines: ReadonlyArray<LineShape>
+  pointCluster: PointClusterSpec | null
+  pointHeatmap: PointHeatmapSpec | null
 }) {
   // v4 — one memoised shape props object shared by every shape-anchored
   // sub-renderer. Previously recreated on every activeConfigs.map
@@ -652,7 +1119,15 @@ function ActiveConfigsRenderer({
             // Same sub-renderer — the playback store swap-in
             // (`useEffectiveEntities`) is what makes `history-movement`
             // scrub through events instead of pulling live rows.
-            return <PointAtCoordSubRenderer key={k} {...commonProps} />
+            return (
+              <PointAtCoordSubRenderer
+                key={k}
+                {...commonProps}
+                pointCluster={pointCluster ?? null}
+                roomPolygons={pointCluster?.mode === 'room' ? polygons : undefined}
+                pointHeatmap={heatmapCovers(pointHeatmap, config.id) ? pointHeatmap : null}
+              />
+            )
           case 'point-on-shape':
             return <PointOnShapeSubRenderer key={k} {...commonProps} {...shapeProps} />
           case 'gauge-on-shape':
@@ -728,6 +1203,16 @@ interface SubRendererProps {
   occluderStairs?: ReadonlyArray<StairShape>
 }
 
+/** Runtime clustering inputs of the point-at-coord sub-renderer. */
+interface PointClusterProps {
+  /** See MapDataLinkedOverlayProps.pointCluster (null = off). */
+  pointCluster?: PointClusterSpec | null
+  /** Room mode only: the facility's polygons (the rooms). */
+  roomPolygons?: ReadonlyArray<PolygonShape>
+  /** See MapDataLinkedOverlayProps.pointHeatmap — already narrowed to this config. */
+  pointHeatmap?: PointHeatmapSpec | null
+}
+
 interface ShapeAnchorProps {
   polygons: ReadonlyArray<PolygonShape>
   circles: ReadonlyArray<CircleShape>
@@ -742,7 +1227,7 @@ interface ShapeAnchorProps {
  * cluster bubble + count. Individual points always draw a circle,
  * arrow (if payload has `heading`), and a text label.
  */
-function PointAtCoordSubRenderer({
+const PointAtCoordSubRenderer = memo(function PointAtCoordSubRenderer({
   map,
   config,
   visible,
@@ -757,15 +1242,22 @@ function PointAtCoordSubRenderer({
   occluderCircles,
   occluderLines,
   occluderStairs,
-}: SubRendererProps) {
+  pointCluster = null,
+  roomPolygons,
+  pointHeatmap = null,
+}: SubRendererProps & PointClusterProps) {
   const configId = config.id
   const tenantId = useCurrentTenantId()
+  // Runtime clustering (null = off: every line below behaves as before).
+  const runtime = configId !== undefined ? pointCluster : null
+  const runtimeActive = runtime !== null
 
-  // Poll the stream's entities on `LAYER_ROWS_POLL_MS` (30s) — the
+  // Poll the stream's entities on `useLayerPollMs()` (30 s by default) — the
   // safety net. Every scheduled / manual rerun invalidates the
   // `layer-rows` cache from `rerunDataSource`, which triggers an
   // immediate refetch, so the poll only kicks in as a backstop for
   // cross-tab updates.
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -773,10 +1265,33 @@ function PointAtCoordSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+
+  // Focus mode: the focused row of this config (fetched on its own when
+  // the layer's query left it out), ghost rows, rows in the focused item's
+  // NEAR column. A clustered config never draws ghosts nor stamps NEAR
+  // rows (a bubble aggregates them). A natively clustered or unclustered
+  // config draws its focused row on its own source (`dl-focus-<id>-*`,
+  // registered last in the dl block): a row in a clustered source can't
+  // be kept out of a bubble, and a row in a plain source would draw
+  // UNDER the rows after it — e.g. one RFID bag among the ~40 at the
+  // same carousel coordinate. A manually clustered config keeps its
+  // focused row last in its own source (never folded into a bubble).
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  // Runtime clustering replaces the config's own native / manual clusters
+  // while it is on: the config draws like an unclustered one (dynamic
+  // source, focus twin, ghosts, NEAR) and the bubbles come from the runtime
+  // layer.
+  const clustered = config.style.cluster === true && !runtimeActive
+  const nativeCluster = clustered && !config.fieldMapping.clusterGroupField
+  const ghostsHere = focus.ghosts && !clustered
+  const nearHere = clustered ? null : focus.near
+  const visibleRef = useLatest(visible)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   // Track that our sources/layers exist so downstream data-push
   // effects don't push against a torn-down style. `installedRef` is
@@ -794,10 +1309,33 @@ function PointAtCoordSubRenderer({
   // one map. Using the id (not the name) so a rename doesn't leak
   // old sources.
   const ids = useMemo(() => sourceLayerIds(configId ?? 0), [configId])
+  const focusIds = useMemo(() => focusLayerIds(configId ?? 0), [configId])
   const tooltipLayerIds = useMemo(
     () => [ids.point, ids.icon, ids.label],
     [ids.point, ids.icon, ids.label],
   )
+  // The runtime bubbles sit under this config's singles, so the focused
+  // row (always a single) and its ring draw above its pile's bubble.
+  const rcIds = useMemo(() => runtimeClusterIds(configId ?? 0), [configId])
+  const ownLayerIds = useMemo(
+    () => [ids.cluster, ids.clusterCount, rcIds.bubble, rcIds.count, ids.point, ids.icon, ids.label],
+    [ids, rcIds],
+  )
+  const focusLayerList = useMemo(
+    () => [focusIds.point, focusIds.icon, focusIds.label],
+    [focusIds],
+  )
+
+  // Diff-only writes to the (dynamic) source, plus the per-row feature
+  // cache that lets an unchanged row hand the writer the same feature
+  // object it wrote last time. See pushFeatures.
+  const writer = useSourceWriter(map, ids.source)
+  const focusWriter = useSourceWriter(map, focusIds.source)
+  const [rowCache] = useState(() => createRowBuildCache<GeoJSON.Feature<GeoJSON.Point> | null>())
+
+  // A native cluster source can't be dynamic: reinstall only when THAT
+  // changes (an unclustered config never reinstalls on a runtime toggle).
+  const shouldNativeCluster = config.style.cluster === true && !runtimeActive
 
   // ---- install / uninstall on map + enabled + config change --------------
   useEffect(() => {
@@ -824,24 +1362,25 @@ function PointAtCoordSubRenderer({
           [config.style.defaultIcon ?? 'map-pin'],
           { color: iconColor },
         ).then(() => {
-          installSourcesAndLayers(map, ids, config)
+          installSourcesAndLayers(map, ids, config, runtimeActive)
           installedRef.current = true
           if (import.meta.env.DEV) {
-            // eslint-disable-next-line no-console
             console.debug(`[map-dl:${config.name}] install complete`, {
               entities: entities.length,
               configId: config.id,
             })
           }
+          // The features go in from the push effect, which re-runs on
+          // this tick. (Pushing here too used to write the closure's
+          // stale, UNfiltered rows for a frame.)
           setInstallTick((t) => t + 1)
-          pushFeatures(map, ids, config, entities, styleRules, polygons)
           pushVisibility(map, ids, visible)
         })
       },
       `[map-dl:${config.name}]`,
     )
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, enabled, ids.point, ids.cluster, config.style.cluster])
+  }, [map, enabled, ids.point, ids.cluster, shouldNativeCluster])
 
   // ---- style sync: default colour only ---------------------------------
   // Sizes now flow via feature properties (`discSize` + `iconSize`
@@ -858,7 +1397,7 @@ function PointAtCoordSubRenderer({
     if (!enabled || !map) return
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(ids.point)) {
+      if (hasMapLayer(map, ids.point)) {
         map.setPaintProperty(ids.point, 'text-color', [
           'coalesce',
           ['get', 'color'],
@@ -873,6 +1412,19 @@ function PointAtCoordSubRenderer({
     ids.point,
     config.style.defaultColor,
   ])
+  // The focus twin's disc is installed with the colour of its moment; a
+  // colour edit while it is up re-applies it (no-op while it is down).
+  const defaultColor = config.style.defaultColor
+  useEffect(() => {
+    if (!enabled || !hasMapLayer(map, focusIds.point)) return
+    try {
+      map.setPaintProperty(focusIds.point, 'text-color', [
+        'coalesce',
+        ['get', 'color'],
+        defaultColor ?? '#3b82f6',
+      ])
+    } catch { /* mid-teardown */ }
+  }, [map, enabled, focusIds.point, defaultColor])
 
   // ---- pre-filter entities: layer filter + active-floor gate ---------
   // Applied before `pushFeatures` so both the ingest and re-emit paths
@@ -882,9 +1434,13 @@ function PointAtCoordSubRenderer({
   // `liveFloorPlanIds`) as unknown — so entities whose data references
   // a deleted floor keep rendering instead of vanishing on the current
   // floor.
+  // Focus mode: the focused row passes both gates — the user asked to see
+  // it, whatever the filter preset or the floor picker say.
   const floorScope = config.fieldMapping.floorScope
+  const focusKey = focus.key
   const filteredEntities = useMemo(() => {
-    return entities.filter((e) => {
+    return rows.filter((e) => {
+      if (focusKey !== null && e.entityKey === focusKey) return true
       if (filter && !evaluateDataLinkFilter(e.payload, filter)) return false
       if (
         !passesFloorScope(
@@ -898,7 +1454,7 @@ function PointAtCoordSubRenderer({
       }
       return true
     })
-  }, [entities, filter, floorScope, activeFloorPlanId, liveFloorPlanIds])
+  }, [rows, focusKey, filter, floorScope, activeFloorPlanId, liveFloorPlanIds])
 
   // ---- analytic occlusion ------------------------------------------------
   // Deterministic hiding at every zoom level. `occludedVersion` bumps
@@ -910,7 +1466,9 @@ function PointAtCoordSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    // The rows it pushes (layer filter + floor gate applied).
+    entities: filteredEntities,
+    focusKey,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -919,42 +1477,164 @@ function PointAtCoordSubRenderer({
   })
 
   // ---- push new features whenever data changes ----------------------------
+  // Layer order is no longer touched here: the container keeps the whole
+  // `dl-*` block on top (see useDataLinkLayerStack).
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, filteredEntities, enabled)
+
+  // Focus twin (natively clustered and unclustered configs): up only
+  // while one of its rows is focused, removed when focus leaves. Declared
+  // before the push so the push of the same commit finds its source.
+  const splitFocused = nativeCluster || !clustered
+  const wantFocusLayers = enabled && splitFocused && focusKey !== null
+  useEffect(() => {
+    if (!wantFocusLayers || installTick === 0 || !installedRef.current) return
+    try {
+      installFocusLayers(map, focusIds, config, visibleRef.current)
+    } catch { /* style mid-swap — the next install re-runs this */ }
+    return () => safeTeardown(map, () => teardownFocusLayers(map, focusIds))
+    // `config` is read at install only (the colour sync above follows edits).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, wantFocusLayers, installTick, focusIds])
+
+  // ---- runtime clustering inputs (all inert while it is off) -------------
+  const zoomBucket = useClusterZoomBucket(map, enabled && runtimeActive)
+  const clusterField = runtime?.mode === 'field' ? runtime.field : undefined
+  // Per row: its floor (as the floor gate resolves it) and, by field, its value.
+  const clusterMeta = useMemo<ReadonlyMap<string, { floor: number | null; part: string }> | null>(() => {
+    if (!runtimeActive) return null
+    const out = new Map<string, { floor: number | null; part: string }>()
+    for (const e of filteredEntities) {
+      let floor = resolveEntityFloor(e.payload, null, { field: floorScope?.field, valueMap: floorScope?.valueMap })
+      if (floor !== null && liveFloorPlanIds && liveFloorPlanIds.size > 0 && !liveFloorPlanIds.has(floor)) floor = null
+      let part = ''
+      if (clusterField) {
+        const v = readPayloadPath(e.payload, clusterField)
+        part = v === undefined || v === null ? '' : String(v)
+      }
+      out.set(e.entityKey, { floor, part })
+    }
+    return out
+  }, [runtimeActive, filteredEntities, floorScope, liveFloorPlanIds, clusterField])
+  const rooms = useMemo<RoomIndex | null>(
+    () => (runtime?.mode === 'room' && roomPolygons ? buildRoomIndex(roomPolygons) : null),
+    [runtime?.mode, roomPolygons],
+  )
+  // Ring colour → the name of the first enabled rule (ascending priority)
+  // that paints it, for the bubble's hover breakdown.
+  const styleRuleIds = config.styleRuleIds
+  const clusterColorNames = useMemo<ReadonlyMap<string, string>>(() => {
+    if (!runtimeActive) return NO_COLOR_NAMES
+    const ruleIds = new Set(styleRuleIds ?? [])
+    const out = new Map<string, string>()
+    const rules = styleRules
+      .filter((r) => r.id !== undefined && ruleIds.has(r.id) && r.enabled !== false)
+      .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+    for (const r of rules) {
+      const colour = r.style?.iconColor ?? r.style?.fillColor
+      if (!colour) continue
+      const tok = colorToken(colour)
+      if (!out.has(tok)) out.set(tok, r.name)
+    }
+    return out
+  }, [runtimeActive, styleRuleIds, styleRules])
+  const clusterLayer = useDlClusterLayer(map, configId, {
+    enabled: enabled && runtimeActive,
+    visible,
+    colorNames: clusterColorNames,
+    field: clusterField,
+  })
+  // Viewer heatmap: heat under (or instead of) this config's points.
+  const heatOn = pointHeatmap !== null
+  const heatOnly = pointHeatmap?.mode === 'only'
+  const heatWeight = pointHeatmap?.weightField ?? null
+  const heatBarriers = pointHeatmap?.barriers ?? null
+  const heatTint = (configId !== undefined && pointHeatmap?.tints?.get(configId)) || null
+  // The markers' occluders (same arrays → the same cached prism list): a
+  // heat cell behind a wall from the camera is hidden like a marker.
+  const heatOccluders = useMemo(
+    () =>
+      heatOn
+        ? buildOccluders({
+            images: occluderImages ?? EMPTY_IMAGES,
+            polygons: occluderPolygons ?? EMPTY_POLYGONS,
+            circles: occluderCircles ?? EMPTY_CIRCLES,
+            lines: occluderLines ?? EMPTY_LINES,
+            stairs: occluderStairs ?? EMPTY_STAIRS,
+          })
+        : undefined,
+    [heatOn, occluderImages, occluderPolygons, occluderCircles, occluderLines, occluderStairs],
+  )
+  const heatLayer = useDlHeatmapLayer(map, configId, {
+    enabled: enabled && heatOn,
+    visible,
+    pointsShown: !heatOnly,
+    tint: heatTint,
+    occluders: heatOccluders,
+  })
+  // The heatmap counts every filtered row on the floor — also the ones the
+  // markers drop as occluded (a tag inside a cold-room volume still makes
+  // that room hot) — built without the occlusion set or the focus split, so
+  // it is computed once per data change, not on every marker flip. With the
+  // host's barriers the heat stops at walls and solid objects.
+  const heatFeatures = useMemo(
+    () => (heatOn && enabled ? heatCells(buildCoordFeatures(config, filteredEntities, styleRules, polygons).features, heatWeight, heatBarriers) : null),
+    [heatOn, enabled, config, filteredEntities, styleRules, polygons, heatWeight, heatBarriers],
+  )
+  useEffect(() => {
+    if (heatFeatures) heatLayer.write(heatFeatures)
+  }, [heatLayer, heatFeatures])
+
+  // Turning clustering off: forget the members (the push re-adds the rows).
+  useEffect(() => {
+    if (runtimeActive || configId === undefined) return
+    clearRuntimeClusterMembers(configId)
+  }, [runtimeActive, configId])
+
+  const complete = loaded && settled
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    pushFeatures(map, ids, config, filteredEntities, styleRules, polygons, occludedRef.current)
-    // Belt-and-suspenders: keep this overlay's layers above later
-    // additions. `styledata` listener below covers most cases; this
-    // catches the poll-tick path where no styledata fires.
-    raiseToTop(map, ids)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, ids, config, filteredEntities, enabled, styleRules, polygons, installTick, occludedVersion])
+    // With the twin up, the focused row leaves the base source (a
+    // one-feature diff write) and goes to the twin. `features` still holds
+    // it (only `outFeatures` leaves it out), so the anchor report finds it.
+    const { features, focused } = pushFeatures(
+      map, ids, config, filteredEntities, styleRules, polygons, occludedRef.current, writer, rowCache,
+      { focusedKey: focusKey, ghosts: ghostsHere, near: nearHere, splitFocused: wantFocusLayers, skipGroupCluster: runtimeActive },
+      runtime && configId !== undefined && clusterMeta
+        ? { spec: runtime, zoom: zoomBucket, configId, rooms, meta: clusterMeta, layer: clusterLayer }
+        : undefined,
+    )
+    if (wantFocusLayers) focusWriter.write(focused ? [focused] : [], coordFeatureKey)
+    // Every drawn row, bubbled or not: the focus anchor report reads them.
+    onDrawn(features, complete)
+  }, [map, ids, config, filteredEntities, enabled, styleRules, polygons, installTick, occludedRef, occludedVersion, writer, rowCache, ruleClockTick, focusKey, ghostsHere, nearHere, focusWriter, wantFocusLayers, complete, onDrawn, runtime, configId, zoomBucket, rooms, clusterMeta, clusterLayer, runtimeActive])
 
-  // Pin to top on every style mutation. Guarded to prevent infinite
-  // moveLayer → styledata → moveLayer recursion.
-  useEffect(() => {
-    if (!map || !enabled) return
-    const onStyleData = () => raiseToTop(map, ids)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ids, enabled])
+  // Claim this config's place in the `dl-*` block (replaces the old
+  // per-renderer `styledata` raise). The focus twin registers on its
+  // own, last, so it sits on top of every config while it is up.
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
+  useDataLinkLayerStack(map, focusLayerList, wantFocusLayers)
 
   // ---- visibility toggling -----------------------------------------------
+  // "Heatmap only" hides the singles; a focused row's twin stays visible.
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    pushVisibility(map, ids, visible)
-  }, [map, ids, visible, enabled, installTick])
+    pushVisibility(map, ids, visible && !heatOnly)
+    pushFocusTwinVisibility(map, focusIds, visible)
+  }, [map, ids, focusIds, visible, enabled, installTick, heatOnly])
 
   return (
-    <TooltipManager
-      map={map}
-      config={config}
-      layerIds={tooltipLayerIds}
-      occludedKeysRef={occludedRef}
-    />
+    <>
+      <TooltipManager
+        map={map}
+        config={config}
+        layerIds={tooltipLayerIds}
+        occludedKeysRef={occludedRef}
+      />
+      {loader}
+    </>
   )
-}
+})
 
 // ---------------------------------------------------------------------------
 // Mapbox helpers — one source + up to 5 layers per config
@@ -978,6 +1658,204 @@ function sourceLayerIds(configId: number): OverlayIds {
     icon: `dl-${configId}-icon`,
     label: `dl-${configId}-label`,
   }
+}
+
+/**
+ * Focus twin of a natively clustered or unclustered point-at-coord /
+ * history-movement config: its own source holding just the focused row,
+ * drawn by copies of the point / icon / label layers on top of every
+ * config (so the row is never under the rows sharing its coordinate).
+ * `dl-focus-…`: still a `dl-` layer (raised with the block, skipped by
+ * the translucent ordering, counted as a hit by focus exit), but not
+ * `dl-<configId>-…`, so the container's orphan sweep and the viewer's
+ * click routing leave it alone.
+ */
+interface FocusOverlayIds {
+  source: string
+  point: string
+  icon: string
+  label: string
+}
+
+function focusLayerIds(configId: number): FocusOverlayIds {
+  return {
+    source: `dl-focus-${configId}-src`,
+    point: `dl-focus-${configId}-point`,
+    icon: `dl-focus-${configId}-icon`,
+    label: `dl-focus-${configId}-label`,
+  }
+}
+
+/** Base opacity of the point-at-coord disc (a style rule's `opacity`, 0–1). */
+const COORD_DISC_OPACITY: mapboxgl.ExpressionSpecification = [
+  '/',
+  ['coalesce', ['get', 'opacity'], 1],
+  1,
+]
+
+/** Opacity of a point symbol drawn at full strength (focus / ghost / NEAR aware). */
+const FULL_POINT_OPACITY = pointSymbolOpacity(1)
+
+/**
+ * The disc / icon / label layer specs of a point-at-coord config. The
+ * focus twin is built from the same specs: no cluster filter, a label
+ * that can't lose collision, and — since every feature on its source is
+ * the focused row — the same paint resolves to full opacity through 3D
+ * content.
+ */
+function coordSymbolLayers(
+  layerIds: { point: string; icon: string; label: string },
+  source: string,
+  config: DataLinkConfig,
+  filter: mapboxgl.ExpressionSpecification,
+  twin: { visibility: 'visible' | 'none' } | null,
+): mapboxgl.SymbolLayerSpecification[] {
+  const defaultColor = config.style.defaultColor ?? '#3b82f6'
+  const twinLayout = twin ? { visibility: twin.visibility } : {}
+  return [
+    // Individual point disc — a symbol (not a circle) so it can be
+    // lifted by `symbol-z-offset` when the feature carries an
+    // `elevation` property. Mapbox 3.25's `circle` layer has no
+    // `circle-z-offset`, which is why every SGV overlay that renders
+    // above ground uses a symbol pattern (see map-line-overlay's draw
+    // guide comment for the historical context).
+    //
+    // `symbol-z-elevate` is a `layout` property; `symbol-z-offset` is a
+    // `paint` property. Mapbox silently drops `symbol-z-offset` when
+    // placed under `layout`, which is what kept the first-floor
+    // markers stuck on the ground in the earlier fix.
+    {
+      id: layerIds.point,
+      type: 'symbol',
+      source,
+      filter,
+      layout: {
+        ...DISC_LAYOUT,
+        // Data-driven text-size — reads the size from each feature's
+        // `discSize` property (stamped in pushFeatures). Mapbox
+        // recommends this over calling `setLayoutProperty('text-size',…)`
+        // per config change because it uses the source-update fast path
+        // (see the Mapbox performance guide + issue #1451 where naked
+        // setLayoutProperty on text-size intermittently doesn't repaint).
+        // Feature-level size also lets style rules override per-record.
+        //
+        // `discSize` is a DIAMETER in this mode (the editor defaults it
+        // to 22) whereas DISC_EM_SCALE converts a radius, hence the /2.
+        'text-size': [
+          '*',
+          ['coalesce', ['get', 'discSize'], 22],
+          DISC_EM_SCALE / 2,
+        ],
+        ...twinLayout,
+      },
+      paint: {
+        'text-color': [
+          'coalesce',
+          ['get', 'color'],
+          defaultColor,
+        ],
+        // v5.4 — analytic occlusion. Mapbox's `text-occlusion-opacity`
+        // uses the depth buffer, whose precision at low zoom is too
+        // coarse to tell a marker at elevation 0 from a slab at 0.152m
+        // above — so the disc stayed visible under floors and walls
+        // until the user zoomed in enough. Occluded rows are left out
+        // of the source (useDataLinkOcclusion), which hides them
+        // deterministically at every zoom; the focused row and ghost
+        // rows read `focused` / `occluded`, NEAR rows `focusNear` (see
+        // pointSymbolOpacity).
+        'text-opacity': pointSymbolOpacity(COORD_DISC_OPACITY),
+        'text-halo-color': '#ffffff',
+        'text-halo-width': 2,
+        'symbol-z-offset': Z_OFFSET,
+        'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
+      },
+    },
+    // Lucide icon symbol layer. `feature.icon` is stamped in
+    // `pushFeatures` per config.style.defaultIcon. The sprite is
+    // registered via `ensureDataLinkSprites` before install; missing
+    // icons fall through to the coloured disc above so the marker
+    // stays visible.
+    {
+      id: layerIds.icon,
+      type: 'symbol',
+      source,
+      filter,
+      layout: {
+        'icon-image': ['get', 'icon'],
+        // Same data-driven pattern as text-size — features carry their
+        // `iconSize` (a Mapbox 0-1+ scale) and the layer reads it. Avoids
+        // the setLayoutProperty flakiness Mapbox has around symbol layout
+        // updates.
+        'icon-size': ['coalesce', ['get', 'iconSize'], 0.7],
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        // `symbol-z-elevate` stays in layout; `symbol-z-offset` moves to
+        // paint. Matching the disc's elevation so the icon rides at the
+        // same altitude — otherwise a first-floor marker's icon would
+        // sit at ground level while its disc hovers above it.
+        'symbol-z-elevate': false,
+        ...twinLayout,
+      },
+      paint: {
+        'symbol-z-offset': Z_OFFSET,
+        // v5.4 — analytic occlusion (see disc layer comment above).
+        'icon-opacity': FULL_POINT_OPACITY,
+        'icon-occlusion-opacity': POINT_OCCLUSION_OPACITY,
+      },
+    },
+    // Text label — only visible when the payload key referenced by
+    // `fieldMapping.labelField` resolved to a string on the feature.
+    {
+      id: layerIds.label,
+      type: 'symbol',
+      source,
+      filter,
+      layout: {
+        'text-field': ['get', 'label'],
+        'text-size': 11,
+        'text-offset': [0, 1.6],
+        'text-anchor': 'top',
+        // The focus twin's label never loses collision to another label.
+        'text-allow-overlap': twin !== null,
+        ...(twin ? { 'text-ignore-placement': true } : {}),
+        'symbol-z-elevate': false,
+        ...twinLayout,
+      },
+      paint: {
+        'text-color': '#111827',
+        // v5.4 — analytic occlusion (see disc layer comment above).
+        'text-opacity': FULL_POINT_OPACITY,
+        'text-halo-color': '#ffffff',
+        'text-halo-width': 1.5,
+        'symbol-z-offset': Z_OFFSET,
+        'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
+      },
+    },
+  ]
+}
+
+/** Add the focus twin (see FocusOverlayIds) on top of the map. */
+function installFocusLayers(
+  map: MapboxMapInstance,
+  f: FocusOverlayIds,
+  config: DataLinkConfig,
+  visible: boolean,
+): void {
+  if (map.getSource(f.source)) teardownFocusLayers(map, f)
+  map.addSource(f.source, { type: 'geojson', data: emptyFC() })
+  const specs = coordSymbolLayers(
+    f, f.source, config, ['literal', true] as mapboxgl.ExpressionSpecification,
+    { visibility: visible ? 'visible' : 'none' },
+  )
+  for (const spec of specs) map.addLayer(spec)
+}
+
+function teardownFocusLayers(map: MapboxMapInstance, f: FocusOverlayIds): void {
+  if (!mapAlive(map)) return
+  for (const layerId of [f.label, f.icon, f.point]) {
+    if (hasMapLayer(map, layerId)) map.removeLayer(layerId)
+  }
+  if (map.getSource(f.source)) map.removeSource(f.source)
 }
 
 function emptyFC(): GeoJSON.FeatureCollection {
@@ -1010,6 +1888,8 @@ function installSourcesAndLayers(
   map: MapboxMapInstance,
   ids: OverlayIds,
   config: DataLinkConfig,
+  /** Runtime clustering is on: no native cluster, a dynamic source. */
+  noCluster = false,
 ): void {
   // A cluster-config swap means the source's `cluster` option has to
   // change; sources can't be mutated in place, so we tear the whole
@@ -1052,7 +1932,7 @@ function installSourcesAndLayers(
   // geographic) grouping key, which Mapbox doesn't natively support.
   const groupField = config.fieldMapping.clusterGroupField
   const useManualCluster = !!groupField
-  const shouldCluster = config.style.cluster === true && !useManualCluster
+  const shouldCluster = config.style.cluster === true && !useManualCluster && !noCluster
   // Closure over the same cluster settings so `addLayerGuarded`
   // above can re-add the source with the SAME spec if it got yanked
   // mid-install. Cluster-related keys are OMITTED (not `undefined`)
@@ -1087,6 +1967,15 @@ function installSourcesAndLayers(
       base.clusterProperties = {
         elevation: ['max', ['coalesce', ['get', 'elevation'], 0]],
       }
+    } else {
+      // Unclustered points take diff-only `updateData` writes (see
+      // geojson-diff-writer.ts): a poll or SSE refresh that changed a
+      // few rows re-sends those rows, not the whole collection. Point
+      // symbols draw the same from a dynamic source — the anchor maths
+      // matches geojson-vt's, and an anchor outside its tile is dropped
+      // either way. Not for clustered sources: supercluster would then
+      // be fed the dynamic index's internal features.
+      base.dynamic = true
     }
     return base
   }
@@ -1167,136 +2056,27 @@ function installSourcesAndLayers(
         'text-occlusion-opacity': 0,
       },
     })
+    // A group field with `style.cluster` off (every seeded
+    // history-movement layer) installs both bubble layers, but no bubble
+    // is ever built, so they would only cost a style re-evaluation and a
+    // placement pass every frame. Hint them empty for the empty-layer
+    // gate (`@/lib/data-link/dl-layer-gate`); `pushFeatures` clears the
+    // hint if a bubble ever turns up. Set unconditionally so a hint left
+    // by the previous style (a style swap drops layers without
+    // `removeLayer`) never carries over. Native clusters are built on the
+    // worker, so those layers are never hinted.
+    const alwaysEmpty = useManualCluster && manualClusterLayersAlwaysEmpty(config) ? true : null
+    hintLayerEmpty(map, ids.cluster, alwaysEmpty)
+    hintLayerEmpty(map, ids.clusterCount, alwaysEmpty)
   }
 
-  // Individual point disc — a symbol (not a circle) so it can be
-  // lifted by `symbol-z-offset` when the feature carries an
-  // `elevation` property. Mapbox 3.25's `circle` layer has no
-  // `circle-z-offset`, which is why every SGV overlay that renders
-  // above ground uses a symbol pattern (see map-line-overlay's draw
-  // guide comment for the historical context).
-  //
-  // `symbol-z-elevate` is a `layout` property; `symbol-z-offset` is a
-  // `paint` property. Mapbox silently drops `symbol-z-offset` when
-  // placed under `layout`, which is what kept the first-floor
-  // markers stuck on the ground in the earlier fix.
-  addLayerGuarded({
-    id: ids.point,
-    type: 'symbol',
-    source: ids.source,
-    filter: (shouldCluster || useManualCluster) ? nonClusterFilter : (['literal', true] as mapboxgl.ExpressionSpecification),
-    layout: {
-      ...DISC_LAYOUT,
-      // Data-driven text-size — reads the size from each feature's
-      // `discSize` property (stamped in pushFeatures). Mapbox
-      // recommends this over calling `setLayoutProperty('text-size',…)`
-      // per config change because it uses the source-update fast path
-      // (see the Mapbox performance guide + issue #1451 where naked
-      // setLayoutProperty on text-size intermittently doesn't repaint).
-      // Feature-level size also lets style rules override per-record.
-      //
-      // `discSize` is a DIAMETER in this mode (the editor defaults it
-      // to 22) whereas DISC_EM_SCALE converts a radius, hence the /2.
-      'text-size': [
-        '*',
-        ['coalesce', ['get', 'discSize'], 22],
-        DISC_EM_SCALE / 2,
-      ],
-    },
-    paint: {
-      'text-color': [
-        'coalesce',
-        ['get', 'color'],
-        defaultColor,
-      ],
-      // v5.4 — analytic occlusion. Mapbox's `text-occlusion-opacity`
-      // uses the depth buffer, whose precision at low zoom is too
-      // coarse to tell a marker at elevation 0 from a slab at 0.152m
-      // above — so the disc stayed visible under floors and walls
-      // until the user zoomed in enough. Fold `feature-state.occluded`
-      // (set by the effect in `PointAtCoordSubRenderer`) directly
-      // into the opacity so hiding is deterministic at every zoom.
-      'text-opacity': [
-        'case',
-        ['boolean', ['get', 'occluded'], false],
-        0,
-        ['/', ['coalesce', ['get', 'opacity'], 1], 1],
-      ],
-      'text-halo-color': '#ffffff',
-      'text-halo-width': 2,
-      'symbol-z-offset': Z_OFFSET,
-      'text-occlusion-opacity': 0,
-    },
-  })
-
-  // Lucide icon symbol layer. `feature.icon` is stamped in
-  // `pushFeatures` per config.style.defaultIcon. The sprite is
-  // registered via `ensureDataLinkSprites` before install; missing
-  // icons fall through to the coloured disc above so the marker
-  // stays visible.
-  addLayerGuarded({
-    id: ids.icon,
-    type: 'symbol',
-    source: ids.source,
-    filter: (shouldCluster || useManualCluster) ? nonClusterFilter : (['literal', true] as mapboxgl.ExpressionSpecification),
-    layout: {
-      'icon-image': ['get', 'icon'],
-      // Same data-driven pattern as text-size — features carry their
-      // `iconSize` (a Mapbox 0-1+ scale) and the layer reads it. Avoids
-      // the setLayoutProperty flakiness Mapbox has around symbol layout
-      // updates.
-      'icon-size': ['coalesce', ['get', 'iconSize'], 0.7],
-      'icon-allow-overlap': true,
-      'icon-ignore-placement': true,
-      // `symbol-z-elevate` stays in layout; `symbol-z-offset` moves to
-      // paint. Matching the disc's elevation so the icon rides at the
-      // same altitude — otherwise a first-floor marker's icon would
-      // sit at ground level while its disc hovers above it.
-      'symbol-z-elevate': false,
-    },
-    paint: {
-      'symbol-z-offset': Z_OFFSET,
-      // v5.4 — analytic occlusion (see disc layer comment above).
-      'icon-opacity': [
-        'case',
-        ['boolean', ['get', 'occluded'], false],
-        0,
-        1,
-      ],
-      'icon-occlusion-opacity': 0,
-    },
-  })
-
-  // Text label — only visible when the payload key referenced by
-  // `fieldMapping.labelField` resolved to a string on the feature.
-  addLayerGuarded({
-    id: ids.label,
-    type: 'symbol',
-    source: ids.source,
-    filter: (shouldCluster || useManualCluster) ? nonClusterFilter : (['literal', true] as mapboxgl.ExpressionSpecification),
-    layout: {
-      'text-field': ['get', 'label'],
-      'text-size': 11,
-      'text-offset': [0, 1.6],
-      'text-anchor': 'top',
-      'text-allow-overlap': false,
-      'symbol-z-elevate': false,
-    },
-    paint: {
-      'text-color': '#111827',
-      // v5.4 — analytic occlusion (see disc layer comment above).
-      'text-opacity': [
-        'case',
-        ['boolean', ['get', 'occluded'], false],
-        0,
-        1,
-      ],
-      'text-halo-color': '#ffffff',
-      'text-halo-width': 1.5,
-      'symbol-z-offset': Z_OFFSET,
-      'text-occlusion-opacity': 0,
-    },
-  })
+  // Disc, icon and label (see coordSymbolLayers).
+  const pointFilter = (shouldCluster || useManualCluster)
+    ? nonClusterFilter
+    : (['literal', true] as mapboxgl.ExpressionSpecification)
+  for (const spec of coordSymbolLayers(ids, ids.source, config, pointFilter, null)) {
+    addLayerGuarded(spec)
+  }
 }
 
 /**
@@ -1324,16 +2104,26 @@ function safeTeardown(map: MapboxMapInstance, fn: () => void): void {
 function teardown(map: MapboxMapInstance, ids: OverlayIds): void {
   if (!mapAlive(map)) return
   for (const layerId of [ids.label, ids.icon, ids.point, ids.clusterCount, ids.cluster]) {
-    if (map.getLayer(layerId)) map.removeLayer(layerId)
+    if (hasMapLayer(map, layerId)) map.removeLayer(layerId)
   }
   if (map.getSource(ids.source)) map.removeSource(ids.source)
 }
 
 /**
- * Build the GeoJSON FeatureCollection from the config's field mapping.
- * Skips entities whose payload doesn't yield a usable (lng, lat) — those
- * won't render, but we don't error, since the ingest pipeline accepts
- * arbitrary payloads.
+ * Build the config's point features (`buildCoordFeatures` — field
+ * mapping, rules, manual clusters) and write them to its source.
+ * Entities whose payload doesn't yield a usable (lng, lat) are skipped
+ * — those won't render, but we don't error, since the ingest pipeline
+ * accepts arbitrary payloads.
+ *
+ * Rows whose object is unchanged since the last push reuse their
+ * feature (`cache`), and the writer then sends the source only what
+ * changed. Occluded rows are left out (v5.4 hard-hide), so an
+ * occlusion change removes or re-adds just those rows. Focus mode
+ * (`focus`): the focused row is never left out and is stamped
+ * `focused: true`; ghost mode keeps occluded rows as `occluded: true`.
+ * Returns the build, so the caller can draw a split-off focused row and
+ * report where the focused row went.
  */
 function pushFeatures(
   map: MapboxMapInstance,
@@ -1341,594 +2131,217 @@ function pushFeatures(
   config: DataLinkConfig,
   entities: EntityState[],
   styleRules: ReadonlyArray<StyleRule>,
-  polygons?: ReadonlyArray<PolygonShape>,
-  /** v5.4 — entity keys currently occluded. Stamped as `occluded:
-   *  true` on each feature's properties so the paint expression can
-   *  `['case', ['get', 'occluded'], ...]` hide them. Empty / omitted
-   *  means nothing hidden. */
-  occludedKeys?: ReadonlySet<string>,
-): void {
-  const lngKey = config.fieldMapping.coordFields?.lng ?? 'lng'
-  const latKey = config.fieldMapping.coordFields?.lat ?? 'lat'
-  const labelKey = config.fieldMapping.labelField ?? 'label'
-  const colorKey = config.fieldMapping.colorField
-  const elevationKey = config.fieldMapping.elevationField
-  const groupKey = config.fieldMapping.clusterGroupField
+  polygons: ReadonlyArray<PolygonShape> | undefined,
+  /** v5.4 — entity keys currently occluded; those rows are skipped.
+   *  Empty / omitted means nothing hidden. */
+  occludedKeys: ReadonlySet<string> | undefined,
+  writer: GeoJSONDiffWriter,
+  cache: RowBuildCache<GeoJSON.Feature<GeoJSON.Point> | null>,
+  focus?: CoordFocusOptions,
+  /** Runtime clustering (see pushClustered); unset = today's path. */
+  runtime?: RuntimeClusterPush,
+): CoordFeaturesResult {
+  const result = buildCoordFeatures(
+    config,
+    entities,
+    styleRules,
+    polygons,
+    occludedKeys,
+    cache,
+    focus,
+  )
+  const { features, outFeatures, manualClusterActive, focused } = result
 
-  // Polygon-id → elevation lookup. Built once per feature push so the
-  // fallback in the loop below is O(1). Only populated when the user
-  // has set `clusterGroupField` (typically `currentRoomId`); otherwise
-  // there's no join key so the fallback can't fire.
-  //
-  // When the entity payload doesn't carry an `elevation` field, we
-  // lift the marker to the room's own altitude. This is what makes
-  // the mock work without emitting elevation per row — the polygon
-  // knows how high its floor is (from config.elevation), and every
-  // marker in that room inherits that height.
-  const roomElevationById = new Map<number, number>()
-  if (groupKey && polygons) {
-    for (const p of polygons) {
-      if (p.id === undefined) continue
-      const z = p.config?.elevation
-      if (typeof z === 'number' && Number.isFinite(z)) {
-        roomElevationById.set(p.id, z)
-      }
-    }
-  }
-
-  const features: GeoJSON.Feature<GeoJSON.Point>[] = []
-  let skippedCount = 0
-  for (const e of entities) {
-    // v5.4 — hard-hide via source. When the analytic occlusion pass
-    // has marked this entity's key, we skip it entirely — no
-    // feature enters the source, so Mapbox has nothing to draw,
-    // hit-test, or hover. Opacity / filter-based approaches leak
-    // through `queryRenderedFeatures` and let the user click on
-    // invisible markers; skipping at push time is the only way to
-    // guarantee "if it's behind something, it doesn't exist".
-    if (occludedKeys && occludedKeys.has(e.entityKey)) {
-      skippedCount++
-      continue
-    }
-    // Prefer the payload's coord fields (arbitrary schema); fall
-    // back to the backend-extracted `position` (only present when
-    // the ingest included a top-level `[lng, lat]`).
-    // Supports the same array-index / dotted-path syntax the resolver
-    // uses (`currentPosition[0]`, `location.lng`, plain key), so a
-    // REST source that only exposes an array position works without
-    // a translation layer.
-    let lng: number | undefined
-    let lat: number | undefined
-    const rawLng = readPayloadPath(e.payload, lngKey)
-    const rawLat = readPayloadPath(e.payload, latKey)
-    // File-imported sources (CSV / XLSX / JSON) preserve every value
-    // as a string in `data_source_rows.payload` — the parser doesn't
-    // coerce because a JSONB column is schema-less. Number() + isFinite
-    // handles that path AND the native-number path from streaming
-    // publishers uniformly.
-    const numLng = coerceCoord(rawLng)
-    const numLat = coerceCoord(rawLat)
-    if (numLng !== undefined && numLat !== undefined) {
-      lng = numLng
-      lat = numLat
-    } else if (e.position) {
-      lng = e.position[0]
-      lat = e.position[1]
-    }
-    if (lng === undefined || lat === undefined) continue
-
-    // Read the elevation (metres above ground) — used by Mapbox
-    // symbol layers to lift the marker + icon + label off the floor
-    // plan raster to their real z.
-    //
-    // Three sources, in order of preference:
-    //
-    //   1. v5.3 `elevation` spec (static / field / rules) — the
-    //      layer author's explicit intent wins.
-    //   2. Legacy `elevationField` on the payload (pre-v5.3 configs).
-    //   3. The ROOM's elevation via the polygon lookup built above.
-    //      Kicks in when the entity payload has no z but the config
-    //      has `clusterGroupField` mapping the payload → a polygon id
-    //      (e.g. `currentRoomId`). Lets a REST source that only
-    //      knows "you're in room 42" render on the right floor.
-    //
-    // Silent 0 when nothing hits — old data links keep rendering at
-    // ground level.
-    let elevationM = 0
-    let elevationFromPayload = false
-    const specHit = resolveFromElevationSpec(e.payload, config.fieldMapping.elevation)
-    if (specHit !== undefined) {
-      elevationM = specHit
-      elevationFromPayload = true
-    } else if (elevationKey) {
-      const rawZ = readPayloadPath(e.payload, elevationKey)
-      const parsed = typeof rawZ === 'number' ? rawZ : Number(rawZ)
-      if (Number.isFinite(parsed)) {
-        elevationM = parsed
-        elevationFromPayload = true
-      }
-    }
-    if (!elevationFromPayload && groupKey && roomElevationById.size > 0) {
-      const rawGroup = readPayloadPath(e.payload, groupKey)
-      // Polygon ids are integers in Postgres → the group value may
-      // arrive as either a number OR its stringified form (JSON
-      // preserves numeric strings sometimes). Try both.
-      const asNum =
-        typeof rawGroup === 'number' ? rawGroup : Number(rawGroup)
-      if (Number.isFinite(asNum) && roomElevationById.has(asNum)) {
-        elevationM = roomElevationById.get(asNum) ?? 0
-      }
-    }
-
-    let label =
-      typeof e.payload[labelKey] === 'string' || typeof e.payload[labelKey] === 'number'
-        ? String(e.payload[labelKey])
-        : e.entityKey
-    let color =
-      colorKey && typeof e.payload[colorKey] === 'string'
-        ? (e.payload[colorKey] as string)
-        : undefined
-    let opacity: number | undefined
-
-    // Slice-4 style-rule overrides: rules matched by the entity's
-    // payload can override color/label/opacity before the paint
-    // expressions consume them.
-    const override = evaluateEntityRules(
-      styleRules,
-      config.styleRuleIds,
-      e.payload,
-    )
-    if (override) {
-      if (override.fillColor) color = override.fillColor
-      if (override.iconColor) color = override.iconColor
-      if (override.labelText)
-        label = resolveLabelTemplate(override.labelText, e.payload)
-      if (override.fillOpacity !== undefined) opacity = override.fillOpacity / 100
-    }
-
-    // Per-feature icon id — the sub-renderer's install pass
-    // registered `dl-icon-<id>-<color>` via ensureDataLinkSpritesFor()
-    // before this feature-push runs, so referencing the mapbox image
-    // name here just works. Falls back to `map-pin` @ default color.
-    const iconName = mapboxImageIdFor(
-      config.style.defaultIcon ?? 'map-pin',
-      config.style.iconColor,
-    )
-
-    features.push({
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: [lng, lat] },
-      properties: {
-        entityKey: e.entityKey,
-        streamId: e.streamId,
-        configId: config.id,
-        label,
-        color,
-        opacity,
-        elevation: elevationM,
-        icon: iconName,
-        // v5.4 — analytic occlusion flag. See pushFeatures signature
-        // + OCCLUSION_TEXT_OPACITY at the top of this file.
-        occluded: occludedKeys?.has(e.entityKey) ?? false,
-        // v4 — feature-level size stamps. The disc + icon layers use
-        // `['coalesce', ['get', 'discSize'], 22]` / `['coalesce',
-        // ['get', 'iconSize'], 0.7]` at install so re-emitting the
-        // source (via source.setData) picks up any slider change on
-        // the fast path. See Mapbox perf guide + the
-        // docs/pitfalls-frontend.md pitfall note on setLayoutProperty
-        // text-size lag.
-        discSize: config.style.markerSize ?? 22,
-        iconSize: config.style.iconSize ?? 0.7,
-        // groupKey is used by the manual cluster aggregator below.
-        // Stamped even when the config doesn't cluster, so a later
-        // toggle to enable clustering doesn't require a full source
-        // rebuild.
-        groupKey:
-          groupKey && readPayloadPath(e.payload, groupKey) !== undefined
-            ? String(readPayloadPath(e.payload, groupKey))
-            : null,
-        payload: JSON.stringify(e.payload),
-      },
-    })
-  }
-
-  // Manual clustering by `clusterGroupField`. Since Mapbox's built-in
-  // cluster is geographic-only, we group features here by their
-  // `groupKey` (e.g. `currentRoomId`). Groups with more than one point
-  // are replaced by a single aggregate feature at the group's centroid
-  // with `manualCluster: true` + `point_count: N`. Groups of size 1
-  // pass through as individual features. This guarantees no bubble
-  // ever straddles a group boundary — the same room's markers merge,
-  // and adjacent rooms stay visually distinct.
-  //
-  // Only runs when `clusterGroupField` is set AND the config asks for
-  // cluster mode. Otherwise the raw feature list is pushed and the
-  // native cluster (or no cluster at all) draws it.
-  let outFeatures: GeoJSON.Feature<GeoJSON.Point>[] = features
-  const manualClusterActive =
-    config.style.cluster === true && !!groupKey && features.length > 0
-  if (manualClusterActive) {
-    const groups = new Map<string, GeoJSON.Feature<GeoJSON.Point>[]>()
-    for (const f of features) {
-      const k = String(f.properties?.groupKey ?? '__ungrouped__')
-      const arr = groups.get(k)
-      if (arr) arr.push(f)
-      else groups.set(k, [f])
-    }
-    outFeatures = []
-    for (const arr of groups.values()) {
-      if (arr.length === 1) {
-        outFeatures.push(arr[0])
-        continue
-      }
-      let cx = 0
-      let cy = 0
-      let cz = 0
-      for (const f of arr) {
-        cx += f.geometry.coordinates[0]
-        cy += f.geometry.coordinates[1]
-        cz += Number(f.properties?.elevation ?? 0)
-      }
-      cx /= arr.length
-      cy /= arr.length
-      cz /= arr.length
-      const sample = arr[0].properties ?? {}
-      outFeatures.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [cx, cy] },
-        properties: {
-          manualCluster: true,
-          point_count: arr.length,
-          point_count_abbreviated: String(arr.length),
-          groupKey: sample.groupKey,
-          elevation: cz,
-          // Preserve the config id so the click handler can trace back.
-          configId: sample.configId,
-        },
-      })
-    }
+  if (runtime) {
+    if (config.id !== undefined) manualClusterLeaves.delete(config.id)
+    pushClustered(config, outFeatures, focused, writer, runtime)
+    return result
   }
 
   // Stash the un-aggregated feature list so the /view drawer can
-  // expand manual clusters into their leaves later.
+  // expand manual clusters into their leaves later. The focused row is
+  // drawn on its own, so it is no bubble's leaf.
   if (manualClusterActive && config.id !== undefined) {
-    manualClusterLeaves.set(config.id, features)
+    manualClusterLeaves.set(config.id, focused ? features.filter((f) => f !== focused) : features)
   } else if (config.id !== undefined) {
     manualClusterLeaves.delete(config.id)
   }
 
-  const src = map.getSource(ids.source) as unknown as
-    | { setData: (data: GeoJSON.FeatureCollection) => void }
-    | undefined
-  if (src && typeof src.setData === 'function') {
-    src.setData({ type: 'FeatureCollection', features: outFeatures })
+  // The bubble layers may carry an "always empty" gate hint from install
+  // (see installSourcesAndLayers). If this push carries a bubble anyway,
+  // show the layers before the write goes out, so the hint can never
+  // hold a bubble back.
+  if (anyManualClusterFeature(outFeatures)) {
+    hintLayerEmpty(map, ids.cluster, null)
+    hintLayerEmpty(map, ids.clusterCount, null)
   }
-  // v5.4 DEBUG — see whether the skip is firing.
-  // eslint-disable-next-line no-console
-  console.log(`[dl-push:${config.id}]`, {
-    entities: entities.length,
-    occluded_key_set_size: occludedKeys?.size ?? 0,
-    skipped_at_push: skippedCount,
-    features_pushed: outFeatures.length,
-    sample_occluded_key: occludedKeys ? [...occludedKeys][0] : null,
-  })
+
+  writer.write(outFeatures, coordFeatureKey)
+  return result
 }
 
-function pushVisibility(map: MapboxMapInstance, ids: OverlayIds, visible: boolean): void {
+interface RuntimeClusterPush {
+  spec: PointClusterSpec
+  /** `clusterZoomBucket` of the settled camera. */
+  zoom: number
+  configId: number
+  rooms: RoomIndex | null
+  /** Per entity key: its floor and (field mode) value. */
+  meta: ReadonlyMap<string, { floor: number | null; part: string }>
+  layer: DlClusterLayerHandle
+}
+
+const NO_COLOR_NAMES: ReadonlyMap<string, string> = new Map()
+
+/**
+ * Runtime clustering's half of the push: fold the drawable rows into
+ * bubbles (`clusterPoints`), write the rows that stay single to the
+ * config's own source (original order, the existing diff writer) and the
+ * bubbles to the runtime layer. The focused row and ghost rows are never
+ * members: they pass through as singles.
+ */
+function pushClustered(
+  config: DataLinkConfig,
+  outFeatures: readonly GeoJSON.Feature<GeoJSON.Point>[],
+  focused: GeoJSON.Feature<GeoJSON.Point> | null,
+  writer: GeoJSONDiffWriter,
+  rt: RuntimeClusterPush,
+): void {
+  const defaultColor = config.style.defaultColor ?? '#3b82f6'
+  const items: ClusterItem[] = []
+  for (const f of outFeatures) {
+    const p = f.properties
+    if (f === focused || !p || p.occluded === true || p.focused === true) continue
+    const key = p.entityKey
+    if (typeof key !== 'string') continue
+    const meta = rt.meta.get(key)
+    const elevation = Number(p.elevation)
+    items.push({
+      key,
+      lng: f.geometry.coordinates[0],
+      lat: f.geometry.coordinates[1],
+      elevation: Number.isFinite(elevation) ? elevation : 0,
+      color: typeof p.color === 'string' && p.color ? p.color : defaultColor,
+      floor: meta?.floor ?? null,
+      part: meta?.part ?? '',
+    })
+  }
+  const result = clusterPoints(items, rt.spec, rt.zoom, { configId: rt.configId, rooms: rt.rooms })
+  const singles = result.memberKeys.size === 0
+    ? outFeatures
+    : outFeatures.filter((f) => {
+        const key = f.properties?.entityKey
+        return f === focused || f.properties?.occluded === true || typeof key !== 'string' || !result.memberKeys.has(key)
+      })
+  writer.write(singles, coordFeatureKey)
+  setRuntimeClusterMembers(rt.configId, result.members)
+  rt.layer.write(result.bubbles)
+}
+
+/**
+ * Writer identity for a point-at-coord feature: the entity key, or the
+ * group key for a manual-cluster bubble. Duplicates are told apart by
+ * the writer itself.
+ */
+function coordFeatureKey(f: GeoJSON.Feature): string {
+  const p = f.properties
+  if (p?.manualCluster === true) return `g:${String(p.groupKey ?? '')}`
+  return `e:${String(p?.entityKey ?? '')}`
+}
+
+function pushVisibility(
+  map: MapboxMapInstance,
+  ids: OverlayIds,
+  visible: boolean,
+  focusIds?: FocusOverlayIds,
+): void {
   const value = visible ? 'visible' : 'none'
-  for (const layerId of [ids.cluster, ids.clusterCount, ids.point, ids.icon, ids.label]) {
-    if (map.getLayer(layerId)) {
+  const layerIds = [ids.cluster, ids.clusterCount, ids.point, ids.icon, ids.label]
+  // The focus twin, when it is up (it installs with the current value).
+  if (focusIds) layerIds.push(focusIds.point, focusIds.icon, focusIds.label)
+  for (const layerId of layerIds) {
+    if (hasMapLayer(map, layerId)) {
       map.setLayoutProperty(layerId, 'visibility', value)
     }
   }
 }
 
-/**
- * Move this overlay's layers to the top of the Mapbox z-stack. Same
- * needs-raise guard as the deleted `map-asset-overlay.tsx` had so the
- * `styledata` listener doesn't recurse on its own move events.
- */
-function raiseToTop(map: MapboxMapInstance, ids: OverlayIds): void {
-  const ownLayerIds = [ids.cluster, ids.clusterCount, ids.point, ids.icon, ids.label]
-  const ownSet = new Set(ownLayerIds)
-  const layers = map.getStyle()?.layers ?? []
-  let lastOwnIdx = -1
-  for (let i = 0; i < layers.length; i++) {
-    if (ownSet.has(layers[i].id)) lastOwnIdx = i
-  }
-  if (lastOwnIdx < 0) return
-  let needsRaise = false
-  for (let i = lastOwnIdx + 1; i < layers.length; i++) {
-    if (!ownSet.has(layers[i].id)) {
-      needsRaise = true
-      break
-    }
-  }
-  if (!needsRaise) return
-  for (const id of ownLayerIds) {
-    if (map.getLayer(id)) {
-      try {
-        map.moveLayer(id)
-      } catch {
-        /* swallowed — the layer went away between check + move */
-      }
-    }
+function pushFocusTwinVisibility(map: MapboxMapInstance, focusIds: FocusOverlayIds, visible: boolean): void {
+  const value = visible ? 'visible' : 'none'
+  for (const layerId of [focusIds.point, focusIds.icon, focusIds.label]) {
+    if (hasMapLayer(map, layerId)) map.setLayoutProperty(layerId, 'visibility', value)
   }
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers for the shape-anchored sub-renderers below
 // ---------------------------------------------------------------------------
+//
+// The feature builders themselves (anchor resolution, rule overrides,
+// per-mode geometry) live in `@/lib/data-link/feature-builders`.
 
 /**
- * Compute the [lng, lat] centroid for any shape kind the resolver may
- * return, from a concrete shape object. Used by the v2 iter helper
- * below.
+ * One diff writer per (map, source id) for the sub-renderer's lifetime.
+ * See `@/lib/geojson-diff-writer`: on a `dynamic` source it sends only
+ * the features that changed; on any other source it calls `setData`, and
+ * skips a write whose features are all the same objects as last time.
  */
-function centroidForShape(
-  shape: import('@/lib/data-link/match-resolver').MatchableShape,
-  kind: DataLinkConfig['targetKind'],
-): [number, number] | null {
-  switch (kind) {
-    case 'polygon': {
-      const p = shape as PolygonShape
-      return p.vertices.length >= 3 ? polygonCentroid(p.vertices) : null
+function useSourceWriter(map: MapboxMapInstance, sourceId: string): GeoJSONDiffWriter {
+  const writer = useMemo(() => createGeoJSONDiffWriter(map, sourceId), [map, sourceId])
+  useEffect(() => () => writer.dispose(), [writer])
+  return writer
+}
+
+/** Writer identity for a per-entity feature (shape-anchored point modes). */
+function entityFeatureKey(f: GeoJSON.Feature): string {
+  return String(f.properties?.entityKey ?? '')
+}
+
+/**
+ * One `move` listener per map for every data-link occlusion pass. Each
+ * sub-renderer of each config used to register its own; now they join
+ * the map's pass and it runs them all, in join order, inside the same
+ * synchronous `move` — so results land on the same frame as before.
+ * Keyed per map instance, so a remounted map gets a fresh listener.
+ */
+const dataLinkOcclusionPasses = new WeakMap<
+  MapboxMapInstance,
+  { jobs: Set<() => void>; onMove: () => void }
+>()
+
+function joinDataLinkOcclusionPass(map: MapboxMapInstance, job: () => void): () => void {
+  let pass = dataLinkOcclusionPasses.get(map)
+  if (!pass) {
+    const jobs = new Set<() => void>()
+    pass = {
+      jobs,
+      onMove: () => {
+        for (const run of jobs) run()
+      },
     }
-    case 'circle': {
-      const c = shape as CircleShape
-      if (c.center) return c.center
-      if (c.start && c.current) {
-        return [(c.start[0] + c.current[0]) / 2, (c.start[1] + c.current[1]) / 2]
-      }
-      return null
-    }
-    case 'marker': return (shape as MarkerShape).position
-    case 'line': {
-      const l = shape as LineShape
-      return l.vertices.length >= 2 ? lineCentroid(l.vertices) : null
-    }
-    case 'model': return (shape as ModelShape).position
-    default: return null
+    dataLinkOcclusionPasses.set(map, pass)
+  }
+  const joined = pass
+  if (joined.jobs.size === 0) map.on('move', joined.onMove)
+  joined.jobs.add(job)
+  return () => {
+    if (!joined.jobs.delete(job)) return
+    if (joined.jobs.size === 0) map.off('move', joined.onMove)
   }
 }
 
 /**
- * Altitude of a shape's TOP face in metres. Used where a data-link
- * feature has to sit ON a shape (the tint fill) rather than at it.
- * Matches the slab exactly as its overlay draws it:
- * map-polygon-overlay floors the base at 0.11 m (POLYGON_MIN_BASE_M) and
- * both overlays floor the thickness at 0.05 m. A tint at elevation +
- * height (0 for a flat area) would sit inside that slab and never show.
+ * How far past twice the live row count `useDataLinkOcclusion`'s id
+ * table may grow before it is compacted.
  */
-function slabTopM(shape: { config?: { elevation?: number; height?: number } }, minBase: number): number {
-  const base = shape.config?.elevation
-  const h = shape.config?.height
-  return (
-    Math.max(typeof base === 'number' && Number.isFinite(base) ? base : 0, minBase) +
-    Math.max(typeof h === 'number' && Number.isFinite(h) ? h : 0, 0.05)
-  )
+const OCCLUSION_ID_SLACK = 1024
+
+function sameKeySet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const k of a) if (!b.has(k)) return false
+  return true
 }
 
-/**
- * Metres above ground for one entity, in preference order:
- *
- *   1. the payload's own `elevationField` — the source knows its true
- *      altitude best (e.g. RTLS with vertical accuracy);
- *   2. the altitude of the shape it is anchored to — a sensor bolted to
- *      a first-floor rack belongs at that rack's height even when the
- *      payload says nothing about z;
- *   3. ground.
- *
- * Tier 2 is what puts every shape-anchored render mode on the right
- * floor without asking the operator to emit z per row.
- */
-function resolveAnchorElevation(
-  payload: Record<string, unknown>,
-  config: DataLinkConfig,
-  shape: import('@/lib/data-link/match-resolver').MatchableShape | null,
-): number {
-  const fromSpec = resolveFromElevationSpec(payload, config.fieldMapping.elevation)
-  if (fromSpec !== undefined) return fromSpec
-  // Legacy path — configs written before v5.3 only had `elevationField`.
-  const legacyKey = config.fieldMapping.elevationField
-  if (legacyKey) {
-    const raw = readPayloadPath(payload, legacyKey)
-    // File-imported sources keep every value as a string, so coerce
-    // rather than type-check (same reasoning as coerceCoord).
-    const parsed = typeof raw === 'number' ? raw : Number(raw)
-    if (Number.isFinite(parsed)) return parsed
-  }
-  const z = (shape as { config?: { elevation?: number } } | null)?.config
-    ?.elevation
-  return typeof z === 'number' && Number.isFinite(z) ? z : 0
-}
-
-/**
- * v5.3 elevation spec evaluator. Returns `undefined` when the spec
- * can't produce a definite number for this record — the caller then
- * falls through to the shape-anchor / legacy path so a partly-typed
- * spec doesn't silently pin every marker to 0.
- */
-function resolveFromElevationSpec(
-  payload: Record<string, unknown>,
-  spec: ElevationSpec | undefined,
-): number | undefined {
-  if (!spec) return undefined
-  switch (spec.kind) {
-    case 'static':
-      return Number.isFinite(spec.value) ? spec.value : undefined
-    case 'field': {
-      if (!spec.field) return undefined
-      const raw = readPayloadPath(payload, spec.field)
-      const parsed = typeof raw === 'number' ? raw : Number(raw)
-      return Number.isFinite(parsed) ? parsed : undefined
-    }
-    case 'rules': {
-      for (const rule of spec.rules) {
-        if (!rule.field || !rule.op) continue
-        const raw = readPayloadPath(payload, rule.field)
-        if (raw === undefined || raw === null) continue
-        const haystack = String(raw)
-        const needle = rule.match
-        let hit = false
-        switch (rule.op) {
-          case 'equals':
-            hit = haystack === needle
-            break
-          case 'contains':
-            hit = haystack.includes(needle)
-            break
-          case 'startsWith':
-            hit = haystack.startsWith(needle)
-            break
-          case 'endsWith':
-            hit = haystack.endsWith(needle)
-            break
-        }
-        if (hit && Number.isFinite(rule.value)) return rule.value
-      }
-      return typeof spec.fallback === 'number' && Number.isFinite(spec.fallback)
-        ? spec.fallback
-        : undefined
-    }
-  }
-}
-
-/**
- * v2 iterator — feeds each (entity, matched-shape) pair to the
- * caller's build function. Attribute-join with multiple matches yields
- * one call per pair. Explicit-shape yields at most one. Coord mode
- * yields at most one with `shape=null` + the payload's own position.
- *
- * The `snapshot` argument is a live reference to the useSpatialStore
- * slices the resolver reads (bins + every shape kind). Callers should
- * build it via `useMatchSnapshot()` below.
- *
- * `elevation` is resolved here rather than in each sub-renderer so that
- * every mode lands on the same floor for the same entity.
- */
-function forEachEntityAnchor(
-  entities: readonly EntityState[],
-  config: DataLinkConfig,
-  snapshot: import('@/lib/data-link/match-resolver').MatchStoreSnapshot,
-  visit: (a: {
-    entity: EntityState
-    shape: import('@/lib/data-link/match-resolver').MatchableShape | null
-    position: [number, number]
-    elevation: number
-  }) => void,
-  opts?: {
-    /** v4 — drop entities whose resolved floor doesn't match. */
-    activeFloorPlanId?: ActiveFloors
-    /** Set of currently-live floor plan ids for orphan detection. */
-    liveFloorPlanIds?: ReadonlySet<number>
-    /** v4 — drop entities whose payload fails the layer filter. */
-    filter?: DataLinkFilter | null
-  },
-): void {
-  const activeFloor = opts?.activeFloorPlanId ?? null
-  const liveIds = opts?.liveFloorPlanIds
-  const filter = opts?.filter ?? null
-  const floorScope = config.fieldMapping.floorScope
-  let matched = 0
-  let firstReason: string | null = null
-  for (const entity of entities) {
-    // v4 — payload filter first (cheapest, drops before match).
-    if (filter && !evaluateDataLinkFilter(entity.payload, filter)) continue
-    const result = resolveMatchTargets(entity.payload, config, snapshot)
-    if (result.kind === 'coord') {
-      // Coord path — no shape anchor. Floor gate is payload-only, but
-      // still respects the config's floorScope and treats orphan floors
-      // as unknown so a stale id doesn't hide the row.
-      if (
-        !passesFloorScope(entity.payload, floorScope, activeFloor, liveIds)
-      ) {
-        continue
-      }
-      visit({
-        entity,
-        shape: null,
-        position: result.position,
-        elevation: resolveAnchorElevation(entity.payload, config, null),
-      })
-      matched++
-      continue
-    }
-    if (result.kind !== 'shapes') {
-      if (firstReason === null && result.kind === 'none') firstReason = result.reason
-      continue
-    }
-    let visited = false
-    for (const shape of result.shapes) {
-      // Shape-anchored path: pass the matched shape's floor as the
-      // fallback source for `auto` mode. `passesFloorScope` still wins
-      // the mode (`all` / `specific` short-circuit before the shape
-      // floor is read).
-      const shapeFloor =
-        (shape as unknown as { floorPlanId?: number }).floorPlanId ?? null
-      if (
-        !shapeOnEntityFloor(entity.payload, floorScope, shapeFloor) ||
-        !passesFloorScope(
-          entity.payload,
-          floorScope,
-          activeFloor,
-          liveIds,
-          shapeFloor,
-        )
-      ) {
-        continue
-      }
-      const pos = centroidForShape(shape, config.targetKind)
-      if (!pos) continue
-      visit({
-        entity,
-        shape,
-        position: pos,
-        elevation: resolveAnchorElevation(entity.payload, config, shape),
-      })
-      visited = true
-    }
-    if (visited) matched++
-  }
-  // Debug aid: when a layer has entities flowing in but none of them
-  // resolve to an anchor, the sub-renderer renders 0 features and the
-  // layer appears empty on the map. Log the first failure reason so
-  // the operator can see WHY the match is failing (e.g. payloadField
-  // not present, shape name not in store, targetShapeId stale) and
-  // fix the config without bouncing through the data-link manager.
-  if (entities.length > 0 && matched === 0 && firstReason !== null) {
-    const firstEntity = entities[0]
-    const match = config.fieldMapping?.match
-    const joinDesc =
-      match?.mode === 'attribute-join' || match?.mode === 'external-code'
-        ? `${match.mode}(payloadField="${match.join?.payloadField}", shapeSide=${match.join?.shapeFieldSource}${match.join?.shapeField ? `(${match.join.shapeField})` : ''})`
-        : match?.mode ?? 'coord'
-    console.warn(
-      `[data-link] no entities matched for "${config.name}"\n` +
-        `  renderMode: ${config.renderMode}\n` +
-        `  targetKind: ${config.targetKind}\n` +
-        `  match: ${joinDesc}\n` +
-        `  entityCount: ${entities.length}\n` +
-        `  firstReason: ${firstReason}\n` +
-        `  firstEntity.entityKey: ${firstEntity?.entityKey ?? '(none)'}\n` +
-        `  firstEntity.position: ${JSON.stringify(firstEntity?.position ?? null)}\n` +
-        `  firstEntity.payload: ${JSON.stringify(firstEntity?.payload ?? {})}`,
-    )
-  }
-}
-
-/**
- * Hook that snapshots every store slice the resolver needs. Zustand
- * hands back the current object refs so downstream memoisation +
- * WeakMap caches inside the resolver stay valid across renders.
- *
- * `overrides` lets callers substitute prop-supplied shape arrays for
- * store slices. Share-link / public-view code paths render without
- * `useSpatialStore` populated — the shapes arrive as props from the
- * share endpoint — so an attribute-join sub-renderer must feed those
- * props into the resolver, otherwise every match returns "no polygon
- * where name = X" even though the map draws them fine.
- */
 /**
  * v5.4 — analytic occlusion pass shared by every sub-renderer.
  *
@@ -1939,19 +2352,19 @@ function forEachEntityAnchor(
  * way at tilt, marks the entity as occluded.
  *
  * Runs on every `move` because occlusion is a function of the camera,
- * not the data. Updates via `setFeatureState({source, id, occluded})`
- * so paint expressions (`text-opacity`, `icon-opacity`, `fill-opacity`,
- * `line-opacity`, `circle-opacity`, `heatmap-weight`, …) can fold in
- * `['boolean', ['get', 'occluded'], false]`.
+ * not the data — through the map's shared pass
+ * (`joinDataLinkOcclusionPass`) and `updateOcclusion`, which projects
+ * the targets once per data change, skips repeat camera positions and
+ * reports only what flipped. Hiding is a hard-hide: the sub-renderer
+ * re-pushes with the occluded rows left out (heatmap density, shape
+ * tints, ROI counts, clusters and label collision all depend on the
+ * row being absent, which feature-state opacity could not reproduce),
+ * so React state bumps only on an actual change of the set.
  *
  * Returns a ref pointing at the current occluded-key set so the
  * TooltipManager can also skip hover / click on hidden entities —
  * `queryRenderedFeatures` doesn't respect paint opacity and would
  * otherwise open a tooltip over a marker the user can't see.
- *
- * `sourceId` MUST match the actual source id the sub-renderer uses,
- * and the source MUST have `promoteId: 'entityKey'` so setFeatureState
- * can key by entity string id.
  */
 function useDataLinkOcclusion({
   map,
@@ -1959,6 +2372,8 @@ function useDataLinkOcclusion({
   installTick: _installTick,
   config,
   entities,
+  filter = null,
+  focusKey = null,
   images: propImages,
   polygons: propPolygons,
   circles: propCircles,
@@ -1971,7 +2386,24 @@ function useDataLinkOcclusion({
    *  applied on the newly-attached source. */
   installTick: number
   config: DataLinkConfig
+  /**
+   * The rows the sub-renderer draws from. Pass the already-filtered list
+   * when it has one (point-at-coord pushes `filteredEntities`) — a row
+   * that is never drawn needn't be tested, nor re-push on a flip.
+   */
   entities: readonly EntityState[]
+  /**
+   * The layer filter, ONLY when the sub-renderer's builder drops every
+   * row whose own payload fails it (all modes except history-movement,
+   * whose filter reads the events'). Those rows are skipped here too.
+   */
+  filter?: DataLinkFilter | null
+  /**
+   * Focus mode: the focused row of this config. It is never a target, so
+   * it is never occluded — and if it was, `updateOcclusion` reports it in
+   * `left` and the row is re-pushed visible.
+   */
+  focusKey?: string | null
   images?: ReadonlyArray<ImageShape>
   polygons?: ReadonlyArray<PolygonShape>
   circles?: ReadonlyArray<CircleShape>
@@ -1982,10 +2414,8 @@ function useDataLinkOcclusion({
   /**
    * Bumps every time the occluded set actually changes (not on every
    * `move` — only on set-diff). Sub-renderers include this in the
-   * pushFeatures deps so features re-stamp `occluded` when hiding
-   * changes. `feature-state` is not usable here because
-   * `source.setData(...)` wipes it, so we stamp in the properties
-   * instead — properties are copied verbatim into the source cache.
+   * pushFeatures deps so the occluded rows leave (or re-enter) the
+   * source.
    */
   occludedVersion: number
 } {
@@ -1997,59 +2427,69 @@ function useDataLinkOcclusion({
   // to `MapDataLinkedOverlay` as props. Reading from the store gave
   // 0 prisms and nothing was ever occluded. The host is the single
   // source of truth.
-  const storeImages = propImages ?? []
-  const storePolygons = propPolygons ?? []
-  const storeCircles = propCircles ?? []
-  const storeLines = propLines ?? []
-  const storeStairs = propStairs ?? []
+  // Shared empties, not `?? []`: a fresh array every render rebuilt the
+  // prisms (and re-registered the `move` pass) on every render.
+  const storeImages = propImages ?? EMPTY_IMAGES
+  const storePolygons = propPolygons ?? EMPTY_POLYGONS
+  const storeCircles = propCircles ?? EMPTY_CIRCLES
+  const storeLines = propLines ?? EMPTY_LINES
+  const storeStairs = propStairs ?? EMPTY_STAIRS
+  // Every sub-renderer gets the same arrays, so `buildOccluders` hands
+  // them all the same list — and with it one shared spatial index.
   const prisms = useMemo(
-    () => {
-      const built = buildOccluders({
+    () =>
+      buildOccluders({
         images: storeImages,
         polygons: storePolygons,
         circles: storeCircles,
         lines: storeLines,
         stairs: storeStairs,
-      })
-      // v5.4 DEBUG — see what feeds the occluder builder + what it returns.
-      // eslint-disable-next-line no-console
-      console.log(`[dl-prisms:${config.id}]`, {
-        input_images: (storeImages ?? []).length,
-        input_polygons: (storePolygons ?? []).length,
-        input_lines: (storeLines ?? []).length,
-        input_stairs: (storeStairs ?? []).length,
-        input_circles: (storeCircles ?? []).length,
-        built_prisms: built.length,
-        first_polygon_visible: (storePolygons ?? [])[0]?.visible,
-        first_polygon_zoneId: (storePolygons ?? [])[0]?.zoneId,
-        first_polygon_config: (storePolygons ?? [])[0]?.config,
-      })
-      return built
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+      }),
     [storeImages, storePolygons, storeCircles, storeLines, storeStairs],
   )
   const occludedRef = useRef<Set<string>>(new Set())
   const [occludedVersion, setOccludedVersion] = useState(0)
-  // v5.4 DEBUG — temporary diagnostic logs. Remove once the analytic
-  // occlusion is proven end-to-end.
-  const DBG = `[dl-occlude:${config.id}]`
+  // One numeric id per entity key (`keys[id]` is the key), kept across
+  // `entities` changes, so the ids `updateOcclusion` diffs mean the same
+  // row from one run to the next and its `entered` / `left` are exactly
+  // the keys that flipped. `state.last` always holds the ids of
+  // `occludedRef`, except right after a compaction (below).
+  const [occlusion] = useState(() => ({
+    state: createOcclusionState(),
+    idOfKey: new Map<string, number>(),
+    keys: [] as string[],
+  }))
   useEffect(() => {
-    if (!map || !enabled) {
-      // eslint-disable-next-line no-console
-      console.log(DBG, 'effect skipped', { map: !!map, enabled })
-      return
+    if (!map || !enabled) return
+    const { state, idOfKey, keys } = occlusion
+    // Keys that leave the rows keep their ids (a track window rolling
+    // past short-lived keys, a deleted table row), so the table would
+    // grow for as long as the tab stays open. Once it holds more than
+    // about twice the live rows, start it again from the current rows
+    // and forget what the core reported. Nothing can be diffed by id
+    // then, so the first pass compares the occluded KEYS with
+    // `occludedRef` and re-pushes only if they differ.
+    let resync = false
+    if (keys.length > 2 * entities.length + OCCLUSION_ID_SLACK) {
+      idOfKey.clear()
+      keys.splice(0, keys.length)
+      resetOcclusionState(state)
+      resync = true
     }
     const targets: OccludableTarget[] = []
-    const keyById = new Map<number, string>()
-    let nextId = 0
     for (const e of entities) {
       if (!e.entityKey) continue
+      if (focusKey !== null && e.entityKey === focusKey) continue
+      if (filter && !evaluateDataLinkFilter(e.payload, filter)) continue
       const lngLat = resolvePayloadCoord(e.payload, config) ?? e.position
       if (!lngLat) continue
       const altitudeM = resolveAnchorElevation(e.payload, config, null)
-      const id = nextId++
-      keyById.set(id, e.entityKey)
+      let id = idOfKey.get(e.entityKey)
+      if (id === undefined) {
+        id = keys.length
+        idOfKey.set(e.entityKey, id)
+        keys.push(e.entityKey)
+      }
       targets.push({
         id,
         position: lngLat,
@@ -2057,89 +2497,163 @@ function useDataLinkOcclusion({
         floorPlanId: (e.payload?.floorPlanId as number | undefined) ?? undefined,
       })
     }
-    // eslint-disable-next-line no-console
-    console.log(DBG, 'effect setup', {
-      entities: entities.length,
-      targets: targets.length,
-      prisms: prisms.length,
-      sampleTarget: targets[0],
-      samplePrism: prisms[0]
-        ? { key: prisms[0].key, baseM: prisms[0].baseM, topM: prisms[0].topM, floorPlanId: prisms[0].floorPlanId }
-        : null,
-    })
-    const setsEqual = (a: Set<string>, b: Set<string>) => {
-      if (a.size !== b.size) return false
-      for (const k of a) if (!b.has(k)) return false
-      return true
-    }
-    let ranOnce = false
     const apply = () => {
-      const occludedIds = computeOccludedIds(map, targets, prisms)
+      const { occluded, entered, left } = updateOcclusion(map, targets, prisms, state)
+      if (!resync && entered.length === 0 && left.length === 0) return
       const next = new Set<string>()
-      for (const id of occludedIds) {
-        const k = keyById.get(id)
-        if (k) next.add(k)
+      for (const id of occluded) next.add(keys[id])
+      if (resync) {
+        resync = false
+        if (sameKeySet(next, occludedRef.current)) return
       }
-      if (!ranOnce) {
-        ranOnce = true
-        // eslint-disable-next-line no-console
-        console.log(DBG, 'first apply', {
-          targets: targets.length,
-          prisms: prisms.length,
-          occluded_count: next.size,
-          occluded_keys: [...next].slice(0, 10),
-        })
-      }
-      if (setsEqual(occludedRef.current, next)) return
       occludedRef.current = next
-      // eslint-disable-next-line no-console
-      console.log(DBG, 'occluded set changed', {
-        size: next.size,
-        keys: [...next].slice(0, 10),
-      })
-      // Trigger a re-push so features carry the new `occluded` flag.
-      // Only bumps on set-diff so a slow pan (same visibility for every
-      // frame) doesn't spam setData.
+      // Trigger a re-push so the hidden rows leave (or re-enter) the
+      // source. Only on a real change, so a slow pan (same visibility
+      // for every frame) doesn't spam writes.
       setOccludedVersion((v) => v + 1)
     }
     apply()
-    map.on('move', apply)
-    return () => {
-      map.off('move', apply)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, enabled, _installTick, entities, prisms, config])
+    return joinDataLinkOcclusionPass(map, apply)
+  }, [map, enabled, _installTick, entities, filter, focusKey, prisms, config, occlusion])
 
   return { occludedRef, occludedVersion }
 }
 
-function useMatchSnapshot(
-  overrides?: Partial<import('@/lib/data-link/match-resolver').MatchStoreSnapshot>,
-): import('@/lib/data-link/match-resolver').MatchStoreSnapshot {
-  const bins = useSpatialStore((s) => s.bins)
-  const polygons = useSpatialStore((s) => s.polygons)
-  const circles = useSpatialStore((s) => s.circles)
-  const markers = useSpatialStore((s) => s.markers)
-  const lines = useSpatialStore((s) => s.lines)
-  const stairs = useSpatialStore((s) => s.stairs)
-  const doors = useSpatialStore((s) => s.doors)
-  const images = useSpatialStore((s) => s.images)
-  const imagePlanes = useSpatialStore((s) => s.imagePlanes)
-  const models = useSpatialStore((s) => s.models)
-  const textLabels = useSpatialStore((s) => s.textLabels)
-  return {
-    bins: overrides?.bins ?? bins,
-    polygons: overrides?.polygons ?? polygons,
-    circles: overrides?.circles ?? circles,
-    markers: overrides?.markers ?? markers,
-    lines: overrides?.lines ?? lines,
-    stairs: overrides?.stairs ?? stairs,
-    doors: overrides?.doors ?? doors,
-    images: overrides?.images ?? images,
-    imagePlanes: overrides?.imagePlanes ?? imagePlanes,
-    models: overrides?.models ?? models,
-    textLabels: overrides?.textLabels ?? textLabels,
+/** setTimeout's longest delay. A later instant is reached in steps. */
+const MAX_TIMER_MS = 2_147_483_647
+
+/**
+ * Re-check trigger for style rules that read the clock (`olderThan` /
+ * `newerThan`, e.g. "expires within 7 days"). Their answer for a row
+ * changes with time alone, but a layer only re-pushes when its inputs
+ * change, so an open view kept an expired item in its "expiring" colour.
+ *
+ * Returns a counter that bumps at the first instant one of `rows` flips
+ * a clock condition of the config's rules. The sub-renderer puts it in
+ * its push-effect deps, and the builders re-evaluate every row
+ * (`timeDependent` rules skip the per-row cache). Nothing is armed, and
+ * nothing re-pushes, when the config has no clock rule or no row will
+ * flip. Pass the rows the builder evaluates the rules on.
+ */
+function useRuleClockTick(
+  styleRules: ReadonlyArray<StyleRule>,
+  styleRuleIds: ReadonlyArray<number>,
+  rows: ReadonlyArray<{ payload: Record<string, unknown> }>,
+  enabled: boolean,
+): number {
+  const rules = compileEntityRules(styleRules, styleRuleIds)
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (!enabled || !rules.timeDependent) return
+    let due = nextRuleClockChange(rules, rows, Date.now())
+    let timer: ReturnType<typeof setTimeout> | undefined
+    function arm() {
+      if (due === null) return
+      timer = setTimeout(check, Math.min(Math.max(0, due - Date.now()), MAX_TIMER_MS))
+    }
+    function check() {
+      timer = undefined
+      if (due === null) return
+      const now = Date.now()
+      // Woken early, or by one step of a delay longer than a timer takes.
+      if (now < due) {
+        arm()
+        return
+      }
+      setTick((t) => t + 1)
+      due = nextRuleClockChange(rules, rows, now)
+      arm()
+    }
+    // A hidden tab's timers are throttled; catch up as soon as it shows.
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible' || due === null || Date.now() < due) return
+      if (timer !== undefined) clearTimeout(timer)
+      check()
+    }
+    arm()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      if (timer !== undefined) clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [enabled, rules, rows])
+  return tick
+}
+
+type SpatialStoreState = ReturnType<typeof useSpatialStore.getState>
+
+/** Prop-supplied shape arrays that stand in for store slices. */
+type ShapeOverrides = Partial<
+  Pick<MatchStoreSnapshot, 'polygons' | 'circles' | 'markers' | 'lines' | 'models'>
+>
+
+/** The prop array that replaces the store slice for `kind`, if any. */
+function overrideForKind(
+  kind: DataLinkConfig['targetKind'],
+  overrides: ShapeOverrides,
+): readonly MatchableShape[] | undefined {
+  switch (kind) {
+    case 'polygon': return overrides.polygons
+    case 'circle':  return overrides.circles
+    case 'marker':  return overrides.markers
+    case 'line':    return overrides.lines
+    case 'model':   return overrides.models
+    default:        return undefined
   }
+}
+
+/** The store slice the resolver reads for `kind` (`shapesForKind`). */
+function storeShapesForKind(
+  s: SpatialStoreState,
+  kind: DataLinkConfig['targetKind'],
+): readonly MatchableShape[] {
+  switch (kind) {
+    case 'polygon':    return s.polygons
+    case 'circle':     return s.circles
+    case 'marker':     return s.markers
+    case 'line':       return s.lines
+    case 'stair':      return s.stairs
+    case 'door':       return s.doors
+    case 'image':      return s.images
+    case 'model':      return s.models
+    case 'text-label': return s.textLabels
+    default:           return NO_SHAPES
+  }
+}
+
+/**
+ * The store slices the match resolver reads for this config, as one
+ * memoised snapshot.
+ *
+ * The resolver only ever reads the config's `targetKind` slice (via
+ * `shapesForKind`) and, for a `bin.*` shape side (`external-code`, or
+ * an attribute-join on `bin.externalCode` / `bin.customProp`), `bins`.
+ * Every other slot is left empty, and only those two slices are
+ * subscribed: a bins SSE event no longer re-pushes a name-joined layer,
+ * and a door edit no longer re-pushes a polygon layer. The returned
+ * object keeps its identity until one of them changes, which keeps the
+ * resolver's join index and the per-row feature cache warm.
+ *
+ * `overrides` lets callers substitute prop-supplied shape arrays for
+ * store slices. Share-link / public-view code paths render without
+ * `useSpatialStore` populated — the shapes arrive as props from the
+ * share endpoint — so an attribute-join sub-renderer must feed those
+ * props into the resolver, otherwise every match returns "no polygon
+ * where name = X" even though the map draws them fine.
+ */
+function useMatchSnapshot(
+  config: DataLinkConfig,
+  overrides: ShapeOverrides,
+): MatchStoreSnapshot {
+  const kind = config.targetKind
+  const readsBins = matchReadsBins(config)
+  const override = overrideForKind(kind, overrides)
+  const bins = useSpatialStore((s) => (readsBins ? s.bins : EMPTY_BINS))
+  const storeShapes = useSpatialStore((s) =>
+    override === undefined ? storeShapesForKind(s, kind) : NO_SHAPES,
+  )
+  const shapes = override ?? storeShapes
+  return useMemo(() => narrowMatchSnapshot(kind, shapes, bins), [kind, shapes, bins])
 }
 
 /**
@@ -2195,43 +2709,26 @@ function useStyleReadyInstall(
 }
 
 /**
- * Small helper: raise a set of layers to the top with the same
- * needs-raise guard as `raiseToTop` — accepts any layer id list so
- * each sub-renderer can pin its own layers without duplicating the
- * loop.
+ * Keep this sub-renderer's layers on top of the map, as its own slice of
+ * the `dl-*` block (`@/lib/data-link/dl-layer-stack`). Configs stack in
+ * the order they registered, each in its own fixed layer order — the
+ * order the per-renderer `styledata` listeners this replaces settled on.
+ * The container re-raises the block on `styledata`, guarded, so nothing
+ * moves (and no new `styledata` fires) while the block is already on top.
  */
-function raiseLayerListToTop(map: MapboxMapInstance, layerIds: string[]): void {
-  const ownSet = new Set(layerIds)
-  // getStyle() throws "Style is not done loading" mid basemap swap; skip —
-  // the `styledata` listener calls this again once the new style is in.
-  let layers: ReturnType<MapboxMapInstance['getStyle']>['layers']
-  try {
-    layers = map.getStyle()?.layers ?? []
-  } catch {
-    return
-  }
-  let lastOwnIdx = -1
-  for (let i = 0; i < layers.length; i++) {
-    if (ownSet.has(layers[i].id)) lastOwnIdx = i
-  }
-  if (lastOwnIdx < 0) return
-  let needsRaise = false
-  for (let i = lastOwnIdx + 1; i < layers.length; i++) {
-    if (!ownSet.has(layers[i].id)) {
-      needsRaise = true
-      break
-    }
-  }
-  if (!needsRaise) return
-  for (const id of layerIds) {
-    if (map.getLayer(id)) {
-      try {
-        map.moveLayer(id)
-      } catch {
-        /* swallowed — the layer went away between check + move */
-      }
-    }
-  }
+function useDataLinkLayerStack(
+  map: MapboxMapInstance,
+  layerIds: readonly string[],
+  enabled: boolean,
+): void {
+  useEffect(() => {
+    if (!enabled) return
+    const release = registerDataLinkLayers(map, layerIds)
+    try {
+      raiseDataLinkLayers(map)
+    } catch { /* style not ready — the container's styledata pass catches up */ }
+    return release
+  }, [map, layerIds, enabled])
 }
 
 function setGeoJSONData(
@@ -2255,7 +2752,7 @@ function setGeoJSONData(
  * same coord; typical use is one-sensor-per-shape where the stack is
  * a single dot.
  */
-function PointOnShapeSubRenderer({
+const PointOnShapeSubRenderer = memo(function PointOnShapeSubRenderer({
   map,
   config,
   visible,
@@ -2276,6 +2773,7 @@ function PointOnShapeSubRenderer({
   occluderStairs,
 }: SubRendererProps & ShapeAnchorProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -2283,10 +2781,14 @@ function PointOnShapeSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+  // Focus mode (see the point-at-coord sub-renderer).
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -2298,16 +2800,16 @@ function PointOnShapeSubRenderer({
     () => [pointId, iconId, labelId],
     [pointId, iconId, labelId],
   )
-
-  const shapeProps: ShapeAnchorProps = useMemo(
-    () => ({ polygons, circles, markers, lines, models }),
-    [polygons, circles, markers, lines, models],
+  // Diff-only writes to the (dynamic) source + per-row feature cache.
+  const writer = useSourceWriter(map, sourceId)
+  const [rowCache] = useState(() =>
+    createRowBuildCache<{ row: RowAnchors; features: GeoJSON.Feature<GeoJSON.Point>[] }>(),
   )
 
   const teardownFn = () => {
-    if (map.getLayer(labelId)) map.removeLayer(labelId)
-    if (map.getLayer(iconId)) map.removeLayer(iconId)
-    if (map.getLayer(pointId)) map.removeLayer(pointId)
+    if (hasMapLayer(map, labelId)) map.removeLayer(labelId)
+    if (hasMapLayer(map, iconId)) map.removeLayer(iconId)
+    if (hasMapLayer(map, pointId)) map.removeLayer(pointId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -2323,7 +2825,8 @@ function PointOnShapeSubRenderer({
         [config.style.defaultIcon ?? 'map-pin'],
         { color: config.style.iconColor },
       )
-      map.addSource(sourceId, { type: 'geojson', data: emptyFC(), promoteId: 'entityKey' })
+      // `dynamic`: diff-only writes (see the point-at-coord source).
+      map.addSource(sourceId, { type: 'geojson', data: emptyFC(), promoteId: 'entityKey', dynamic: true })
       const defaultColor = config.style.defaultColor ?? '#3b82f6'
       // v4 — sizes flow via feature properties (stamped in this
       // sub-renderer's push-features effect). Layer expressions read
@@ -2347,11 +2850,13 @@ function PointOnShapeSubRenderer({
         },
         paint: {
           'text-color': ['coalesce', ['get', 'color'], defaultColor],
-          'text-opacity': OCCLUSION_TEXT_OPACITY,
+          // Analytic occlusion leaves occluded rows out; focus / ghost /
+          // NEAR rows read their flags (see pointSymbolOpacity).
+          'text-opacity': FULL_POINT_OPACITY,
           'text-halo-color': '#ffffff',
           'text-halo-width': 2,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
         },
       })
       map.addLayer({
@@ -2369,8 +2874,8 @@ function PointOnShapeSubRenderer({
         },
         paint: {
           'symbol-z-offset': Z_OFFSET,
-          'icon-opacity': OCCLUSION_ICON_OPACITY,
-          'icon-occlusion-opacity': 0,
+          'icon-opacity': FULL_POINT_OPACITY,
+          'icon-occlusion-opacity': POINT_OCCLUSION_OPACITY,
         },
       })
       map.addLayer({
@@ -2387,11 +2892,11 @@ function PointOnShapeSubRenderer({
         },
         paint: {
           'text-color': '#111827',
-          'text-opacity': OCCLUSION_TEXT_OPACITY,
+          'text-opacity': FULL_POINT_OPACITY,
           'text-halo-color': '#ffffff',
           'text-halo-width': 1.5,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
         },
       })
     },
@@ -2415,7 +2920,7 @@ function PointOnShapeSubRenderer({
     if (!enabled || !map) return
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(pointId)) {
+      if (hasMapLayer(map, pointId)) {
         map.setPaintProperty(pointId, 'text-color', [
           'coalesce',
           ['get', 'color'],
@@ -2431,7 +2936,7 @@ function PointOnShapeSubRenderer({
     config.style.defaultColor,
   ])
 
-  const snapshot = useMatchSnapshot({ polygons, circles, markers, lines, models })
+  const snapshot = useMatchSnapshot(config, { polygons, circles, markers, lines, models })
 
   // v5.4 — analytic occlusion. Declared before the push effect so
   // `occludedVersion` is available as a dep — the push re-runs when
@@ -2442,7 +2947,10 @@ function PointOnShapeSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -2455,109 +2963,76 @@ function PointOnShapeSubRenderer({
   // hit multiple) and stack a marker at each centroid. Explicit-shape
   // matches at most one shape; legacy configs still resolve there
   // through the effectiveMatch() fallback.
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  const ghosts = focus.ghosts
+  const near = focus.near
+  // A row with no anchor may just be waiting for its shapes to arrive.
+  const complete = loaded && settled && matchShapesLoaded(config, snapshot)
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    const labelKey = config.fieldMapping.labelField ?? 'label'
-    const colorKey = config.fieldMapping.colorField
-    const iconName = mapboxImageIdFor(
-      config.style.defaultIcon ?? 'map-pin',
-      config.style.iconColor,
+    // `buildPointOnShapeFeatures` — one marker per (entity, matched
+    // shape); occluded entities never enter the source (v5.4 hard-hide)
+    // unless ghost mode keeps them; the focused row is always drawn;
+    // markers in the focused item's NEAR column are stamped `focusNear`.
+    const features = buildPointOnShapeFeatures(
+      rows,
+      config,
+      snapshot,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey, ghosts, near },
+      pointOnShapeOccludedRef.current,
+      rowCache,
     )
-    const features: GeoJSON.Feature<GeoJSON.Point>[] = []
-
-    forEachEntityAnchor(entities, config, snapshot, ({ entity: e, position, elevation }) => {
-      // v5.4 — hard-hide: occluded entities never enter the source.
-      if (pointOnShapeOccludedRef.current.has(e.entityKey)) return
-      let label =
-        typeof e.payload[labelKey] === 'string' || typeof e.payload[labelKey] === 'number'
-          ? String(e.payload[labelKey])
-          : e.entityKey
-      let color =
-        colorKey && typeof e.payload[colorKey] === 'string'
-          ? (e.payload[colorKey] as string)
-          : undefined
-      let opacity: number | undefined
-      const override = evaluateEntityRules(
-        styleRules,
-        config.styleRuleIds,
-        e.payload,
-      )
-      if (override) {
-        if (override.fillColor) color = override.fillColor
-        if (override.iconColor) color = override.iconColor
-        if (override.labelText)
-          label = resolveLabelTemplate(override.labelText, e.payload)
-        if (override.fillOpacity !== undefined)
-          opacity = override.fillOpacity / 100
-      }
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: position },
-        properties: {
-          entityKey: e.entityKey,
-          streamId: e.streamId,
-          configId: config.id,
-          label,
-          color,
-          opacity,
-          elevation,
-          icon: iconName,
-          occluded: pointOnShapeOccludedRef.current.has(e.entityKey),
-          // v4 — feature-level sizes, read by data-driven expressions
-          // on the disc + icon layers. Fast source.setData update path.
-          discSize: config.style.markerSize ?? 11,
-          iconSize: config.style.iconSize ?? 0.7,
-          payload: JSON.stringify(e.payload),
-        },
-      })
-    }, { activeFloorPlanId, liveFloorPlanIds, filter })
-    setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
+    writer.write(features, entityFeatureKey)
+    onDrawn(features, complete)
   }, [
     map,
-    sourceId,
-    ownLayerIds,
     config,
-    entities,
+    rows,
     enabled,
-    shapeProps,
     styleRules,
     snapshot,
     activeFloorPlanId,
     liveFloorPlanIds,
     filter,
     installTick,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    writer,
+    rowCache,
+    pointOnShapeOccludedRef,
     pointOnShapeOccludedVersion,
+    ruleClockTick,
+    focusKey,
+    ghosts,
+    near,
+    complete,
+    onDrawn,
   ])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
 
   return (
-    <TooltipManager
-      map={map}
-      config={config}
-      layerIds={ownLayerIds}
-      occludedKeysRef={pointOnShapeOccludedRef}
-    />
+    <>
+      <TooltipManager
+        map={map}
+        config={config}
+        layerIds={ownLayerIds}
+        occludedKeysRef={pointOnShapeOccludedRef}
+      />
+      {loader}
+    </>
   )
-}
+})
 
 // ---------------------------------------------------------------------------
 // gauge-on-shape sub-renderer
@@ -2568,7 +3043,7 @@ function PointOnShapeSubRenderer({
  * for each entity — the typical case is one sensor per shape so the
  * stack is a single badge.
  */
-function GaugeOnShapeSubRenderer({
+const GaugeOnShapeSubRenderer = memo(function GaugeOnShapeSubRenderer({
   map,
   config,
   visible,
@@ -2589,6 +3064,7 @@ function GaugeOnShapeSubRenderer({
   occluderStairs,
 }: SubRendererProps & ShapeAnchorProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -2596,10 +3072,14 @@ function GaugeOnShapeSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+  // Focus mode (see the point-at-coord sub-renderer).
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -2607,15 +3087,15 @@ function GaugeOnShapeSubRenderer({
   const bgId = `dl-${config.id}-gauge-bg`
   const textId = `dl-${config.id}-gauge-text`
   const ownLayerIds = useMemo(() => [bgId, textId], [bgId, textId])
-
-  const shapeProps: ShapeAnchorProps = useMemo(
-    () => ({ polygons, circles, markers, lines, models }),
-    [polygons, circles, markers, lines, models],
+  // Diff-only writes to the (dynamic) source + per-row feature cache.
+  const writer = useSourceWriter(map, sourceId)
+  const [rowCache] = useState(() =>
+    createRowBuildCache<{ row: RowAnchors; features: GeoJSON.Feature<GeoJSON.Point>[] }>(),
   )
 
   const teardownFn = () => {
-    if (map.getLayer(textId)) map.removeLayer(textId)
-    if (map.getLayer(bgId)) map.removeLayer(bgId)
+    if (hasMapLayer(map, textId)) map.removeLayer(textId)
+    if (hasMapLayer(map, bgId)) map.removeLayer(bgId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -2624,7 +3104,8 @@ function GaugeOnShapeSubRenderer({
     enabled,
     () => {
       if (map.getSource(sourceId)) teardownFn()
-      map.addSource(sourceId, { type: 'geojson', data: emptyFC(), promoteId: 'entityKey' })
+      // `dynamic`: diff-only writes (see the point-at-coord source).
+      map.addSource(sourceId, { type: 'geojson', data: emptyFC(), promoteId: 'entityKey', dynamic: true })
       const defaultColor = config.style.defaultColor ?? '#3b82f6'
       // v4 — user-configurable badge size.
       const badgeSize = config.style.badgeSize ?? 18
@@ -2649,20 +3130,16 @@ function GaugeOnShapeSubRenderer({
           ],
         },
         paint: {
-          'text-color': defaultColor,
-          // v5.4 — analytic occlusion fold. Multiplied against the
-          // gauge's authored 0.92 so occluded features hard-hide (0)
-          // while visible ones keep the original translucency.
-          'text-opacity': [
-            'case',
-            ['boolean', ['get', 'occluded'], false],
-            0,
-            0.92,
-          ],
+          // A style rule's colour (stamped per feature by buildGaugeFeatures) wins over the default.
+          'text-color': ['coalesce', ['get', 'color'], defaultColor],
+          // The gauge's authored 0.92 translucency; occluded rows are
+          // left out of the source (v5.4 hard-hide), focus / ghost / NEAR
+          // rows read their flags (see pointSymbolOpacity).
+          'text-opacity': pointSymbolOpacity(0.92),
           'text-halo-color': '#ffffff',
           'text-halo-width': 2,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
         },
       })
       map.addLayer({
@@ -2678,11 +3155,11 @@ function GaugeOnShapeSubRenderer({
         },
         paint: {
           'text-color': '#ffffff',
-          'text-opacity': OCCLUSION_TEXT_OPACITY,
+          'text-opacity': FULL_POINT_OPACITY,
           'text-halo-color': 'rgba(0,0,0,0.35)',
           'text-halo-width': 1,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': POINT_OCCLUSION_OPACITY,
         },
       })
     },
@@ -2698,15 +3175,15 @@ function GaugeOnShapeSubRenderer({
     if (!enabled || !map) return
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(bgId)) {
+      if (hasMapLayer(map, bgId)) {
         // Size rides on the feature's `badgeSize` stamp (see install);
         // only the colour needs an explicit paint sync.
-        map.setPaintProperty(bgId, 'text-color', defaultColor)
+        map.setPaintProperty(bgId, 'text-color', ['coalesce', ['get', 'color'], defaultColor])
       }
     } catch { /* mid-teardown */ }
   }, [map, enabled, installTick, bgId, config.style.badgeSize, config.style.defaultColor])
 
-  const snapshot = useMatchSnapshot({ polygons, circles, markers, lines, models })
+  const snapshot = useMatchSnapshot(config, { polygons, circles, markers, lines, models })
 
   // v5.4 — analytic occlusion. See useDataLinkOcclusion + the point-
   // at-coord sub-renderer's usage for the pattern.
@@ -2715,7 +3192,10 @@ function GaugeOnShapeSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -2723,103 +3203,76 @@ function GaugeOnShapeSubRenderer({
     stairs: occluderStairs,
   })
 
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  const ghosts = focus.ghosts
+  const near = focus.near
+  // A row with no anchor may just be waiting for its shapes to arrive.
+  const complete = loaded && settled && matchShapesLoaded(config, snapshot)
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    // Uses the mapping's labelField as the value source; if the caller
-    // hasn't set one, falls back to a `value` key (common convention
-    // for sensor payloads). Future: a dedicated valueField on the
-    // mapping — for now labelField ?? 'value' keeps the surface small.
-    const valueKey = config.fieldMapping.labelField ?? 'value'
-    const features: GeoJSON.Feature<GeoJSON.Point>[] = []
-
-    forEachEntityAnchor(entities, config, snapshot, ({ entity: e, position, elevation }) => {
-      // v5.4 — hard-hide: occluded entities never enter the source.
-      if (gaugeOccludedRef.current.has(e.entityKey)) return
-      const raw = e.payload[valueKey]
-      let value =
-        typeof raw === 'string' || typeof raw === 'number'
-          ? String(raw)
-          : e.entityKey
-      let color: string | undefined
-      let opacity: number | undefined
-      const override = evaluateEntityRules(
-        styleRules,
-        config.styleRuleIds,
-        e.payload,
-      )
-      if (override) {
-        if (override.fillColor) color = override.fillColor
-        if (override.iconColor) color = override.iconColor
-        if (override.labelText)
-          value = resolveLabelTemplate(override.labelText, e.payload)
-        if (override.fillOpacity !== undefined)
-          opacity = override.fillOpacity / 100
-      }
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: position },
-        properties: {
-          entityKey: e.entityKey,
-          streamId: e.streamId,
-          configId: config.id,
-          value,
-          label: value,
-          color,
-          opacity,
-          elevation,
-          badgeSize: config.style.badgeSize ?? 18,
-          occluded: gaugeOccludedRef.current.has(e.entityKey),
-          payload: JSON.stringify(e.payload),
-        },
-      })
-    }, { activeFloorPlanId, liveFloorPlanIds, filter })
-    setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
+    // `buildGaugeFeatures` — one badge per (entity, matched shape);
+    // occluded entities never enter the source (v5.4 hard-hide) unless
+    // ghost mode keeps them; the focused row is always drawn; badges in
+    // the focused item's NEAR column are stamped `focusNear`.
+    const features = buildGaugeFeatures(
+      rows,
+      config,
+      snapshot,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey, ghosts, near },
+      gaugeOccludedRef.current,
+      rowCache,
+    )
+    writer.write(features, entityFeatureKey)
+    onDrawn(features, complete)
   }, [
     map,
-    sourceId,
-    ownLayerIds,
     config,
-    entities,
+    rows,
     enabled,
-    shapeProps,
     styleRules,
     snapshot,
     activeFloorPlanId,
     liveFloorPlanIds,
     filter,
     installTick,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    writer,
+    rowCache,
+    gaugeOccludedRef,
     gaugeOccludedVersion,
+    ruleClockTick,
+    focusKey,
+    ghosts,
+    near,
+    complete,
+    onDrawn,
   ])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
 
   return (
-    <TooltipManager
-      map={map}
-      config={config}
-      layerIds={ownLayerIds}
-      occludedKeysRef={gaugeOccludedRef}
-    />
+    <>
+      <TooltipManager
+        map={map}
+        config={config}
+        layerIds={ownLayerIds}
+        occludedKeysRef={gaugeOccludedRef}
+      />
+      {loader}
+    </>
   )
-}
+})
 
 // ---------------------------------------------------------------------------
 // shape-tint sub-renderer
@@ -2830,7 +3283,7 @@ function GaugeOnShapeSubRenderer({
  * defaultColor. Renders even when 0 entities exist — the tint IS the
  * point; data-driven tint is a Slice 4 (style rules) job.
  */
-function ShapeTintSubRenderer({
+const ShapeTintSubRenderer = memo(function ShapeTintSubRenderer({
   map,
   config,
   visible,
@@ -2848,6 +3301,7 @@ function ShapeTintSubRenderer({
   occluderStairs,
 }: SubRendererProps & ShapeAnchorProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -2855,10 +3309,16 @@ function ShapeTintSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+  // Focus mode (see the point-at-coord sub-renderer): the focused row's
+  // tint is drawn whatever the filter / floor. Tints are never faded — not
+  // even in the focused item's NEAR column.
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -2867,7 +3327,7 @@ function ShapeTintSubRenderer({
   const ownLayerIds = useMemo(() => [tintId], [tintId])
 
   const teardownFn = () => {
-    if (map.getLayer(tintId)) map.removeLayer(tintId)
+    if (hasMapLayer(map, tintId)) map.removeLayer(tintId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -2909,13 +3369,15 @@ function ShapeTintSubRenderer({
   )
 
   // ---- style sync: fill opacity + default colour ----------------------
+  // Fill opacity is written only on a change (the install already holds
+  // it), so a re-install or a focus change never writes paint.
   useEffect(() => {
     if (!enabled || !map) return
     const fillOpacity = config.style.fillOpacity ?? 0.5
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(tintId)) {
-        map.setPaintProperty(tintId, 'fill-opacity', [
+      if (hasMapLayer(map, tintId)) {
+        setPaintIfChanged(map, tintId, 'fill-opacity', [
           'coalesce',
           ['get', 'opacity'],
           fillOpacity,
@@ -2929,19 +3391,9 @@ function ShapeTintSubRenderer({
     } catch { /* mid-teardown */ }
   }, [map, enabled, installTick, tintId, config.style.fillOpacity, config.style.defaultColor])
 
-  // Live snapshot of every store slice the resolver may read. Grabbing
-  // the whole state on each rebuild is cheap (Zustand hands back the
-  // current object reference) and ensures attribute-join sees fresh
-  // bins + shapes.
-  const storeBins = useSpatialStore((s) => s.bins)
-  const storeMarkers = useSpatialStore((s) => s.markers)
-  const storeLines = useSpatialStore((s) => s.lines)
-  const storeStairs = useSpatialStore((s) => s.stairs)
-  const storeDoors = useSpatialStore((s) => s.doors)
-  const storeImages = useSpatialStore((s) => s.images)
-  const storeImagePlanes = useSpatialStore((s) => s.imagePlanes)
-  const storeModels = useSpatialStore((s) => s.models)
-  const storeTextLabels = useSpatialStore((s) => s.textLabels)
+  // The store slices the resolver reads for this config, with the
+  // tint's own polygons / circles standing in for the store's.
+  const snapshot = useMatchSnapshot(config, { polygons, circles })
 
   // v5.4 — analytic occlusion. See useDataLinkOcclusion + the point-
   // at-coord sub-renderer's usage for the pattern. Even though the
@@ -2953,7 +3405,10 @@ function ShapeTintSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -2966,175 +3421,67 @@ function ShapeTintSubRenderer({
   // shape ids → one tinted feature per shape. Attribute-join hits ALL
   // matching shapes; explicit-shape falls back to the single target
   // as before.
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  // A row with no anchor may just be waiting for its shapes to arrive.
+  const complete = loaded && settled && matchShapesLoaded(config, snapshot)
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-
-    const snapshot = {
-      bins: storeBins,
-      polygons: [...polygons],
-      circles: [...circles],
-      markers: [...storeMarkers],
-      lines: [...storeLines],
-      stairs: [...storeStairs],
-      doors: [...storeDoors],
-      images: [...storeImages],
-      imagePlanes: [...storeImagePlanes],
-      models: [...storeModels],
-      textLabels: [...storeTextLabels],
-    }
-
-    // shapeId → { color?, opacity?, payload? } — last write wins when
-    // multiple entities target the same shape.
-    const perShape = new Map<
-      number,
-      { color?: string; opacity?: number; payload?: Record<string, unknown> }
-    >()
-
-    // If the config has no entities YET but IS bound to a single shape
-    // (explicit or legacy), still tint that shape with the defaults so
-    // the visual isn't invisible until the first stream event.
-    const alwaysTintFallback = (() => {
-      const result = resolveMatchTargets({}, config, snapshot)
-      if (result.kind === 'shapes') {
-        for (const s of result.shapes) {
-          if (s.id !== undefined && !perShape.has(s.id)) {
-            perShape.set(s.id, {})
-          }
-        }
-      }
-    })
-
-    if (entities.length === 0) {
-      alwaysTintFallback()
-    } else {
-      for (const e of entities) {
-        // v5.4 — hard-hide: occluded entities do not tint their shape.
-        if (tintOccludedRef.current.has(e.entityKey)) continue
-        // v4 — layer filter first (cheapest gate).
-        if (filter && !evaluateDataLinkFilter(e.payload, filter)) continue
-        const target = resolveMatchTargets(e.payload, config, snapshot)
-        if (target.kind !== 'shapes') continue
-        const override = evaluateEntityRules(
-          styleRules,
-          config.styleRuleIds,
-          e.payload,
-        )
-        const patch: {
-          color?: string
-          opacity?: number
-          payload?: Record<string, unknown>
-        } = {}
-        if (override?.fillColor) patch.color = override.fillColor
-        else if (override?.iconColor) patch.color = override.iconColor
-        if (override?.fillOpacity !== undefined) patch.opacity = override.fillOpacity / 100
-        patch.payload = e.payload as Record<string, unknown>
-        for (const s of target.shapes) {
-          if (s.id === undefined) continue
-          // Floor gate honours the config's floorScope + treats orphan
-          // shape/payload floor references as unknown. The tinted shape's
-          // own floorPlanId is passed as the fallback for `auto` mode.
-          const shapeFloor =
-            (s as unknown as { floorPlanId?: number }).floorPlanId ?? null
-          if (
-            !shapeOnEntityFloor(e.payload as Record<string, unknown>, config.fieldMapping.floorScope, shapeFloor) ||
-            !passesFloorScope(
-              e.payload as Record<string, unknown>,
-              config.fieldMapping.floorScope,
-              activeFloorPlanId ?? null,
-              liveFloorPlanIds,
-              shapeFloor,
-            )
-          ) {
-            continue
-          }
-          perShape.set(s.id, patch)
-        }
-      }
-    }
-
-    const features: GeoJSON.Feature<GeoJSON.Polygon>[] = []
-    for (const [shapeId, styleForShape] of perShape) {
-      const props = {
-        configId: config.id,
-        color: styleForShape.color,
-        opacity: styleForShape.opacity,
-        payload: styleForShape.payload
-          ? JSON.stringify(styleForShape.payload)
-          : undefined,
-      }
-      if (config.targetKind === 'polygon') {
-        const p = polygons.find((x) => x.id === shapeId)
-        if (p && p.vertices.length >= 3) {
-          const ring: [number, number][] = [...p.vertices, p.vertices[0]]
-          features.push({
-            type: 'Feature',
-            geometry: { type: 'Polygon', coordinates: [ring] },
-            // Top face, not the base: tinting an extruded room at its
-            // base would bury the tint inside the solid. A flat room
-            // still draws as a thin slab, so use its drawn top.
-            properties: { ...props, elevation: slabTopM(p, 0.11) },
-          })
-        }
-      } else if (config.targetKind === 'circle') {
-        const c = circles.find((x) => x.id === shapeId)
-        if (c) {
-          for (const feat of buildCircleFeatures(c)) {
-            features.push({
-              type: 'Feature',
-              geometry: feat.geometry,
-              properties: { ...props, elevation: slabTopM(c, 0) },
-            })
-          }
-        }
-      }
-    }
+    // `buildShapeTintFeatures` — last matching entity per shape wins;
+    // a bound shape with no entities yet still tints with the defaults.
+    // The focused row's shape is stamped `focused` (its anchor).
+    const features = buildShapeTintFeatures(
+      rows,
+      config,
+      snapshot,
+      polygons,
+      circles,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey },
+      tintOccludedRef.current,
+    )
     setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
+    onDrawn(features, complete)
   }, [
     map,
     sourceId,
-    ownLayerIds,
     config,
     polygons,
     circles,
     enabled,
-    entities,
+    rows,
     styleRules,
-    storeBins,
-    storeMarkers,
-    storeLines,
-    storeStairs,
-    storeDoors,
-    storeImages,
-    storeImagePlanes,
-    storeModels,
-    storeTextLabels,
+    snapshot,
     activeFloorPlanId,
     liveFloorPlanIds,
     filter,
     installTick,
+    tintOccludedRef,
     tintOccludedVersion,
+    ruleClockTick,
+    focusKey,
+    complete,
+    onDrawn,
   ])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
-  return <TooltipManager map={map} config={config} layerIds={ownLayerIds} />
-}
+  return (
+    <>
+      <TooltipManager map={map} config={config} layerIds={ownLayerIds} />
+      {loader}
+    </>
+  )
+})
 
 // ---------------------------------------------------------------------------
 // heatmap sub-renderer
@@ -3145,7 +3492,7 @@ function ShapeTintSubRenderer({
  * Falls back to a per-point circle at high zoom so individual points
  * remain visible past the point where the heatmap fades.
  */
-function HeatmapSubRenderer({
+const HeatmapSubRenderer = memo(function HeatmapSubRenderer({
   map,
   config,
   visible,
@@ -3170,6 +3517,7 @@ function HeatmapSubRenderer({
   const useHistorySource =
     config.style.heatmapSource === 'history' && config.sourceId !== undefined
   const historyWindowSec = config.style.heatmapWindowSec ?? 86_400
+  const layerPollMs = useLayerPollMs()
   const historyQuery = useApiQuery<TableRowEvent[]>(
     () =>
       config.sourceId !== undefined && useHistorySource
@@ -3179,26 +3527,36 @@ function HeatmapSubRenderer({
           })
         : Promise.resolve([]),
     ['heatmap-events', tenantId, config.sourceId ?? 0, historyWindowSec],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled: enabled && useHistorySource },
+    { intervalMs: layerPollMs, enabled: enabled && useHistorySource },
   )
   const liveQuery = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled: enabled && !useHistorySource },
+    { intervalMs: layerPollMs, enabled: enabled && !useHistorySource },
   )
   const liveEntities = useMemo(
     () =>
       useHistorySource
         ? eventsToEntities(historyQuery.data ?? [])
-        : liveQuery.data ?? [],
+        : liveQuery.data,
     [useHistorySource, historyQuery.data, liveQuery.data],
   )
-  const { entities } = useEffectiveEntities(config, liveEntities)
-  useLayerLoading(
-    config.id,
-    config.name,
-    useHistorySource ? historyQuery.isLoading : liveQuery.isLoading,
+  // Unchanged rows / events keep their objects across refetches (so the
+  // per-row feature cache below holds), and the loader's blocking card
+  // only covers a load with no rows yet — see useLayerRows.
+  const { entities, playbackActive } = useEffectiveEntities(config, useSharedRows(liveEntities))
+  const loadingQuery = useHistorySource ? historyQuery : liveQuery
+  useLayerLoading(config.id, config.name, loadingQuery.isLoading, loadingQuery.data !== undefined)
+  // Focus mode: the focused row adds its density and its high-zoom dot
+  // whatever the filter / floor; nothing else changes (an aggregate is
+  // never faded). The single-row fetch only applies to the live-rows
+  // source (history events aren't filtered server-side by row).
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || loadingQuery.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(
+    config, entities, focus.key, loaded, !playbackActive && !useHistorySource,
   )
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -3206,10 +3564,13 @@ function HeatmapSubRenderer({
   const heatmapId = `dl-${config.id}-heatmap`
   const heatpointId = `dl-${config.id}-heatmap-point`
   const ownLayerIds = useMemo(() => [heatmapId, heatpointId], [heatmapId, heatpointId])
+  // Skips a write whose features are all unchanged (per-row cache).
+  const writer = useSourceWriter(map, sourceId)
+  const [rowCache] = useState(() => createRowBuildCache<GeoJSON.Feature<GeoJSON.Point> | null>())
 
   const teardownFn = () => {
-    if (map.getLayer(heatpointId)) map.removeLayer(heatpointId)
-    if (map.getLayer(heatmapId)) map.removeLayer(heatmapId)
+    if (hasMapLayer(map, heatpointId)) map.removeLayer(heatpointId)
+    if (hasMapLayer(map, heatmapId)) map.removeLayer(heatmapId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -3282,7 +3643,8 @@ function HeatmapSubRenderer({
           'text-halo-color': '#ffffff',
           'text-halo-width': 1,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          // The focused row's dot shows through floors and walls.
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
     },
@@ -3299,7 +3661,7 @@ function HeatmapSubRenderer({
     const heatmapRadiusMax = config.style.heatmapRadius ?? 40
     const heatmapIntensityMult = config.style.heatmapIntensity ?? 1
     try {
-      if (map.getLayer(heatmapId)) {
+      if (hasMapLayer(map, heatmapId)) {
         map.setPaintProperty(heatmapId, 'heatmap-radius', [
           'interpolate', ['linear'], ['zoom'], 0, 10, 22, heatmapRadiusMax,
         ])
@@ -3329,7 +3691,10 @@ function HeatmapSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -3337,90 +3702,43 @@ function HeatmapSubRenderer({
     stairs: occluderStairs,
   })
 
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  const complete = loaded && settled
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    const features: GeoJSON.Feature<GeoJSON.Point>[] = []
-    // v2: coord lookup via resolvePayloadCoord() so legacy configs
-    // AND explicit `match.mode='coord'` configs both work through the
-    // same code path. resolveMatchTargets returns kind='coord' with
-    // the resolved position, which we destructure here.
-    for (const e of entities) {
-      // v5.4 — hard-hide: occluded entities do not contribute to density.
-      if (heatmapOccludedRef.current.has(e.entityKey)) continue
-      // Layer filter + floor gate. Heatmap has no matched shape, so
-      // `passesFloorScope` reads floor from the payload only (and
-      // treats orphan ids as unknown).
-      if (filter && !evaluateDataLinkFilter(e.payload, filter)) continue
-      if (
-        !passesFloorScope(
-          e.payload,
-          config.fieldMapping.floorScope,
-          activeFloorPlanId ?? null,
-          liveFloorPlanIds,
-        )
-      ) {
-        continue
-      }
-      const position = resolvePayloadCoord(e.payload, config)
-      if (!position) continue
-      const [rawLng, rawLat] = position
-      let color: string | undefined
-      let opacity: number | undefined
-      const override = evaluateEntityRules(
-        styleRules,
-        config.styleRuleIds,
-        e.payload,
-      )
-      if (override) {
-        if (override.fillColor) color = override.fillColor
-        if (override.iconColor && !color) color = override.iconColor
-        if (override.fillOpacity !== undefined)
-          opacity = override.fillOpacity / 100
-      }
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [rawLng, rawLat] },
-        properties: {
-          entityKey: e.entityKey,
-          streamId: e.streamId,
-          configId: config.id,
-          // v5: heatmap-weight expression coalesces on `weight`, so
-          // rules that lower a point's opacity (e.g. "weak-signal RFID"
-          // at 40%) also lower its contribution to the density gradient.
-          // Defaults to 1 when no rule matches.
-          weight: opacity ?? 1,
-          color,
-          opacity,
-          // Only feeds the high-zoom dot layer — the heatmap pass
-          // itself is screen-space and has no notion of altitude.
-          elevation: resolveAnchorElevation(e.payload, config, null),
-          payload: JSON.stringify(e.payload),
-        },
-      })
-    }
-    setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
-  }, [map, sourceId, ownLayerIds, config, entities, enabled, styleRules, activeFloorPlanId, liveFloorPlanIds, filter, installTick, heatmapOccludedVersion])
+    // `buildHeatmapFeatures` — one weighted point per record with a
+    // coordinate; occluded entities do not contribute to density.
+    const features = buildHeatmapFeatures(
+      rows,
+      config,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey },
+      heatmapOccludedRef.current,
+      rowCache,
+    )
+    writer.write(features, entityFeatureKey)
+    onDrawn(features, complete)
+  }, [map, config, rows, enabled, styleRules, activeFloorPlanId, liveFloorPlanIds, filter, installTick, heatmapOccludedRef, heatmapOccludedVersion, writer, rowCache, ruleClockTick, focusKey, complete, onDrawn])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
-  return <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={heatmapOccludedRef} />
-}
+  return (
+    <>
+      <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={heatmapOccludedRef} />
+      {loader}
+    </>
+  )
+})
 
 // ---------------------------------------------------------------------------
 // track sub-renderer
@@ -3431,7 +3749,7 @@ function HeatmapSubRenderer({
  * latest position. Groups events by entityKey, sorts by ts ascending,
  * connects the dots.
  */
-function TrackSubRenderer({
+const TrackSubRenderer = memo(function TrackSubRenderer({
   map,
   config,
   visible,
@@ -3447,13 +3765,22 @@ function TrackSubRenderer({
   occluderStairs,
 }: SubRendererProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => listEntityEventsForStream(config.streamId, { windowSec: 300 }),
     ['entity-events', tenantId, config.streamId, 300],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const events = useMemo(() => query.data ?? [], [query.data])
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const events = useMemo(() => query.data ?? EMPTY_EVENTS, [query.data])
+  // Blocking card only while no rows are held (see useLayerRows).
+  useLayerLoading(config.id, config.name, query.isLoading, query.data !== undefined)
+  // Focus mode: the focused track is drawn whatever the filter / floor
+  // and its head shows through 3D content; every other track stays as
+  // drawn. (Events are fetched unfiltered, so there is no row to fetch
+  // apart.)
+  const focus = useConfigFocus(config)
+  const loaded = query.data !== undefined
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -3464,8 +3791,8 @@ function TrackSubRenderer({
   const ownLayerIds = useMemo(() => [lineId, headId], [lineId, headId])
 
   const teardownFn = () => {
-    if (map.getLayer(headId)) map.removeLayer(headId)
-    if (map.getLayer(lineId)) map.removeLayer(lineId)
+    if (hasMapLayer(map, headId)) map.removeLayer(headId)
+    if (hasMapLayer(map, lineId)) map.removeLayer(lineId)
     if (map.getSource(headSrc)) map.removeSource(headSrc)
     if (map.getSource(lineSrc)) map.removeSource(lineSrc)
   }
@@ -3512,7 +3839,8 @@ function TrackSubRenderer({
           'text-halo-color': '#ffffff',
           'text-halo-width': 2,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          // The focused track's head shows through floors and walls.
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
     },
@@ -3529,13 +3857,13 @@ function TrackSubRenderer({
     const lineWidth = config.style.lineWidth ?? 3
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(lineId)) {
+      if (hasMapLayer(map, lineId)) {
         map.setPaintProperty(lineId, 'line-width', lineWidth)
         map.setPaintProperty(lineId, 'line-color', [
           'coalesce', ['get', 'color'], defaultColor,
         ])
       }
-      if (map.getLayer(headId)) {
+      if (hasMapLayer(map, headId)) {
         map.setPaintProperty(headId, 'text-color', [
           'coalesce', ['get', 'color'], defaultColor,
         ])
@@ -3574,6 +3902,7 @@ function TrackSubRenderer({
     installTick,
     config,
     entities: latestEntities,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -3581,129 +3910,37 @@ function TrackSubRenderer({
     stairs: occluderStairs,
   })
 
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, events, enabled)
+  const focusKey = focus.key
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-
-    // Bucket by entity key. v2: coord read via resolvePayloadCoord()
-    // so track shares the same coord path as heatmap + point-at-coord.
-    const buckets = new Map<string, Array<{ event: EntityEvent; pos: [number, number] }>>()
-    for (const e of events) {
-      // v5.4 — hard-hide: drop every event belonging to an occluded track.
-      if (trackOccludedRef.current.has(e.entityKey)) continue
-      // Layer filter + floor gate. Track has no matched shape, so
-      // `passesFloorScope` reads floor from the payload only (and
-      // treats orphan ids as unknown).
-      if (filter && !evaluateDataLinkFilter(e.payload, filter)) continue
-      if (
-        !passesFloorScope(
-          e.payload,
-          config.fieldMapping.floorScope,
-          activeFloorPlanId ?? null,
-          liveFloorPlanIds,
-        )
-      ) {
-        continue
-      }
-      const pos = resolvePayloadCoord(e.payload, config)
-      if (!pos) continue
-      const bucket = buckets.get(e.entityKey) ?? []
-      bucket.push({ event: e, pos })
-      buckets.set(e.entityKey, bucket)
-    }
-
-    const lineFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = []
-    const headFeatures: GeoJSON.Feature<GeoJSON.Point>[] = []
-    for (const [entityKey, entries] of buckets) {
-      // Sort ascending by ts so the LineString flows past → present.
-      entries.sort((a, b) => a.event.ts.getTime() - b.event.ts.getTime())
-      const bucket = entries.map((x) => x.event)
-      const coords: [number, number][] = entries.map((x) => x.pos)
-      // Style-rule override applies against the most recent event's
-      // payload — one entity's whole track shares the same color.
-      const latestEvent = bucket[bucket.length - 1]
-      let color: string | undefined
-      let opacity: number | undefined
-      let label: string | undefined
-      const override = latestEvent
-        ? evaluateEntityRules(
-            styleRules,
-            config.styleRuleIds,
-            latestEvent.payload,
-          )
-        : null
-      if (override) {
-        if (override.fillColor) color = override.fillColor
-        if (override.iconColor && !color) color = override.iconColor
-        if (override.labelText)
-          label = resolveLabelTemplate(override.labelText, latestEvent.payload)
-        if (override.fillOpacity !== undefined)
-          opacity = override.fillOpacity / 100
-      }
-      const trackPayload = latestEvent
-        ? JSON.stringify(latestEvent.payload)
-        : undefined
-      // `line-z-offset` lifts a whole feature, not a vertex, so the
-      // breadcrumb rides at the floor the entity is on NOW. A track
-      // that crossed floors mid-history is drawn at its latest one.
-      const trackElevation = latestEvent
-        ? resolveAnchorElevation(latestEvent.payload, config, null)
-        : 0
-      if (coords.length >= 2) {
-        lineFeatures.push({
-          type: 'Feature',
-          geometry: { type: 'LineString', coordinates: coords },
-          properties: {
-            entityKey,
-            configId: config.id,
-            color,
-            opacity,
-            label,
-            elevation: trackElevation,
-            payload: trackPayload,
-          },
-        })
-      }
-      const latest = coords[coords.length - 1]
-      if (latest) {
-        headFeatures.push({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: latest },
-          properties: {
-            entityKey,
-            configId: config.id,
-            color,
-            opacity,
-            label,
-            elevation: trackElevation,
-            payload: trackPayload,
-          },
-        })
-      }
-    }
+    // `buildTrackFeatures` — per-entity breadcrumb + head; an occluded
+    // track drops entirely, breadcrumb included.
+    const { lineFeatures, headFeatures } = buildTrackFeatures(
+      events,
+      config,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey },
+      trackOccludedRef.current,
+    )
     setGeoJSONData(map, lineSrc, { type: 'FeatureCollection', features: lineFeatures })
     setGeoJSONData(map, headSrc, { type: 'FeatureCollection', features: headFeatures })
-    raiseLayerListToTop(map, ownLayerIds)
-  }, [map, lineSrc, headSrc, ownLayerIds, config, events, enabled, styleRules, activeFloorPlanId, liveFloorPlanIds, filter, installTick, trackOccludedVersion])
+    onDrawn(headFeatures, loaded)
+  }, [map, lineSrc, headSrc, config, events, enabled, styleRules, activeFloorPlanId, liveFloorPlanIds, filter, installTick, trackOccludedRef, trackOccludedVersion, ruleClockTick, focusKey, loaded, onDrawn])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
   return <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={trackOccludedRef} />
-}
+})
 
 // ---------------------------------------------------------------------------
 // fov-cone sub-renderer
@@ -3716,7 +3953,7 @@ function TrackSubRenderer({
  * Field keys are hardcoded for now — a follow-up can expose them on
  * `config.fieldMapping` when the editor UI catches up.
  */
-function FovConeSubRenderer({
+const FovConeSubRenderer = memo(function FovConeSubRenderer({
   map,
   config,
   visible,
@@ -3737,6 +3974,7 @@ function FovConeSubRenderer({
   occluderStairs,
 }: SubRendererProps & ShapeAnchorProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -3744,10 +3982,15 @@ function FovConeSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+  // Focus mode (see the point-at-coord sub-renderer): the focused cone is
+  // drawn whatever the filter / floor; cones are never faded.
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   const [installTick, setInstallTick] = useState(0)
@@ -3755,15 +3998,15 @@ function FovConeSubRenderer({
   const fillId = `dl-${config.id}-fov-fill`
   const outlineId = `dl-${config.id}-fov-outline`
   const ownLayerIds = useMemo(() => [fillId, outlineId], [fillId, outlineId])
-
-  const shapeProps: ShapeAnchorProps = useMemo(
-    () => ({ polygons, circles, markers, lines, models }),
-    [polygons, circles, markers, lines, models],
+  // Skips a write whose features are all unchanged (per-row cache).
+  const writer = useSourceWriter(map, sourceId)
+  const [rowCache] = useState(() =>
+    createRowBuildCache<{ row: RowAnchors; features: GeoJSON.Feature<GeoJSON.Polygon>[] }>(),
   )
 
   const teardownFn = () => {
-    if (map.getLayer(outlineId)) map.removeLayer(outlineId)
-    if (map.getLayer(fillId)) map.removeLayer(fillId)
+    if (hasMapLayer(map, outlineId)) map.removeLayer(outlineId)
+    if (hasMapLayer(map, fillId)) map.removeLayer(fillId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -3816,21 +4059,22 @@ function FovConeSubRenderer({
   )
 
   // ---- style sync: fill opacity + outline width + colour --------------
+  // Fill opacity is written only on a change (see the shape-tint sync).
   useEffect(() => {
     if (!enabled || !map) return
     const fillOpacity = config.style.fillOpacity ?? 0.3
     const outlineWidth = config.style.outlineWidth ?? 1.5
     const defaultColor = config.style.defaultColor ?? '#3b82f6'
     try {
-      if (map.getLayer(fillId)) {
-        map.setPaintProperty(fillId, 'fill-opacity', [
+      if (hasMapLayer(map, fillId)) {
+        setPaintIfChanged(map, fillId, 'fill-opacity', [
           'coalesce', ['get', 'opacity'], fillOpacity,
         ])
         map.setPaintProperty(fillId, 'fill-color', [
           'coalesce', ['get', 'color'], defaultColor,
         ])
       }
-      if (map.getLayer(outlineId)) {
+      if (hasMapLayer(map, outlineId)) {
         map.setPaintProperty(outlineId, 'line-width', outlineWidth)
         map.setPaintProperty(outlineId, 'line-color', [
           'coalesce', ['get', 'color'], defaultColor,
@@ -3848,7 +4092,7 @@ function FovConeSubRenderer({
     config.style.defaultColor,
   ])
 
-  const snapshot = useMatchSnapshot({ polygons, circles, markers, lines, models })
+  const snapshot = useMatchSnapshot(config, { polygons, circles, markers, lines, models })
 
   // v5.4 — analytic occlusion. A camera bolted to a wall on the
   // ground floor doesn't throw its cone through the ceiling of the
@@ -3858,7 +4102,10 @@ function FovConeSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -3866,121 +4113,64 @@ function FovConeSubRenderer({
     stairs: occluderStairs,
   })
 
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  // A row with no anchor may just be waiting for its shapes to arrive.
+  const complete = loaded && settled && matchShapesLoaded(config, snapshot)
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    // Field keys — hardcoded per the current design; future work can
-    // expose these as `config.fieldMapping.fovFields.{yaw,fov,distance}`.
-    const YAW_KEY = 'yaw'
-    const FOV_KEY = 'fovDeg'
-    const DIST_KEY = 'viewDistanceM'
-    const metersPerDegLat = 111320
-
-    const features: GeoJSON.Feature<GeoJSON.Polygon>[] = []
-    forEachEntityAnchor(entities, config, snapshot, ({ entity: e, position: anchor, elevation }) => {
-      // v5.4 — hard-hide: occluded entities never emit a cone.
-      if (fovOccludedRef.current.has(e.entityKey)) return
-      const yaw = typeof e.payload[YAW_KEY] === 'number' ? (e.payload[YAW_KEY] as number) : 0
-      const fovDeg =
-        typeof e.payload[FOV_KEY] === 'number' ? (e.payload[FOV_KEY] as number) : 60
-      const dist =
-        typeof e.payload[DIST_KEY] === 'number' ? (e.payload[DIST_KEY] as number) : 10
-      const halfFov = ((fovDeg / 2) * Math.PI) / 180
-      const yawRad = (yaw * Math.PI) / 180
-      // Rough m → deg conversion at the anchor's latitude. Computed
-      // per-anchor because attribute-join can spread the cones across
-      // shapes at different latitudes.
-      const metersPerDegLng = 111320 * Math.cos((anchor[1] * Math.PI) / 180)
-
-      const baseCenterMx = Math.sin(yawRad) * dist
-      const baseCenterMy = Math.cos(yawRad) * dist
-      const halfBase = dist * Math.tan(halfFov)
-      const perpMx = Math.cos(yawRad)
-      const perpMy = -Math.sin(yawRad)
-
-      const leftM: [number, number] = [
-        baseCenterMx - perpMx * halfBase,
-        baseCenterMy - perpMy * halfBase,
-      ]
-      const rightM: [number, number] = [
-        baseCenterMx + perpMx * halfBase,
-        baseCenterMy + perpMy * halfBase,
-      ]
-
-      const toLngLat = (mx: number, my: number): [number, number] => [
-        anchor[0] + mx / metersPerDegLng,
-        anchor[1] + my / metersPerDegLat,
-      ]
-
-      const apex = anchor
-      const left = toLngLat(leftM[0], leftM[1])
-      const right = toLngLat(rightM[0], rightM[1])
-      const ring: [number, number][] = [apex, left, right, apex]
-
-      let color: string | undefined
-      let opacity: number | undefined
-      const override = evaluateEntityRules(
-        styleRules,
-        config.styleRuleIds,
-        e.payload,
-      )
-      if (override) {
-        if (override.fillColor) color = override.fillColor
-        if (override.iconColor && !color) color = override.iconColor
-        if (override.fillOpacity !== undefined)
-          opacity = override.fillOpacity / 100
-      }
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Polygon', coordinates: [ring] },
-        properties: {
-          entityKey: e.entityKey,
-          streamId: e.streamId,
-          configId: config.id,
-          color,
-          opacity,
-          elevation,
-          payload: JSON.stringify(e.payload),
-        },
-      })
-    }, { activeFloorPlanId, liveFloorPlanIds, filter })
-    setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
+    // `buildFovFeatures` — one cone per (entity, anchor); occluded
+    // entities never emit a cone (the focused one always does).
+    const features = buildFovFeatures(
+      rows,
+      config,
+      snapshot,
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey },
+      fovOccludedRef.current,
+      rowCache,
+    )
+    writer.write(features, entityFeatureKey)
+    onDrawn(features, complete)
   }, [
     map,
-    sourceId,
-    ownLayerIds,
     config,
-    entities,
+    rows,
     enabled,
-    shapeProps,
     styleRules,
     snapshot,
     activeFloorPlanId,
     liveFloorPlanIds,
     filter,
     installTick,
+    fovOccludedRef,
     fovOccludedVersion,
+    writer,
+    rowCache,
+    ruleClockTick,
+    focusKey,
+    complete,
+    onDrawn,
   ])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
-  return <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={fovOccludedRef} />
-}
+  return (
+    <>
+      <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={fovOccludedRef} />
+      {loader}
+    </>
+  )
+})
 
 // ---------------------------------------------------------------------------
 // roi-pulse sub-renderer
@@ -3991,7 +4181,7 @@ function FovConeSubRenderer({
  * entities the stream currently has bound to this config. The ring's
  * radius animates on a 1 s cycle via a 100 ms setInterval.
  */
-function RoiPulseSubRenderer({
+const RoiPulseSubRenderer = memo(function RoiPulseSubRenderer({
   map,
   config,
   visible,
@@ -4012,6 +4202,7 @@ function RoiPulseSubRenderer({
   occluderStairs,
 }: SubRendererProps & ShapeAnchorProps) {
   const tenantId = useCurrentTenantId()
+  const layerPollMs = useLayerPollMs()
   const query = useApiQuery(
     () => fetchLayerRows(config, { filter, activeFloorPlanId }),
     // v4 — filter + floor participate in the cache key so a config
@@ -4019,17 +4210,25 @@ function RoiPulseSubRenderer({
     // its cache. JSON.stringify on the filter tree is fine — the tree
     // is small and stable across renders when the widget isn't open.
     ['layer-rows', tenantId, config.sourceId ?? `stream:${config.streamId}`, activeFloorKey(activeFloorPlanId), JSON.stringify(filter ?? null)],
-    { intervalMs: LAYER_ROWS_POLL_MS, enabled },
+    { intervalMs: layerPollMs, enabled },
   )
-  const { entities } = useEffectiveEntities(config, query.data)
-  useLayerLoading(config.id, config.name, query.isLoading)
+  const { entities, playbackActive } = useEffectiveEntities(config, useLayerRows(config, query))
+  // Focus mode (see the point-at-coord sub-renderer): the ring holding the
+  // focused row counts it whatever the filter / floor and shows through
+  // 3D content; rings are never faded.
+  const focus = useConfigFocus(config)
+  const loaded = playbackActive || query.data !== undefined
+  const { rows, settled, loader } = useFocusedRows(config, entities, focus.key, loaded, !playbackActive)
+  const onDrawn = useFocusAnchorReport(config, focus, liveFloorPlanIds)
 
   const installedRef = useRef(false)
   // The halo pulses by fading, not by growing: its size is now
   // `text-size`, a LAYOUT property, and re-setting layout on a 100 ms
   // timer would re-run symbol layout every tick. Opacity is paint, so
-  // it animates for free.
-  const [haloOpacity, setHaloOpacity] = useState(0.35)
+  // it animates for free. Held in a ref and written straight to the
+  // layer: as React state, every tick re-rendered this sub-renderer
+  // and re-pushed its whole source ten times a second.
+  const haloOpacityRef = useRef(0.35)
   const [installTick, setInstallTick] = useState(0)
   const sourceId = `dl-${config.id}-src`
   const haloId = `dl-${config.id}-roi-halo`
@@ -4041,16 +4240,11 @@ function RoiPulseSubRenderer({
     [haloId, ringId, discId, countId],
   )
 
-  const shapeProps: ShapeAnchorProps = useMemo(
-    () => ({ polygons, circles, markers, lines, models }),
-    [polygons, circles, markers, lines, models],
-  )
-
   const teardownFn = () => {
-    if (map.getLayer(countId)) map.removeLayer(countId)
-    if (map.getLayer(discId)) map.removeLayer(discId)
-    if (map.getLayer(ringId)) map.removeLayer(ringId)
-    if (map.getLayer(haloId)) map.removeLayer(haloId)
+    if (hasMapLayer(map, countId)) map.removeLayer(countId)
+    if (hasMapLayer(map, discId)) map.removeLayer(discId)
+    if (hasMapLayer(map, ringId)) map.removeLayer(ringId)
+    if (hasMapLayer(map, haloId)) map.removeLayer(haloId)
     if (map.getSource(sourceId)) map.removeSource(sourceId)
   }
 
@@ -4061,6 +4255,8 @@ function RoiPulseSubRenderer({
       if (map.getSource(sourceId)) teardownFn()
       map.addSource(sourceId, { type: 'geojson', data: emptyFC(), promoteId: 'entityKey' })
       const defaultColor = config.style.defaultColor ?? '#ef4444'
+      // `*-occlusion-opacity`: the ring holding the focused row shows
+      // through floors and walls; every other ring hides as before.
       // 1. Halo — filled disc, animated opacity (ripple).
       map.addLayer({
         id: haloId,
@@ -4071,7 +4267,7 @@ function RoiPulseSubRenderer({
           'text-color': ['coalesce', ['get', 'color'], defaultColor],
           'text-opacity': 0.35,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
       // 2. Ring — static stroke ring, mid-size.
@@ -4084,7 +4280,7 @@ function RoiPulseSubRenderer({
           'text-color': ['coalesce', ['get', 'color'], defaultColor],
           'text-opacity': ['coalesce', ['get', 'opacity'], 0.9],
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
       // 3. Center disc — solid fill behind the count number.
@@ -4098,7 +4294,7 @@ function RoiPulseSubRenderer({
           'text-halo-color': '#ffffff',
           'text-halo-width': 1.5,
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
       // 4. Count text — white, bold, sits on the disc.
@@ -4117,7 +4313,7 @@ function RoiPulseSubRenderer({
         paint: {
           'text-color': '#ffffff',
           'symbol-z-offset': Z_OFFSET,
-          'text-occlusion-opacity': 0,
+          'text-occlusion-opacity': FOCUS_OCCLUSION_OPACITY,
         },
       })
     },
@@ -4134,12 +4330,18 @@ function RoiPulseSubRenderer({
     let phase = 0
     const interval = setInterval(() => {
       phase = (phase + 0.083) % 1 // 12 ticks × 100 ms = 1.2 s cycle
-      setHaloOpacity(0.35 * (1 - phase))
+      haloOpacityRef.current = 0.35 * (1 - phase)
+      if (!installedRef.current || !hasMapLayer(map, haloId)) return
+      try {
+        map.setPaintProperty(haloId, 'text-opacity', haloOpacityRef.current)
+      } catch {
+        /* swallowed — layer went away between check + set */
+      }
     }, 100)
     return () => clearInterval(interval)
-  }, [enabled])
+  }, [enabled, map, haloId])
 
-  const snapshot = useMatchSnapshot({ polygons, circles, markers, lines, models })
+  const snapshot = useMatchSnapshot(config, { polygons, circles, markers, lines, models })
 
   // v5.4 — analytic occlusion. Occluded entities never contribute to a
   // ring; a ring whose every entity is occluded therefore disappears.
@@ -4148,7 +4350,10 @@ function RoiPulseSubRenderer({
     enabled: enabled && installTick > 0,
     installTick,
     config,
-    entities,
+    entities: rows,
+    // Its builder drops rows failing the layer filter.
+    filter,
+    focusKey: focus.key,
     images: occluderImages,
     polygons: occluderPolygons,
     circles: occluderCircles,
@@ -4159,132 +4364,76 @@ function RoiPulseSubRenderer({
   // Push one ring per matched shape (attribute-join can hit many); the
   // count on each ring is the number of entities whose payload resolved
   // to that particular shape. Explicit-shape produces exactly one ring.
+  // Re-push when a clock rule ("expires within 7 days") flips for a row.
+  const ruleClockTick = useRuleClockTick(styleRules, config.styleRuleIds, rows, enabled)
+  const focusKey = focus.key
+  // A row with no anchor may just be waiting for its shapes to arrive.
+  const complete = loaded && settled && matchShapesLoaded(config, snapshot)
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-
-    // Group by (matched shape id, or the coord anchor as a fallback).
-    // First entity's style-rule override becomes the ring's colour.
-    const perAnchor = new Map<
-      string,
-      {
-        position: [number, number]
-        elevation: number
-        entities: EntityState[]
-        color?: string
-        opacity?: number
-        payload?: Record<string, unknown>
-      }
-    >()
-
-    forEachEntityAnchor(
-      entities,
+    // `buildRoiFeatures` — first entity's style-rule override becomes
+    // the ring's colour; occluded entities don't count (the focused one
+    // always does, and stamps its ring `focused`).
+    const features = buildRoiFeatures(
+      rows,
       config,
       snapshot,
-      ({ entity: e, shape, position, elevation }) => {
-        // v5.4 — hard-hide: don't count occluded entities toward the ring.
-        if (roiOccludedRef.current.has(e.entityKey)) return
-        const key = shape?.id !== undefined ? `s:${shape.id}` : `p:${position[0]},${position[1]}`
-        let bucket = perAnchor.get(key)
-        if (!bucket) {
-          bucket = { position, elevation, entities: [] }
-          perAnchor.set(key, bucket)
-        }
-        bucket.entities.push(e)
-        if (!bucket.color) {
-          const override = evaluateEntityRules(
-            styleRules,
-            config.styleRuleIds,
-            e.payload,
-          )
-          if (override) {
-            if (override.fillColor) bucket.color = override.fillColor
-            if (override.iconColor && !bucket.color) bucket.color = override.iconColor
-            if (override.fillOpacity !== undefined)
-              bucket.opacity = override.fillOpacity / 100
-            bucket.payload = e.payload
-          }
-        }
-        if (!bucket.payload) bucket.payload = e.payload
-      },
-      { activeFloorPlanId, liveFloorPlanIds, filter },
+      styleRules,
+      { activeFloorPlanId, liveFloorPlanIds, filter, focusedKey: focusKey },
+      roiOccludedRef.current,
     )
-
-    // One row per anchor (a reader, a door sensor) always counts "1";
-    // show its `labelField` value instead when one is configured.
-    const labelField = config.fieldMapping.labelField
-    const badgeText = (bucket: { entities: EntityState[] }): string => {
-      if (labelField && bucket.entities.length === 1) {
-        const v = readPayloadPath(bucket.entities[0].payload, labelField)
-        if (v !== undefined && v !== null && v !== '') return String(v)
-      }
-      return String(bucket.entities.length)
-    }
-    const features: GeoJSON.Feature<GeoJSON.Point>[] = []
-    for (const bucket of perAnchor.values()) {
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: bucket.position },
-        properties: {
-          configId: config.id,
-          count: badgeText(bucket),
-          color: bucket.color,
-          opacity: bucket.opacity,
-          elevation: bucket.elevation,
-          payload: bucket.payload ? JSON.stringify(bucket.payload) : undefined,
-        },
-      })
-    }
     setGeoJSONData(map, sourceId, { type: 'FeatureCollection', features })
-    raiseLayerListToTop(map, ownLayerIds)
+    onDrawn(features, complete)
   }, [
     map,
     sourceId,
-    ownLayerIds,
     config,
-    entities,
+    rows,
     enabled,
-    shapeProps,
     styleRules,
     snapshot,
     activeFloorPlanId,
     liveFloorPlanIds,
     filter,
     installTick,
+    roiOccludedRef,
     roiOccludedVersion,
+    ruleClockTick,
+    focusKey,
+    complete,
+    onDrawn,
   ])
 
-  // Drive the halo pulse via paint properties. `setPaintProperty`
-  // is fine for scalar values — no data expression needed.
+  // Re-apply the pulse's current opacity once the halo layer exists
+  // (install, style swap) instead of waiting for the next tick.
   useEffect(() => {
     if (!enabled || !installedRef.current) return
-    if (map.getLayer(haloId)) {
+    if (hasMapLayer(map, haloId)) {
       try {
-        map.setPaintProperty(haloId, 'text-opacity', haloOpacity)
+        map.setPaintProperty(haloId, 'text-opacity', haloOpacityRef.current)
       } catch {
         /* swallowed — layer went away between check + set */
       }
     }
-  }, [map, haloId, haloOpacity, enabled, installTick])
+  }, [map, haloId, enabled, installTick])
 
-  useEffect(() => {
-    if (!enabled) return
-    const onStyleData = () => raiseLayerListToTop(map, ownLayerIds)
-    map.on('styledata', onStyleData)
-    return () => {
-      map.off('styledata', onStyleData)
-    }
-  }, [map, ownLayerIds, enabled])
+  useDataLinkLayerStack(map, ownLayerIds, enabled)
 
   useEffect(() => {
     if (!enabled || !installedRef.current) return
     const value = visible ? 'visible' : 'none'
     for (const id of ownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', value)
+      if (hasMapLayer(map, id)) map.setLayoutProperty(id, 'visibility', value)
     }
   }, [map, ownLayerIds, visible, enabled, installTick])
 
-  return <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={roiOccludedRef} />
-}
+  return (
+    <>
+      <TooltipManager map={map} config={config} layerIds={ownLayerIds} occludedKeysRef={roiOccludedRef} />
+      {loader}
+    </>
+  )
+})
 
 // ---------------------------------------------------------------------------
 // TooltipManager — one popup per config, listens on that config's layers
@@ -4375,11 +4524,11 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
   const [styleGen, setStyleGen] = useState(0)
   useEffect(() => {
     if (!map || layerIds.length === 0 || shapeAnchoredMode) return
-    let allPresent = layerIds.every((id) => map.getLayer(id) !== undefined)
+    // `hasMapLayer`, not `map.getLayer` — the latter serialises the
+    // layer, and this runs on every `styledata` of every overlay.
+    let allPresent = layerIds.every((id) => hasMapLayer(map, id))
     const onStyleData = () => {
-      const nowAllPresent = layerIds.every(
-        (id) => map.getLayer(id) !== undefined,
-      )
+      const nowAllPresent = layerIds.every((id) => hasMapLayer(map, id))
       if (nowAllPresent !== allPresent) {
         allPresent = nowAllPresent
         setStyleGen((g) => g + 1)
@@ -4458,7 +4607,7 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
     // Only listen to layers that currently exist. When the sub-renderer
     // installs its layers async we may mount before them; the effect
     // re-runs when styleGen bumps so late-added layers land here.
-    const liveLayerIds = layerIds.filter((id) => map.getLayer(id) !== undefined)
+    const liveLayerIds = layerIds.filter((id) => hasMapLayer(map, id))
     if (liveLayerIds.length === 0) return
 
     let clickedFeaturePayload: string | null = null
@@ -4647,14 +4796,22 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
       clickedFeaturePayload = null
     }
 
-    const onMouseMove = (e: mapboxgl.MapMouseEvent) => {
+    const onMouseMove = (
+      e: mapboxgl.MapMouseEvent,
+      /** This event's query over `liveLayerIds`, when the caller ran it. */
+      queried?: mapboxgl.MapboxGeoJSONFeature[],
+    ) => {
       if (trigger !== 'hover') return
       if (owner === 'click') return
       let hits: mapboxgl.MapboxGeoJSONFeature[]
-      try {
-        hits = map.queryRenderedFeatures(e.point, { layers: liveLayerIds })
-      } catch {
-        return
+      if (queried) {
+        hits = queried
+      } else {
+        try {
+          hits = map.queryRenderedFeatures(e.point, { layers: liveLayerIds })
+        } catch {
+          return
+        }
       }
       // v5.4 — skip features the analytic occlusion pass has hidden.
       // `queryRenderedFeatures` doesn't check per-feature paint opacity,
@@ -4796,12 +4953,54 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
       if (hits.length === 0) dismiss()
     }
 
-    if (trigger === 'hover') {
-      // Layer-scoped mousemove: fires only for our layers.
-      for (const id of liveLayerIds) {
-        map.on('mousemove', id, onMouseMove)
-        map.on('mouseleave', id, onMouseLeave)
+    // Hover: ONE map listener for this config, replacing the delegated
+    // `mousemove` + `mouseleave` pair per layer. Each delegated listener
+    // ran its own `queryRenderedFeatures` (plus a `getLayer` serialise per
+    // layer) on every mouse move, and `onMouseMove` then ran another over
+    // every layer — 2N+ queries per move. Here one query answers all of
+    // them, and the per-layer sequence is replayed in the same order:
+    // for each layer, "move" when the cursor is over one of its features,
+    // then "leave" when it just left that layer's features (or the map).
+    const insideLayers = new Set<string>()
+    const onHoverMove = (e: mapboxgl.MapMouseEvent) => {
+      const present = liveLayerIds.filter((id) => hasMapLayer(map, id))
+      let hits: mapboxgl.MapboxGeoJSONFeature[] = []
+      if (present.length > 0) {
+        try {
+          hits = map.queryRenderedFeatures(e.point, { layers: present })
+        } catch {
+          return
+        }
       }
+      const hitLayers = new Set<string>()
+      for (const h of hits) {
+        const id = h.layer?.id
+        if (id) hitLayers.add(id)
+      }
+      // `onMouseMove` queries every listed layer; reuse this query when
+      // it covered all of them.
+      const queried = present.length === liveLayerIds.length ? hits : undefined
+      for (const id of liveLayerIds) {
+        if (hitLayers.has(id)) {
+          onMouseMove(e, queried)
+          insideLayers.add(id)
+        } else if (insideLayers.has(id)) {
+          insideLayers.delete(id)
+          onMouseLeave()
+        }
+      }
+    }
+    const onHoverOut = () => {
+      for (const id of liveLayerIds) {
+        if (!insideLayers.has(id)) continue
+        insideLayers.delete(id)
+        onMouseLeave()
+      }
+    }
+
+    if (trigger === 'hover') {
+      map.on('mousemove', onHoverMove)
+      map.on('mouseout', onHoverOut)
     } else {
       for (const id of liveLayerIds) {
         map.on('click', id, onLayerClick)
@@ -4811,10 +5010,8 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
 
     return () => {
       if (trigger === 'hover') {
-        for (const id of liveLayerIds) {
-          map.off('mousemove', id, onMouseMove)
-          map.off('mouseleave', id, onMouseLeave)
-        }
+        map.off('mousemove', onHoverMove)
+        map.off('mouseout', onHoverOut)
       } else {
         for (const id of liveLayerIds) {
           map.off('click', id, onLayerClick)
@@ -4837,7 +5034,7 @@ function TooltipManager({ map, config, layerIds, occludedKeysRef }: TooltipManag
       })
       popup.remove()
     }
-  }, [map, config, layerIds, styleGen, shapeAnchoredMode])
+  }, [map, config, layerIds, styleGen, shapeAnchoredMode, occludedKeysRef])
 
   return null
 }

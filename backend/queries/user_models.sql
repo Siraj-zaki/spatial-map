@@ -28,3 +28,10 @@ WHERE id = $1 AND tenant_id = $2;
 -- Catalog rows in this workspace still pointing at a model file; the
 -- catalog delete drops the workspace's ownership of the file at zero.
 SELECT COUNT(*)::bigint FROM user_models WHERE tenant_id = $1 AND model_url = $2;
+
+-- name: ListUserModelBounds :many
+-- The local bounding boxes (inspector.bounds) of a facility's 3D models,
+-- for the facility envelope: the mobile app routes around their footprints.
+SELECT id, coalesce(inspector->'bounds', 'null'::jsonb)::jsonb AS bounds
+FROM user_models
+WHERE tenant_id = $1 AND id = ANY(sqlc.arg(ids)::bigint[]);

@@ -2,9 +2,11 @@
  * v4 — global data-link "which layers are loading" store.
  *
  * Every sub-renderer of `MapDataLinkedOverlay` reports its
- * `useApiQuery.isLoading` state here keyed by config id. The
- * `DataLinkFullScreenLoader` component reads the aggregate and paints
- * a proper backdrop + spinner when the map is waiting on data.
+ * `useApiQuery.isLoading` state here keyed by config id, together with
+ * whether the layer already has rows (`refreshing`). The
+ * `DataLinkFullScreenLoader` component reads the aggregate: the viewer's
+ * full-screen card covers only layers with no rows yet, the editor's
+ * non-blocking pill covers every load.
  *
  * Why a Zustand store instead of a React context: contexts trigger
  * consumers to re-render on every write, which would mean every
@@ -18,21 +20,26 @@ import { create } from 'zustand'
 interface LoadingEntry {
   configId: number
   configName: string
+  /** A refetch of a layer that already has rows (its `data` is defined). */
+  refreshing: boolean
 }
 
 interface DataLinkLoadingState {
   loading: Map<number, LoadingEntry>
-  setLoading: (configId: number, configName: string, on: boolean) => void
+  setLoading: (configId: number, configName: string, on: boolean, refreshing?: boolean) => void
   clearLoadingForConfig: (configId: number) => void
 }
 
 export const useDataLinkLoadingStore = create<DataLinkLoadingState>((set) => ({
   loading: new Map(),
-  setLoading: (configId, configName, on) =>
+  setLoading: (configId, configName, on, refreshing = false) =>
     set((state) => {
+      const prev = state.loading.get(configId)
+      // Unchanged → keep the same state, so no listener (the loader) wakes.
+      if (on ? prev?.configName === configName && prev.refreshing === refreshing : !prev) return state
       const next = new Map(state.loading)
       if (on) {
-        next.set(configId, { configId, configName })
+        next.set(configId, { configId, configName, refreshing })
       } else {
         next.delete(configId)
       }
@@ -40,7 +47,7 @@ export const useDataLinkLoadingStore = create<DataLinkLoadingState>((set) => ({
     }),
   clearLoadingForConfig: (configId) =>
     set((state) => {
-      if (!state.loading.has(configId)) return {}
+      if (!state.loading.has(configId)) return state
       const next = new Map(state.loading)
       next.delete(configId)
       return { loading: next }
@@ -49,8 +56,10 @@ export const useDataLinkLoadingStore = create<DataLinkLoadingState>((set) => ({
 
 /**
  * Convenience hook for sub-renderers. Reports the (isLoading) state of
- * `useApiQuery` back to the global store. On unmount, clears the entry
- * so a torn-down layer doesn't leak into the aggregate.
+ * `useApiQuery` back to the global store; `hasData` is whether the query
+ * already holds rows (`data !== undefined`), so a refetch can be told
+ * apart from a first load. On unmount, clears the entry so a torn-down
+ * layer doesn't leak into the aggregate.
  */
 import { useEffect } from 'react'
 
@@ -58,15 +67,16 @@ export function useLayerLoading(
   configId: number | undefined,
   configName: string,
   isLoading: boolean,
+  hasData = false,
 ): void {
   const set = useDataLinkLoadingStore((s) => s.setLoading)
   const clear = useDataLinkLoadingStore((s) => s.clearLoadingForConfig)
   useEffect(() => {
     if (configId === undefined) return
-    set(configId, configName, isLoading)
+    set(configId, configName, isLoading, hasData)
     return () => {
       clear(configId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configId, isLoading])
+  }, [configId, isLoading, hasData])
 }

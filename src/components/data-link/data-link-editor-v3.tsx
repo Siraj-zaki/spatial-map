@@ -104,6 +104,7 @@ import {
   iconComponentForId,
 } from '@/components/data-link/lucide-icon-picker'
 import { FilterPresetsSection } from '@/components/data-link/filter-presets-section'
+import { sitePath } from '@/lib/site'
 
 /**
  * MarkerIconAndColors is heavy — it renders the full ~1700-icon Lucide
@@ -1456,7 +1457,7 @@ const SourcePickerRow = memo(function SourcePickerRow({
       {sources.length === 0 && (
         <p className="text-[11px] text-muted-foreground">
           No data sources yet. Add one from{' '}
-          <a href="/integrations" className="underline">
+          <a href={sitePath('/integrations')} className="underline">
             Integrations
           </a>
           .
@@ -2751,7 +2752,7 @@ export function DataLinkEditorV3Dialog({
                 />
               </div>
               <a
-                href="/integrations"
+                href={sitePath('/integrations')}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1.5 h-9 px-3 rounded-md border border-border bg-background hover:bg-accent/40 text-xs font-medium shrink-0 mt-[0px]"

@@ -330,6 +330,18 @@ type AppSettingResponse struct {
 	UpdatedAt string          `json:"updatedAt"`
 }
 
+// mayWriteAppSetting refuses writes from a caller with neither a signed-in
+// user nor the configured API key (machine access). RequireUserOrAPIKey
+// already refuses those on the real router; this keeps the rule when the
+// handler is mounted elsewhere.
+func mayWriteAppSetting(w http.ResponseWriter, r *http.Request) bool {
+	if api.UserID(r.Context()) == 0 && !api.APIKeyCaller(r.Context()) {
+		api.Error(w, http.StatusUnauthorized, "sign in required")
+		return false
+	}
+	return true
+}
+
 func AppSettingsRouter(q *db.Queries) chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +378,9 @@ func AppSettingsRouter(q *db.Queries) chi.Router {
 		})
 		r.Put("/", func(w http.ResponseWriter, r *http.Request) {
 			key := chi.URLParam(r, "key")
+			if !mayWriteAppSetting(w, r) {
+				return
+			}
 			var req AppSettingRequest
 			if err := api.DecodeBody(r, &req); err != nil {
 				api.BadRequest(w, "invalid request body")
@@ -380,6 +395,9 @@ func AppSettingsRouter(q *db.Queries) chi.Router {
 		})
 		r.Delete("/", func(w http.ResponseWriter, r *http.Request) {
 			key := chi.URLParam(r, "key")
+			if !mayWriteAppSetting(w, r) {
+				return
+			}
 			if err := q.DeleteAppSetting(r.Context(), key); err != nil {
 				api.InternalError(w, r, err)
 				return

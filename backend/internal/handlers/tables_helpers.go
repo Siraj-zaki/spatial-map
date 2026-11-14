@@ -48,7 +48,7 @@ type dataSourceRowEventResponse struct {
 	AuthTokenID *int64          `json:"authTokenId,omitempty"`
 }
 
-func toDataSourceRowEventResponse(row db.DataSourceRowEvent) dataSourceRowEventResponse {
+func toDataSourceRowEventResponse(row db.DataSourceRowEvent, public bool) dataSourceRowEventResponse {
 	resp := dataSourceRowEventResponse{
 		ID:        row.ID,
 		SourceID:  row.SourceID,
@@ -56,6 +56,9 @@ func toDataSourceRowEventResponse(row db.DataSourceRowEvent) dataSourceRowEventR
 		Operation: row.Operation,
 		TS:        api.FormatTime(row.Ts),
 		Payload:   row.Payload,
+	}
+	if public {
+		return resp
 	}
 	if row.SourceIp.Valid {
 		resp.SourceIP = row.SourceIp.String

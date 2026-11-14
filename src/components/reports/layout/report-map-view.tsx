@@ -18,20 +18,20 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronLeft,
+  Contrast,
   Download,
   Filter,
+  Globe2,
   History,
   LayoutList,
   Link2,
   Map as MapIcon,
   Moon,
   MoreHorizontal,
-  Mountain,
   PencilLine,
   RefreshCw,
   RotateCcw,
   Route,
-  Satellite,
   Share2,
   SlidersHorizontal,
   Square,
@@ -121,13 +121,21 @@ export interface MapViewActions {
   onRefresh: () => void
   /** A background re-run: no spinner, no dimmed widgets. */
   onQuietRefresh: () => void
-  onShare: () => void
+  /** Copy this page's link. Unset on a public link's page. */
+  onShare?: () => void
+  /** Manage public links (report editors only). */
+  onShareDialog?: () => void
   /** Unset when nothing in the report can be exported. */
   onExport?: () => void
   /** Unset when the viewer can't edit. */
   onEdit?: () => void
-  onHistory: () => void
+  /** A master report's setup (owners / admins). */
+  onMasterSetup?: () => void
+  /** Unset on a public link's page. */
+  onHistory?: () => void
   onPageView: () => void
+  /** A public link's page: no way back into the app, no star. */
+  shared?: boolean
 }
 
 export function ReportMapView({
@@ -191,9 +199,10 @@ export function ReportMapView({
   }, [prefs.list, prefs.insights, hasParams, setPanel])
 
   const chrome: ExplorerMapChrome = {
-    renderTopBar: (floorPicker) => (
+    renderTopBar: (floorPicker, clusterControl) => (
       <TopBar
         floorPicker={floorPicker}
+        clusterControl={clusterControl}
         report={report}
         store={store}
         wide={wide}
@@ -268,6 +277,7 @@ function TopBar({
   actions,
   live,
   floorPicker,
+  clusterControl,
   viewMenu,
 }: {
   report: Report
@@ -279,6 +289,8 @@ function TopBar({
   actions: MapViewActions
   live: { every: number; remaining: number | null; now: number; onChange: (every: number) => void }
   floorPicker: ReactNode
+  /** The explorer map's "Cluster items" control (after Filters, phones too). */
+  clusterControl?: ReactNode
   viewMenu: ReactNode
 }) {
   const { t, i18n } = useTranslation()
@@ -291,20 +303,24 @@ function TopBar({
   return (
     <TooltipProvider delayDuration={250}>
       <header className={cn(glass, 'flex items-center gap-1.5 px-2 py-2 sm:gap-2 sm:px-3')}>
-        <Tip label={t('reports.backToDirectory', { defaultValue: 'All reports' })}>
-          <Button asChild variant="ghost" size="sm" className={ICON_BTN}>
-            <Link to="/reports" aria-label={t('reports.backToDirectory', { defaultValue: 'All reports' })}>
-              <ChevronLeft className="h-4 w-4 rtl:rotate-180" />
-            </Link>
-          </Button>
-        </Tip>
+        {!actions.shared && (
+          <Tip label={t('reports.backToDirectory', { defaultValue: 'All reports' })}>
+            <Button asChild variant="ghost" size="sm" className={ICON_BTN}>
+              <Link to="/reports" aria-label={t('reports.backToDirectory', { defaultValue: 'All reports' })}>
+                <ChevronLeft className="h-4 w-4 rtl:rotate-180" />
+              </Link>
+            </Button>
+          </Tip>
+        )}
         <div className="hidden shrink-0 sm:block">
           <ReportIcon report={report} fallback={meta.icon} size="sm" />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1">
             <h1 className="truncate text-sm font-semibold leading-5">{report.name}</h1>
-            <StarButton plain starred={actions.starred} onToggle={actions.onToggleStar} name={report.name} className="hidden shrink-0 sm:inline-flex" />
+            {!actions.shared && (
+              <StarButton plain starred={actions.starred} onToggle={actions.onToggleStar} name={report.name} className="hidden shrink-0 sm:inline-flex" />
+            )}
           </div>
           <p className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
             <span className="truncate">{facility}</span>
@@ -355,11 +371,19 @@ function TopBar({
               </PopoverContent>
             </Popover>
           )}
+          {clusterControl}
           {wide && <Sep />}
           {wide && <ViewSwitch onPage={actions.onPageView} iconOnly />}
           {wide && viewMenu}
-          {wide && <ShareMenu actions={actions} />}
+          {wide && (actions.onShare || actions.onExport || actions.onHistory) && <ShareMenu actions={actions} />}
           {wide && <Sep />}
+          {wide && actions.onMasterSetup && (
+            <Tip label={t('reports.master.setupItem', { defaultValue: 'Set up master report…' })}>
+              <Button variant="ghost" size="sm" className={ICON_BTN} onClick={actions.onMasterSetup} aria-label={t('reports.master.setupItem', { defaultValue: 'Set up master report…' })}>
+                <SlidersHorizontal className="h-4 w-4" />
+              </Button>
+            </Tip>
+          )}
           {actions.onEdit && (
             <Button size="sm" className="hidden h-8 shrink-0 sm:inline-flex" onClick={actions.onEdit}>
               <PencilLine className="h-3.5 w-3.5" />
@@ -387,19 +411,31 @@ function ShareMenu({ actions }: { actions: MapViewActions }) {
         </DropdownMenuTrigger>
       </Tip>
       <DropdownMenuContent align="end" className="w-56">
-        <DropdownMenuItem onSelect={actions.onShare}>
-          <Link2 className="me-2 h-4 w-4" />
-          {t('reports.mapView.copyLink', { defaultValue: 'Copy link' })}
-        </DropdownMenuItem>
+        {actions.onShareDialog && (
+          <DropdownMenuItem onSelect={actions.onShareDialog}>
+            <Globe2 className="me-2 h-4 w-4" />
+            {t('reports.share.menuItem', { defaultValue: 'Share link…' })}
+          </DropdownMenuItem>
+        )}
+        {actions.onShare && (
+          <DropdownMenuItem onSelect={actions.onShare}>
+            <Link2 className="me-2 h-4 w-4" />
+            {t('reports.mapView.copyLink', { defaultValue: 'Copy link' })}
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem onSelect={actions.onExport} disabled={!actions.onExport}>
           <Download className="me-2 h-4 w-4" />
           {t('reports.export.menuItem', { defaultValue: 'Export…' })}
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={actions.onHistory}>
-          <History className="me-2 h-4 w-4" />
-          {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
-        </DropdownMenuItem>
+        {actions.onHistory && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={actions.onHistory}>
+              <History className="me-2 h-4 w-4" />
+              {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -428,21 +464,37 @@ function CompactMenu({ actions, viewMenu }: { actions: MapViewActions; viewMenu:
               {t('reports.editReport', { defaultValue: 'Edit' })}
             </DropdownMenuItem>
           )}
+          {actions.onMasterSetup && (
+            <DropdownMenuItem onSelect={actions.onMasterSetup}>
+              <SlidersHorizontal className="me-2 h-4 w-4" />
+              {t('reports.master.setupItem', { defaultValue: 'Set up master report…' })}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={actions.onShare}>
-            <Link2 className="me-2 h-4 w-4" />
-            {t('reports.mapView.copyLink', { defaultValue: 'Copy link' })}
-          </DropdownMenuItem>
+          {actions.onShareDialog && (
+            <DropdownMenuItem onSelect={actions.onShareDialog}>
+              <Globe2 className="me-2 h-4 w-4" />
+              {t('reports.share.menuItem', { defaultValue: 'Share link…' })}
+            </DropdownMenuItem>
+          )}
+          {actions.onShare && (
+            <DropdownMenuItem onSelect={actions.onShare}>
+              <Link2 className="me-2 h-4 w-4" />
+              {t('reports.mapView.copyLink', { defaultValue: 'Copy link' })}
+            </DropdownMenuItem>
+          )}
           {actions.onExport && (
             <DropdownMenuItem onSelect={actions.onExport}>
               <Download className="me-2 h-4 w-4" />
               {t('reports.export.menuItem', { defaultValue: 'Export…' })}
             </DropdownMenuItem>
           )}
-          <DropdownMenuItem onSelect={actions.onHistory}>
-            <History className="me-2 h-4 w-4" />
-            {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
-          </DropdownMenuItem>
+          {actions.onHistory && (
+            <DropdownMenuItem onSelect={actions.onHistory}>
+              <History className="me-2 h-4 w-4" />
+              {t('reports.viewer.runHistory', { defaultValue: 'Run history' })}
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </>
@@ -481,11 +533,11 @@ export function ViewSwitch({ onPage, onMap, className, iconOnly = false }: { onP
 }
 
 /** Each basemap's icon in the style list (lucide, no colours). */
-const STYLE_ICON: Partial<Record<string, typeof MapIcon>> = {
+export const STYLE_ICON: Partial<Record<string, typeof MapIcon>> = {
   standard: MapIcon,
   'standard-simple': Square,
-  outdoors: Mountain,
-  satellite: Satellite,
+  'monochrome-light': Contrast,
+  'monochrome-dark': Contrast,
   dusk: Sunset,
   streets: Route,
   dark: Moon,
@@ -494,7 +546,7 @@ const STYLE_ICON: Partial<Record<string, typeof MapIcon>> = {
 
 /** Translated basemap name (`reports.mapView.styles.<id>`; a new style
  *  in map-styles.json falls back to its id, title-cased). */
-function useStyleLabel(): (id: MapStyleId) => string {
+export function useStyleLabel(): (id: MapStyleId) => string {
   const { t } = useTranslation()
   return (id) => t(`reports.mapView.styles.${id}`, { defaultValue: defaultStyleLabel(id) })
 }
@@ -685,7 +737,7 @@ function MapKpiChip({
  * when the last run finished, never while one is running or the tab is
  * hidden. Returns the seconds left and a 1 s clock for "4s ago".
  */
-function useLiveRefresh(every: number, running: boolean, updatedAt: number | null, run: () => void): { remaining: number | null; now: number } {
+export function useLiveRefresh(every: number, running: boolean, updatedAt: number | null, run: () => void): { remaining: number | null; now: number } {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     const h = window.setInterval(() => setNow(Date.now()), 1000)
@@ -712,7 +764,7 @@ function agoText(ms: number, locale: string): string {
   return rtf.format(-Math.round(s / 3600), 'hour')
 }
 
-function LivePill({
+export function LivePill({
   every,
   remaining,
   pulseKey,

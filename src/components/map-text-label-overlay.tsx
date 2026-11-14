@@ -35,9 +35,11 @@ import type {
 } from '@/lib/shapes'
 import {
   buildOccluders,
-  computeOccludedIds,
+  createOcclusionState,
+  updateOcclusion,
   type GridOccluderInput,
   type OccludableTarget,
+  type OcclusionState,
 } from '@/lib/marker-occlusion'
 import {
   TRANSFORM_ICON,
@@ -46,6 +48,17 @@ import {
   registerTransformHandleIcons,
   subscribeThemeChanges,
 } from '@/lib/map-transform-handles'
+import type { LayerFeaturePredicate } from '@/lib/empty-layer-gate'
+import { GatedLayerHold, type GatedLayerSpec } from '@/components/map-line-overlay'
+import {
+  GHOST_OCCLUDED_OPACITY,
+  NO_BLOCKERS,
+  focusFactor,
+  focusedIdOf,
+  useFocusScene,
+  type FocusScene,
+} from '@/lib/focus/focus-scene'
+import { useGraphicsSettings } from '@/lib/graphics-settings'
 import type {
   GeoJSONSource,
   Map as MapboxMapInstance,
@@ -132,10 +145,205 @@ const ALIGNMENTS = ['viewport', 'map'] as const
 type AlignmentMode = (typeof ALIGNMENTS)[number]
 const TEXT_LAYER_BASE = 'text-label-layer'
 const SELECTION_LAYER_BASE = 'text-label-selection-layer'
+/**
+ * Focus mode's twin of the text layers: draws ONLY the focused label, with
+ * collision off, so a focused label is never dropped by placement. The id
+ * deliberately starts with `text-label-layer-`, which makes it a real
+ * 'text' hit layer (overlay-hit-priority.ts) for the click handler, the
+ * empty-click exit and the other overlays' priority checks.
+ */
+const FOCUS_LAYER_BASE = 'text-label-layer-focus'
 const textLayerId = (m: AlignmentMode) => `${TEXT_LAYER_BASE}-${m}`
 const selectionLayerId = (m: AlignmentMode) => `${SELECTION_LAYER_BASE}-${m}`
-const TEXT_LAYER_IDS = ALIGNMENTS.map(textLayerId)
+const focusLayerId = (m: AlignmentMode) => `${FOCUS_LAYER_BASE}-${m}`
+/** Every layer that draws label text: the per-alignment layers and their focus twins. */
+const TEXT_LAYER_IDS = [...ALIGNMENTS.map(textLayerId), ...ALIGNMENTS.map(focusLayerId)]
 const SELECTION_LAYER_IDS = ALIGNMENTS.map(selectionLayerId)
+
+// ---- Empty-layer gate predicates (lib/empty-layer-gate.ts) ----------------
+// JS transcriptions of the per-alignment filters below, so the gate can hide
+// a layer whose filter passes nothing — `text-label-layer-map` whenever every
+// label is viewport-aligned (most facilities), and vice versa. Mapbox
+// re-evaluates every visible layer each frame even when it draws nothing. Registered right after every `addLayer` /
+// `setFilter` of the layer. Mapbox `get` reads a missing property as null,
+// `coalesce` skips null, and `==` / `in` are strict, so `?.` + `??` + `===`
+// match it value for value.
+
+/** Text layer: `['==', ['coalesce', ['get', 'pitchAlignment'], 'viewport'], mode]`. */
+export function textAlignmentPredicate(mode: AlignmentMode): LayerFeaturePredicate {
+  return (f) => (f.properties?.pitchAlignment ?? 'viewport') === mode
+}
+
+/** Selection layer: the alignment test AND `['in', ['get', 'textLabelId'], ['literal', ids]]`. */
+export function textSelectionPredicate(mode: AlignmentMode, ids: ReadonlyArray<number>): LayerFeaturePredicate {
+  const selected = new Set<unknown>(ids)
+  return (f) => {
+    const p = f.properties
+    return (p?.pitchAlignment ?? 'viewport') === mode && selected.has(p?.textLabelId)
+  }
+}
+
+/**
+ * Focus twin filter: the alignment test AND the one focused label.
+ * `-1` (no focus) matches nothing — saved labels have positive ids and the
+ * placement preview has none.
+ */
+export function textFocusFilter(mode: AlignmentMode, focusedId: number | null): unknown[] {
+  return [
+    'all',
+    ['==', ['coalesce', ['get', 'pitchAlignment'], 'viewport'], mode],
+    ['==', ['get', 'textLabelId'], focusedId ?? -1],
+  ]
+}
+
+/** Focus twin predicate: JS mirror of `textFocusFilter(mode, focusedId)`. */
+export function textFocusPredicate(mode: AlignmentMode, focusedId: number | null): LayerFeaturePredicate {
+  const want = focusedId ?? -1
+  return (f) => {
+    const p = f.properties
+    return (p?.pitchAlignment ?? 'viewport') === mode && p?.textLabelId === want
+  }
+}
+
+// ---- Opacity expressions (occlusion / focus mode / ghosts) ----------------
+// Built fresh per call: Mapbox deep-compares a new paint value against the
+// current one, so rebuilding an unchanged expression is a no-op there.
+
+/** Focus-mode multiplier: feature-state `focusScale` (FOCUS_FACTOR.near for a label in the NEAR column); unset → 1. */
+function focusScaleExpr(): unknown[] {
+  return ['coalesce', ['feature-state', 'focusScale'], 1]
+}
+
+/** The label's authored opacity, 0–1. */
+function authoredTextOpacityExpr(): unknown[] {
+  return ['/', ['coalesce', ['to-number', ['get', 'opacity']], 100], 100]
+}
+
+/**
+ * `text-opacity` of the per-alignment text layers:
+ *
+ *   focusScale × case(focused → 0, occluded → 0 | ghost, authored)
+ *
+ * - `focused` (feature-state): the focused label is drawn by its twin
+ *   (`text-label-layer-focus-*`), so the base copy hides — never drawn twice.
+ *   The base copy still places, so every other label keeps its spot.
+ * - `occluded` (feature-state, the analytic pass): 0, or with Graphics →
+ *   "faint ghosts" on, GHOST_OCCLUDED_OPACITY of the authored opacity.
+ * - `focusScale`: focus mode's near tier (a label right next to the focused
+ *   item fades so it doesn't crowd it).
+ *
+ * With no feature-state written and ghosts off this evaluates to exactly the
+ * pre-focus expression (`1 × x === x`).
+ */
+export function textLabelOpacityExpr(ghosts: boolean): unknown[] {
+  return [
+    '*',
+    focusScaleExpr(),
+    [
+      'case',
+      ['boolean', ['feature-state', 'focused'], false],
+      0,
+      ['boolean', ['feature-state', 'occluded'], false],
+      ghosts ? ['*', GHOST_OCCLUDED_OPACITY, authoredTextOpacityExpr()] : 0,
+      authoredTextOpacityExpr(),
+    ],
+  ]
+}
+
+/** `text-opacity` of the selection halo layers: same occlusion / focus folding, base 1. */
+export function textSelectionOpacityExpr(ghosts: boolean): unknown[] {
+  return [
+    '*',
+    focusScaleExpr(),
+    ['case', ['boolean', ['feature-state', 'occluded'], false], ghosts ? GHOST_OCCLUDED_OPACITY : 0, 1],
+  ]
+}
+
+/**
+ * `text-opacity` of the focus twins (`text-label-layer-focus-*`):
+ *
+ *   case(focused → authored, 0)
+ *
+ * The exact complement of the base layers' `focused → 0` branch: the twin
+ * shows the label exactly while its base copy is hidden, so the label is
+ * never drawn twice and never missing (`focused` is written only once
+ * TEXT_SOURCE re-tiled the twin's filter, and cleared on exit, which hides
+ * the twin and shows the base copy in the same frame).
+ *
+ * It MUST read feature-state. TEXT_SOURCE carries feature-state (occluded /
+ * focused / focusScale), and Mapbox GL 3.25's `Tile.updateBuckets` then hands
+ * each bucket only its `stateDependentLayers`. A symbol layer with no
+ * state-dependent paint gets an EMPTY list, and on a paint update / symbol
+ * UBO update (an image registered, a transition, a palette or theme swap)
+ * `SymbolBucket.update` reads `layers[0].paint` → "Cannot read properties of
+ * undefined (reading 'paint')". Every symbol layer on a source this overlay
+ * writes feature-state to needs at least one state-dependent paint property.
+ */
+export function textFocusTwinOpacityExpr(): unknown[] {
+  return ['case', ['boolean', ['feature-state', 'focused'], false], authoredTextOpacityExpr(), 0]
+}
+
+/**
+ * Per-label focus factors that aren't 1, as a value key (`id:factor,…`, ''
+ * when none). Memos keyed on the key keep their identity while the faded
+ * set is unchanged — a focus change that fades the same labels writes
+ * nothing. Labels never occlude anything, so blockers don't apply: only the
+ * labels in the focused item's NEAR column (`scene.near.textLabels`) fade,
+ * to FOCUS_FACTOR.near; every other label keeps factor 1.
+ */
+function labelFocusFactorKey(scene: FocusScene, labels: ReadonlyArray<TextLabelShape> | undefined): string {
+  if (!scene.active || !labels) return ''
+  const parts: string[] = []
+  for (const l of labels) {
+    if (l.id === undefined) continue
+    const f = focusFactor(scene, NO_BLOCKERS, 'text-labels', l.id)
+    if (f !== 1) parts.push(`${l.id}:${f}`)
+  }
+  return parts.join(',')
+}
+
+const NO_FACTORS: ReadonlyMap<number, number> = new Map()
+
+/** Inverse of `labelFocusFactorKey` (number → string → number round-trips exactly). */
+function parseFactorKey(key: string): ReadonlyMap<number, number> {
+  if (key === '') return NO_FACTORS
+  const out = new Map<number, number>()
+  for (const part of key.split(',')) {
+    const i = part.indexOf(':')
+    out.set(Number(part.slice(0, i)), Number(part.slice(i + 1)))
+  }
+  return out
+}
+
+/** Structural equality for the small paint / filter values compared before a write. */
+function sameValue(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
+
+/** True once TEXT_SOURCE's tiles reflect its latest data and filters (or it is gone). */
+function textSourceSettled(map: MapboxMapInstance): boolean {
+  try {
+    return !map.getSource(TEXT_SOURCE) || map.isSourceLoaded(TEXT_SOURCE)
+  } catch {
+    return true
+  }
+}
+
+/**
+ * The layers gated through GatedLayerHold (map-line-overlay.tsx): when a
+ * label switches alignment, the layer it leaves is held visible until
+ * TEXT_SOURCE re-tiles, so the label never drops out between the two.
+ * Symbol layers cast no shadow. The focus twins are gated the same way:
+ * empty (hidden) without a focused label, shown the moment one is set and
+ * held until the source re-tiled when it clears.
+ */
+const TEXT_GATED_LAYERS: ReadonlyMap<string, GatedLayerSpec> = new Map<string, GatedLayerSpec>(
+  [...TEXT_LAYER_IDS, ...SELECTION_LAYER_IDS].map((id) => [id, { sourceId: TEXT_SOURCE, castsShadows: false }] as const),
+)
 
 /**
  * v5.4 — zoom-dependent multiplier applied to the authored `size`.
@@ -215,6 +423,105 @@ const FONT_EXPR = [
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ] as any
 
+/**
+ * Layout of a label text layer. `alwaysPlaced` false = the per-alignment
+ * layers (collision on); true = the focus twin, which must draw the focused
+ * label whatever it overlaps.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function textLayerLayout(mode: AlignmentMode, alwaysPlaced: boolean): any {
+  return {
+    'text-field': ['coalesce', ['get', 'text'], ''],
+    // v5.4 — zoom-stable size. Mapbox's `text-size` is pixels;
+    // held constant it makes labels look larger and larger as the
+    // user zooms out because the map content shrinks under them.
+    // Scale the user's size DOWN below zoom 18 so labels stay
+    // proportional to what's on the ground, and hold ~full size
+    // at close zooms so authored-size still reads as authored.
+    'text-size': TEXT_SIZE_ZOOM_EXPR,
+    'text-font': FONT_EXPR,
+    'text-anchor': ['coalesce', ['get', 'anchor'], 'center'],
+    'text-letter-spacing': ['coalesce', ['get', 'letterSpacing'], 0],
+    // v5.4 — let Mapbox de-conflict at zoom-out so a dense
+    // facility isn't a wall of overlapping labels. Both flags
+    // must be false: `text-allow-overlap: false` hides THIS
+    // label when it would overlap an already-placed symbol;
+    // `text-ignore-placement: false` makes THIS label reserve
+    // pixels so later symbols de-conflict against it. `text-
+    // padding: 4` widens the collision box so labels don't
+    // just barely miss each other. The earlier revert to
+    // `true/true` was because I'd wired the occluder bag with
+    // multi-floor geometry — every label was disappearing for
+    // an unrelated reason, and I mistakenly blamed collision.
+    // With the occluder fix in place, collision is safe again.
+    // The focus twin flips both: it draws one label, always, and
+    // reserves nothing (the hidden base copy keeps its placement,
+    // so the other labels stay exactly where they were).
+    'text-allow-overlap': alwaysPlaced,
+    'text-ignore-placement': alwaysPlaced,
+    'text-padding': 4,
+    // Bigger authored labels win the collision race. Mapbox
+    // places lower-sort-key symbols first, so we NEGATE the
+    // size so a 24pt label sorts BEFORE a 12pt label and
+    // therefore claims its pixels first.
+    'symbol-sort-key': ['*', -1, SIZE_INPUT],
+    // Constants — Mapbox rejects data expressions on these two.
+    'text-rotation-alignment': mode,
+    'text-pitch-alignment': mode,
+    'text-rotate': ['coalesce', ['get', 'rotation'], 0],
+    'symbol-elevation-reference': 'sea',
+    // Don't auto-snap to extrusion roofs — the user's explicit
+    // `elevation` already places the label in 3D.
+    'symbol-z-elevate': false,
+  }
+}
+
+/** Paint of a label text layer; only `text-opacity` differs between the base layers and the focus twin. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function textLayerPaint(textOpacity: unknown): any {
+  return {
+    'text-color': ['coalesce', ['get', 'color'], '#111827'],
+    // v5.4 — fold analytic floor-plan occlusion into text-opacity.
+    // `feature-state.occluded === true` → 0; otherwise the
+    // authored per-feature opacity applies. This mirrors the
+    // marker overlay's `data-occluded` DOM flag, but for symbol
+    // layers where DOM CSS isn't available. Focus mode folds in
+    // its own feature-state (see textLabelOpacityExpr).
+    'text-opacity': textOpacity,
+    'text-halo-color': ['coalesce', ['get', 'haloColor'], '#ffffff'],
+    'text-halo-width': ['coalesce', ['to-number', ['get', 'haloWidth']], 0],
+    'text-halo-blur': ['coalesce', ['to-number', ['get', 'haloBlur']], 0],
+    // Per-feature altitude. `symbol-z-offset` is a PAINT property
+    // (matches how the grid label layer does it).
+    'symbol-z-offset': ['coalesce', ['get', 'elevation'], 0],
+    // Emissive strength keeps the text readable under the v3
+    // lighting model. Driven per-feature so the "glow" preset can
+    // crank it without affecting "subtle" labels.
+    'text-emissive-strength': [
+      'coalesce',
+      ['to-number', ['get', 'emissive']],
+      1,
+    ],
+    // v5.4 — force x-ray (1). The GL depth buffer was hiding
+    // ground-floor labels (elevation: 0) behind 0.152m-tall
+    // polygon slabs and 0.1m floor rasters in the viewer's
+    // top-down view — a label at z=0 sits BELOW a slab at
+    // z=0.152, so `text-occlusion-opacity: 0` treated them as
+    // "behind 3D content" and painted them at opacity 0. On
+    // tilt some labels then appeared because the depth test
+    // was no longer against a slab.
+    //
+    // Our analytic occlusion pass (`feature-state.occluded → text-
+    // opacity: 0` above) already covers the "walls block labels
+    // on tilt" case correctly. Making this layer property a
+    // constant 1 hands the responsibility entirely to the
+    // analytic pass and stops the depth buffer from second-
+    // guessing it. Per-feature `config.occlusionOpacity` is now
+    // dead metadata — safe to remove in a later cleanup.
+    'text-occlusion-opacity': 1,
+  }
+}
+
 export function MapTextLabelOverlay({
   map,
   labels,
@@ -238,6 +545,13 @@ export function MapTextLabelOverlay({
   // swap and `styleLoaded` stays true across it, so the effects would
   // otherwise never re-run.
   const [styleGen, setStyleGen] = useState(0)
+
+  // ---- Focus mode (view state from the host's FocusSceneContext) --------
+  // Outside a provider the scene is FOCUS_OFF: no label is focused, every
+  // factor is 1, and nothing below writes anything.
+  const scene = useFocusScene()
+  const focusedLabelId = focusedIdOf(scene, 'text-labels')
+  const occlusionGhosts = useGraphicsSettings((s) => s.occlusionGhosts)
 
   // ---- Style readiness ---------------------------------------------------
   useEffect(() => {
@@ -306,9 +620,21 @@ export function MapTextLabelOverlay({
     return base
   }, [labels, shapeStyleOverrides, liveCursor, liveConfig])
 
+  // ---- Empty-layer gate --------------------------------------------------
+  // Every gate predicate goes through this hold (GatedLayerHold).
+  const gateHoldRef = useRef(new GatedLayerHold(TEXT_GATED_LAYERS))
+  useEffect(() => {
+    if (!map) return
+    return gateHoldRef.current.attach(map)
+  }, [map])
+
   // ---- Layer setup -------------------------------------------------------
   useEffect(() => {
     if (!map || !styleLoaded) return
+    const gateHold = gateHoldRef.current
+    // Installed with the current "faint ghosts" setting so the toggle
+    // effect below has nothing to rewrite on mount.
+    const ghosts = useGraphicsSettings.getState().occlusionGhosts
     try {
       if (!map.getSource(TEXT_SOURCE)) {
         map.addSource(TEXT_SOURCE, {
@@ -319,6 +645,7 @@ export function MapTextLabelOverlay({
           // without regenerating the whole FC on every camera move.
           promoteId: 'textLabelId',
         })
+        gateHold.resetSource(TEXT_SOURCE)
       }
 
       // One symbol layer per alignment mode. Features route by their
@@ -329,102 +656,15 @@ export function MapTextLabelOverlay({
       for (const mode of ALIGNMENTS) {
         const layerId = textLayerId(mode)
         if (map.getLayer(layerId)) continue
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const layout: any = {
-          'text-field': ['coalesce', ['get', 'text'], ''],
-          // v5.4 — zoom-stable size. Mapbox's `text-size` is pixels;
-          // held constant it makes labels look larger and larger as the
-          // user zooms out because the map content shrinks under them.
-          // Scale the user's size DOWN below zoom 18 so labels stay
-          // proportional to what's on the ground, and hold ~full size
-          // at close zooms so authored-size still reads as authored.
-          'text-size': TEXT_SIZE_ZOOM_EXPR,
-          'text-font': FONT_EXPR,
-          'text-anchor': ['coalesce', ['get', 'anchor'], 'center'],
-          'text-letter-spacing': ['coalesce', ['get', 'letterSpacing'], 0],
-          // v5.4 — let Mapbox de-conflict at zoom-out so a dense
-          // facility isn't a wall of overlapping labels. Both flags
-          // must be false: `text-allow-overlap: false` hides THIS
-          // label when it would overlap an already-placed symbol;
-          // `text-ignore-placement: false` makes THIS label reserve
-          // pixels so later symbols de-conflict against it. `text-
-          // padding: 4` widens the collision box so labels don't
-          // just barely miss each other. The earlier revert to
-          // `true/true` was because I'd wired the occluder bag with
-          // multi-floor geometry — every label was disappearing for
-          // an unrelated reason, and I mistakenly blamed collision.
-          // With the occluder fix in place, collision is safe again.
-          'text-allow-overlap': false,
-          'text-ignore-placement': false,
-          'text-padding': 4,
-          // Bigger authored labels win the collision race. Mapbox
-          // places lower-sort-key symbols first, so we NEGATE the
-          // size so a 24pt label sorts BEFORE a 12pt label and
-          // therefore claims its pixels first.
-          'symbol-sort-key': ['*', -1, SIZE_INPUT],
-          // Constants — Mapbox rejects data expressions on these two.
-          'text-rotation-alignment': mode,
-          'text-pitch-alignment': mode,
-          'text-rotate': ['coalesce', ['get', 'rotation'], 0],
-          'symbol-elevation-reference': 'sea',
-          // Don't auto-snap to extrusion roofs — the user's explicit
-          // `elevation` already places the label in 3D.
-          'symbol-z-elevate': false,
-        }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const paint: any = {
-          'text-color': ['coalesce', ['get', 'color'], '#111827'],
-          // v5.4 — fold analytic floor-plan occlusion into text-opacity.
-          // `feature-state.occluded === true` → 0; otherwise the
-          // authored per-feature opacity applies. This mirrors the
-          // marker overlay's `data-occluded` DOM flag, but for symbol
-          // layers where DOM CSS isn't available.
-          'text-opacity': [
-            'case',
-            ['boolean', ['feature-state', 'occluded'], false],
-            0,
-            ['/', ['coalesce', ['to-number', ['get', 'opacity']], 100], 100],
-          ],
-          'text-halo-color': ['coalesce', ['get', 'haloColor'], '#ffffff'],
-          'text-halo-width': ['coalesce', ['to-number', ['get', 'haloWidth']], 0],
-          'text-halo-blur': ['coalesce', ['to-number', ['get', 'haloBlur']], 0],
-          // Per-feature altitude. `symbol-z-offset` is a PAINT property
-          // (matches how the grid label layer does it).
-          'symbol-z-offset': ['coalesce', ['get', 'elevation'], 0],
-          // Emissive strength keeps the text readable under the v3
-          // lighting model. Driven per-feature so the "glow" preset can
-          // crank it without affecting "subtle" labels.
-          'text-emissive-strength': [
-            'coalesce',
-            ['to-number', ['get', 'emissive']],
-            1,
-          ],
-          // v5.4 — force x-ray (1). The GL depth buffer was hiding
-          // ground-floor labels (elevation: 0) behind 0.152m-tall
-          // polygon slabs and 0.1m floor rasters in the viewer's
-          // top-down view — a label at z=0 sits BELOW a slab at
-          // z=0.152, so `text-occlusion-opacity: 0` treated them as
-          // "behind 3D content" and painted them at opacity 0. On
-          // tilt some labels then appeared because the depth test
-          // was no longer against a slab.
-          //
-          // Our analytic occlusion pass (`feature-state.occluded → text-
-          // opacity: 0` above) already covers the "walls block labels
-          // on tilt" case correctly. Making this layer property a
-          // constant 1 hands the responsibility entirely to the
-          // analytic pass and stops the depth buffer from second-
-          // guessing it. Per-feature `config.occlusionOpacity` is now
-          // dead metadata — safe to remove in a later cleanup.
-          'text-occlusion-opacity': 1,
-        }
         map.addLayer({
           id: layerId,
           type: 'symbol',
           source: TEXT_SOURCE,
           filter: ['==', ['coalesce', ['get', 'pitchAlignment'], 'viewport'], mode],
-          layout,
-          paint,
+          layout: textLayerLayout(mode, false),
+          paint: textLayerPaint(textLabelOpacityExpr(ghosts)),
         })
+        gateHold.register(map, layerId, textAlignmentPredicate(mode))
       }
 
       // Selection halo — one mirror per alignment mode. Wider halo,
@@ -462,19 +702,19 @@ export function MapTextLabelOverlay({
           'text-halo-blur': 0.5,
           // Fade the selection halo along with the main label when
           // the label is occluded — otherwise a floor above would
-          // reveal an orphan halo hovering over nothing.
-          'text-opacity': [
-            'case',
-            ['boolean', ['feature-state', 'occluded'], false],
-            0,
-            1,
-          ],
+          // reveal an orphan halo hovering over nothing. Focus mode
+          // fades it with a near label (textSelectionOpacityExpr).
+          'text-opacity': textSelectionOpacityExpr(ghosts),
           'symbol-z-offset': ['coalesce', ['get', 'elevation'], 0],
           'text-emissive-strength': 1,
+          // The focused label (feature-state `focused`, drawn x-ray by
+          // its twin) keeps its halo in front of walls and slabs too;
+          // everything else keeps the per-feature depth occlusion.
           'text-occlusion-opacity': [
-            'coalesce',
-            ['to-number', ['get', 'occlusionOpacity']],
-            0,
+            'case',
+            ['boolean', ['feature-state', 'focused'], false],
+            1,
+            ['coalesce', ['to-number', ['get', 'occlusionOpacity']], 0],
           ],
         }
         map.addLayer({
@@ -489,6 +729,31 @@ export function MapTextLabelOverlay({
           layout,
           paint,
         })
+        gateHold.register(map, layerId, textSelectionPredicate(mode, [-1]))
+      }
+
+      // Focus twin — one per alignment mode (the alignments are layout
+      // constants). Same layout / paint builders as the text layers, but
+      // collision off and no occlusion / near folding: it draws only the
+      // focused label (filter set by the focus effect below), on top of
+      // everything in this overlay, whatever it overlaps or sits behind,
+      // and only while that label's base copy is hidden (feature-state
+      // `focused`, textFocusTwinOpacityExpr — which also keeps the layer
+      // state-dependent, see there). Empty without a focus, so the gate
+      // keeps it hidden.
+      for (const mode of ALIGNMENTS) {
+        const layerId = focusLayerId(mode)
+        if (map.getLayer(layerId)) continue
+        map.addLayer({
+          id: layerId,
+          type: 'symbol',
+          source: TEXT_SOURCE,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          filter: textFocusFilter(mode, null) as any,
+          layout: textLayerLayout(mode, true),
+          paint: textLayerPaint(textFocusTwinOpacityExpr()),
+        })
+        gateHold.register(map, layerId, textFocusPredicate(mode, null))
       }
     } catch (err) {
       console.warn('[MapTextLabelOverlay] setup failed', err)
@@ -514,8 +779,34 @@ export function MapTextLabelOverlay({
   useEffect(() => {
     if (!map || !styleLoaded) return
     const src = map.getSource(TEXT_SOURCE) as GeoJSONSource | undefined
-    if (src) src.setData(fc as GeoJSON.FeatureCollection)
+    if (src) {
+      // Before setData, where the gate re-counts (GatedLayerHold).
+      gateHoldRef.current.push(map, TEXT_SOURCE, fc)
+      src.setData(fc as GeoJSON.FeatureCollection)
+    }
   }, [map, styleLoaded, styleGen, fc])
+
+  // ---- Graphics → "faint ghosts" -----------------------------------------
+  // The occluded branch of the text / halo opacity: 0 (off, the default) or
+  // GHOST_OCCLUDED_OPACITY. A data-driven paint swap re-lays out the source,
+  // so it is written only when the live value differs — once per toggle;
+  // never on mount (setup installs the current setting) or per camera move.
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    for (const mode of ALIGNMENTS) {
+      for (const [layerId, value] of [
+        [textLayerId(mode), textLabelOpacityExpr(occlusionGhosts)],
+        [selectionLayerId(mode), textSelectionOpacityExpr(occlusionGhosts)],
+      ] as const) {
+        try {
+          if (!map.getLayer(layerId)) continue
+          if (sameValue(map.getPaintProperty(layerId, 'text-opacity'), value)) continue
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          map.setPaintProperty(layerId, 'text-opacity', value as any)
+        } catch { /* style torn down */ }
+      }
+    }
+  }, [map, styleLoaded, styleGen, occlusionGhosts])
 
   // ---- Occlusion ---------------------------------------------------------
   //
@@ -535,7 +826,9 @@ export function MapTextLabelOverlay({
   // the 3D behaviour a viewer expects on tilt.
   //
   // Runs on every `move` because occlusion is a function of the
-  // camera, not of the data.
+  // camera, not of the data. Only the ids whose state flipped are
+  // written: every `setFeatureState` makes Mapbox refresh the source's
+  // tiles and re-upload their paint arrays, even for an unchanged value.
   const occludeImages = occluders?.images
   const occludePolygons = occluders?.polygons
   const occludeCircles = occluders?.circles
@@ -564,12 +857,16 @@ export function MapTextLabelOverlay({
       occludeGrids,
     ],
   )
-  const occludedIdsRef = useRef<Set<number>>(new Set())
-  useEffect(() => {
-    if (!map || !styleLoaded) return
+  // One target per label, built once per `labels` change (and projected
+  // once inside `updateOcclusion`) rather than on every camera move.
+  // The focused label is left out: focus mode never hides it. Dropping it
+  // from the targets makes the next pass report it in `left`, so the
+  // effect below clears its `occluded` flag with the usual flip write.
+  const occlusionTargets = useMemo(() => {
     const targets: OccludableTarget[] = []
     for (const l of labels ?? []) {
       if (l.id === undefined) continue
+      if (l.id === focusedLabelId) continue
       targets.push({
         id: l.id,
         position: l.position,
@@ -577,33 +874,142 @@ export function MapTextLabelOverlay({
         floorPlanId: l.floorPlanId,
       })
     }
-    const apply = () => {
-      const nextOccluded = computeOccludedIds(map, targets, prisms)
-      const prev = occludedIdsRef.current
-      // Clear the state of anything that just left the occluded set,
-      // set state for anything that just joined. `setFeatureState`
-      // needs the source name + feature id — the source's
-      // `promoteId: 'textLabelId'` maps `properties.textLabelId` to
-      // the id key.
-      for (const id of prev) {
-        if (nextOccluded.has(id)) continue
+    return targets
+  }, [labels, focusedLabelId])
+  // What TEXT_SOURCE's feature-state says, tied to the source instance it
+  // was written to. Kept across re-subscriptions (a label edit, a floor
+  // toggle) so they write only what flipped. A NEW source starts with no
+  // feature-state — basemap swap, StrictMode remount, HMR — and is
+  // detected by identity, so the next pass writes every occluded id again
+  // instead of trusting writes that went to the old one.
+  const occlusionRef = useRef<{ source: unknown; state: OcclusionState } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    // Hidden layers draw nothing (the selection halo is gated on
+    // `committedVisible` too), so the pass can wait: it re-runs when they
+    // show again and diffs against what the source still holds.
+    if (!committedVisible) return
+    const sync = () => {
+      const source = map.getSource(TEXT_SOURCE)
+      // Mid style swap: nothing to write to. The re-created source is
+      // picked up below on the next pass.
+      if (!source) return
+      let o = occlusionRef.current
+      if (!o || o.source !== source) {
+        o = { source, state: createOcclusionState() }
+        occlusionRef.current = o
+      }
+      const { entered, left } = updateOcclusion(map, occlusionTargets, prisms, o.state)
+      // `setFeatureState` needs the source name + feature id — the
+      // source's `promoteId: 'textLabelId'` maps
+      // `properties.textLabelId` to the id key. Feature-state survives
+      // `setData` on the same source, so a label edit keeps it.
+      for (const id of left) {
         try {
           map.setFeatureState({ source: TEXT_SOURCE, id }, { occluded: false })
         } catch { /* source went away */ }
       }
-      for (const id of nextOccluded) {
+      for (const id of entered) {
         try {
           map.setFeatureState({ source: TEXT_SOURCE, id }, { occluded: true })
         } catch { /* source went away */ }
       }
-      occludedIdsRef.current = nextOccluded
     }
-    apply()
-    map.on('move', apply)
+    sync()
+    // Nothing to hide (no occluders — the editor's author mode — or no
+    // labels): the result can't depend on the camera.
+    if (occlusionTargets.length === 0 || prisms.length === 0) return
+    map.on('move', sync)
     return () => {
-      map.off('move', apply)
+      map.off('move', sync)
     }
-  }, [map, styleLoaded, labels, prisms])
+  }, [map, styleLoaded, styleGen, occlusionTargets, prisms, committedVisible])
+
+  // ---- Focus mode: the twin layers --------------------------------------
+  // Point the twins at the focused label (or at nothing). Runs once per
+  // focus change; `setFilter` re-tiles TEXT_SOURCE, so it is skipped when
+  // the live filter already matches (mount, style swap with no focus). The
+  // predicate is re-registered in the same pass (GatedLayerHold: show now,
+  // hide only once the source re-tiled).
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    for (const mode of ALIGNMENTS) {
+      const layerId = focusLayerId(mode)
+      try {
+        if (!map.getLayer(layerId)) continue
+        const filter = textFocusFilter(mode, focusedLabelId)
+        if (sameValue(map.getFilter(layerId), filter)) continue
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        map.setFilter(layerId, filter as any)
+        gateHoldRef.current.register(map, layerId, textFocusPredicate(mode, focusedLabelId))
+      } catch { /* style torn down */ }
+    }
+  }, [map, styleLoaded, styleGen, focusedLabelId])
+
+  // ---- Focus mode: near tier + handing the label to the twin -----------
+  // `focusScale` (FOCUS_FACTOR.near) on every label in the focused item's
+  // NEAR column; written from the scene, never from the camera, and only
+  // for ids whose value changed. Tracked per TEXT_SOURCE instance like the
+  // occlusion state: a re-created source starts clean and gets every value
+  // written again.
+  //
+  // `focused` hides the base copy of the label and shows it on the twin
+  // (textFocusTwinOpacityExpr is its complement). It is written only once
+  // TEXT_SOURCE has re-tiled the twin's new filter — hiding the base copy
+  // sooner would blank the label for the worker round trip. On exit /
+  // change the old label is un-focused at once: the base copy shows and the
+  // twin's (old-filter) copy hides in the same frame.
+  const labelFactorKey = useMemo(() => labelFocusFactorKey(scene, labels), [scene, labels])
+  const labelFactors = useMemo(() => parseFactorKey(labelFactorKey), [labelFactorKey])
+  const focusWriteRef = useRef<{
+    source: unknown
+    scales: ReadonlyMap<number, number>
+    hidden: number | null
+  } | null>(null)
+  useEffect(() => {
+    if (!map || !styleLoaded) return
+    const source = map.getSource(TEXT_SOURCE)
+    if (!source) return
+    let w = focusWriteRef.current
+    if (!w || w.source !== source) {
+      w = { source, scales: NO_FACTORS, hidden: null }
+      focusWriteRef.current = w
+    }
+    const written = w
+    const write = (id: number, state: Record<string, unknown>) => {
+      try {
+        map.setFeatureState({ source: TEXT_SOURCE, id }, state)
+      } catch { /* source went away */ }
+    }
+    if (written.scales !== labelFactors) {
+      for (const id of written.scales.keys()) {
+        if (!labelFactors.has(id)) write(id, { focusScale: 1 })
+      }
+      for (const [id, factor] of labelFactors) {
+        if (written.scales.get(id) !== factor) write(id, { focusScale: factor })
+      }
+      written.scales = labelFactors
+    }
+    if (written.hidden !== null && written.hidden !== focusedLabelId) {
+      write(written.hidden, { focused: false })
+      written.hidden = null
+    }
+    if (focusedLabelId === null || written.hidden === focusedLabelId) return
+    const id = focusedLabelId
+    const onRender = () => {
+      if (!textSourceSettled(map)) return
+      map.off('render', onRender)
+      write(id, { focused: true })
+      written.hidden = id
+    }
+    map.on('render', onRender)
+    // A frame is due anyway after a filter / data change; this covers a
+    // re-run with neither (the scales changed while waiting).
+    map.triggerRepaint()
+    return () => {
+      map.off('render', onRender)
+    }
+  }, [map, styleLoaded, styleGen, labelFactors, focusedLabelId])
 
   // ---- Selection filter --------------------------------------------------
   // We belt-and-suspenders this: when nothing is selected, set both
@@ -626,6 +1032,7 @@ export function MapTextLabelOverlay({
           ['==', ['coalesce', ['get', 'pitchAlignment'], 'viewport'], mode],
           ['in', ['get', 'textLabelId'], ['literal', ids]],
         ])
+        gateHoldRef.current.register(map, layerId, textSelectionPredicate(mode, ids))
         // Selection layers are gated on BOTH the selection state and
         // the master `committedVisible` toggle, so we re-compute the
         // composite here rather than letting the visibility effect
@@ -675,9 +1082,13 @@ export function MapTextLabelOverlay({
   }, [map, styleLoaded, styleGen, primaryHex])
 
   // Keep the transform handle at the top of the layer stack so
-  // late-added overlays can't shove above.
+  // late-added overlays can't shove above. Only while a transform is
+  // active: with none, the handle source is empty and its place in the
+  // stack can't show, while `moveLayer` (even onto the top it already
+  // holds) flags a layer re-order — on every label edit and selection
+  // click otherwise. It runs again when a transform starts.
   useEffect(() => {
-    if (!map || !styleLoaded) return
+    if (!map || !styleLoaded || !transformState) return
     try {
       if (map.getLayer(TRANSFORM_LAYER)) map.moveLayer(TRANSFORM_LAYER)
     } catch { /* ignore */ }
@@ -724,6 +1135,12 @@ export function MapTextLabelOverlay({
     }
 
     const onMove = (e: MapMouseEvent) => {
+      // Mid drag-pan / drag-orbit (button held while the camera moves)
+      // the pointer is busy dragging the map, not hovering a label, so
+      // skip the hit-test that would otherwise run on every drag frame.
+      // The cursor keeps its pre-drag value until the next plain
+      // mousemove after the drag refreshes it.
+      if ((e.originalEvent as MouseEvent | undefined)?.buttons && map.isMoving()) return
       const layers = presentLayers()
       if (layers.length === 0) return
       const bbox: [[number, number], [number, number]] = [
