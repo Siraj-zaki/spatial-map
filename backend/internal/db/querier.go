@@ -391,6 +391,9 @@ type Querier interface {
 	// intentionally omitted from v1 — they're a small minority and would
 	// require 9 subqueries or a UNION ALL.
 	ListBinsByGridZone(ctx context.Context, zoneID pgtype.Int8) ([]Bin, error)
+	// One facility's bins: grid cells of its racks / seating, and bins bound to its shapes. The map asks
+	// with ?zoneId — the whole workspace's bins (tens of thousands of seats) made every facility open slow.
+	ListBinsByZone(ctx context.Context, arg ListBinsByZoneParams) ([]Bin, error)
 	ListCircles(ctx context.Context, tenantID int64) ([]Circle, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	ListCirclesByZone(ctx context.Context, zoneID pgtype.Int8) ([]Circle, error)

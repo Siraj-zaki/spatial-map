@@ -295,8 +295,9 @@ func main() {
 		// X-Tenant-Id (you may not have one yet, or you may be deleting
 		// the current one). Auth is enforced inside the handlers — every
 		// mutation demands a JWT userID; JWT callers get role gates,
-		// API-key callers keep legacy ungated behaviour.
-		r.Mount("/tenants", handlers.TenantsRouter(queries, objectStore))
+		// API-key callers keep legacy ungated behaviour. Anonymous callers
+		// (no user, no configured key) are refused here.
+		r.With(api.RequireUserOrAPIKey).Mount("/tenants", handlers.TenantsRouter(queries, objectStore))
 
 		// Per-user profile self-service. Authenticated but NOT tenant-scoped
 		// because profile data belongs to the user, not the workspace.
@@ -320,8 +321,11 @@ func main() {
 
 		// All other catalog routes require a tenant header. The membership
 		// check inside TenantMiddleware also enforces that a JWT user can
-		// only access tenants they belong to.
+		// only access tenants they belong to. RequireUserOrAPIKey runs
+		// first: a caller with neither a signed-in user nor the configured
+		// API key never reaches a workspace (api/middleware.go).
 		r.Group(func(r chi.Router) {
+			r.Use(api.RequireUserOrAPIKey)
 			r.Use(api.TenantMiddleware(queries))
 			// Real-time invalidation stream. The SPA reads it with fetch
 			// (not EventSource) so it can send the JWT and X-Tenant-Id;

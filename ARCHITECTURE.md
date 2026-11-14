@@ -986,7 +986,7 @@ Detection coord contract: the Python pipeline computes shapes in pixel space (SA
 #### Tenant-scoped catalog (auth + tenant)
 - **Zones**: CRUD + `/zones/{id}/duplicate` (clones shapes + bins)
 - **Shapes**: `GET|POST /api/v1/{grids|polygons|circles|lines|markers|images|models|image-planes|text-labels|stairs|doors}` and `/{id}` for `GET|PATCH|DELETE`
-- **Bins**: full CRUD + `PATCH /bins/bulk-upsert` (for imports)
+- **Bins**: full CRUD + `PATCH /bins/bulk-upsert` (for imports). `GET /bins?zoneId=N` (0.1.1, `ListBinsByZone`) returns one facility's bins — grid cells of its grids plus bins bound to its shapes; without `zoneId`, every bin in the workspace
 - **Metadata**: `attribute-definitions` (with `?zoneId=X` filter), `style-rules`
 - **Data link**: `connections`, `streams`, `data-sources`, `data-sources/{id}/probe`, `data-sources/{id}/upload`
 - **Import pipeline**: `POST /import-jobs/preview` (multipart file + plan), `POST /import-jobs/commit`, `GET /import-jobs[/{id}]`
@@ -1010,10 +1010,12 @@ Two auth modes coexist:
 - `OptionalJWTMiddleware` validates the token if present. Falls through silently if absent. **Malformed/expired tokens** are rejected with 401 (an active signal).
 - **Session revocation** (`internal/api/session_revocation.go`, 2026-09): after the signature check, the middleware rejects (401, code `session_revoked`) any token whose `iat` < `users.password_changed_at`. Lookups are cached per user for 30 s; the instance that performs a reset primes its own cache (`api.NoteSessionRevocation`) so the cut-off is immediate there, other instances catch up within the TTL. Enabled in `main()` via `api.EnableSessionRevocation(queries)` — tests that never call it keep the old behaviour.
 - `TenantMiddleware(queries)` cross-checks: when a JWT user requests a `X-Tenant-Id`, membership in `user_tenants` is verified. 403 otherwise.
+- **`RequireUserOrAPIKey`** (0.1.1) runs before `TenantMiddleware` on the whole tenant group and on `/tenants`: a request with neither a signed-in user nor the configured API key gets 401 `sign in required`. Before it, an empty `SGV_AUTH.API_KEY` (the docker-compose default) let anonymous requests through and they were served any workspace their `X-Tenant-Id` named; `/tenants`' "API-key caller" paths listed, renamed and deleted any workspace. Pinned by `internal/api/access_test.go`.
 
-**API Key (legacy / dev / e2e)** — set via `SGV_AUTH.API_KEY`. Empty disables auth in dev.
+**API Key (machine access: scripts, integrations, e2e)** — set via `SGV_AUTH.API_KEY`.
 - Pass via `X-Api-Key`, `Authorization: Bearer <key>`, or `?apiKey=<key>` (for WS).
-- `APIKeyMiddleware` short-circuits when a JWT is already authenticated (so JWT supersedes the key).
+- `APIKeyMiddleware` short-circuits when a JWT is already authenticated (so JWT supersedes the key). When the presented key matches, it marks the request (`api.APIKeyCaller(ctx)`). An empty configured key lets requests through this middleware but **never** marks them, so they still can't reach workspace routes.
+- Never put the real key in `VITE_API_KEY` for a served build — it is bundled into the public JS. The SPA's default is the dev placeholder, which only matches `config.dev.yaml`.
 
 **Tenant**: extracted from `X-Tenant-Id` header → request context. For JWT users, also validated against `user_tenants`.
 

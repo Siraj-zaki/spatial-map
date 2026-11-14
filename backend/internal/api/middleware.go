@@ -22,6 +22,19 @@ type userIDKey struct{}
 // userEmailKey is the context key for the authenticated user's email.
 type userEmailKey struct{}
 
+// apiKeyCallerKey marks a request that presented the configured API key
+// (machine access: scripts, integrations). Set by APIKeyMiddleware.
+type apiKeyCallerKey struct{}
+
+// APIKeyCaller reports whether the request authenticated with the
+// configured API key. It is false when no key is configured — an empty
+// auth.api_key lets requests through APIKeyMiddleware but never counts as
+// presenting a key.
+func APIKeyCaller(ctx context.Context) bool {
+	v, _ := ctx.Value(apiKeyCallerKey{}).(bool)
+	return v
+}
+
 // TenantID returns the tenant ID stored in the request context, or 0 if absent.
 func TenantID(ctx context.Context) int64 {
 	v, _ := ctx.Value(tenantKey{}).(int64)
@@ -180,7 +193,30 @@ func APIKeyMiddleware(apiKey string) func(http.Handler) http.Handler {
 				Error(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
-			next.ServeHTTP(w, r)
+			ctx := context.WithValue(r.Context(), apiKeyCallerKey{}, true)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// RequireUserOrAPIKey refuses a request that has neither a signed-in user
+// nor the configured API key, with 401 "sign in required".
+//
+// It guards everything that reads or changes a workspace (the tenant group
+// and /tenants). Without it, when auth.api_key is empty — the docker-compose
+// default — APIKeyMiddleware lets every request through and anyone could
+// read, change or delete any workspace just by sending its X-Tenant-Id.
+// TenantMiddleware's membership check only runs for signed-in users.
+//
+// Machine access keeps working with the real key. Webhooks, streams, the
+// public table API and share links live outside these routes and resolve
+// the tenant from their own tokens.
+func RequireUserOrAPIKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if UserID(r.Context()) == 0 && !APIKeyCaller(r.Context()) {
+			Error(w, http.StatusUnauthorized, "sign in required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

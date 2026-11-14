@@ -348,6 +348,67 @@ func (q *Queries) ListBinsByGridZone(ctx context.Context, zoneID pgtype.Int8) ([
 	return items, nil
 }
 
+const listBinsByZone = `-- name: ListBinsByZone :many
+SELECT b.id, b.tenant_id, b.target_kind, b.grid_id, b.row, b.col, b.level, b.shape_id, b.status, b.sku, b.capacity, b.notes, b.external_code, b.custom_properties, b.last_synced_at, b.sync_source, b.floor_plan_id, b.updated_at
+FROM bins b
+WHERE b.tenant_id = $1 AND (
+  b.grid_id IN (SELECT g.id FROM grids g WHERE g.tenant_id = $1 AND g.zone_id = $2::bigint)
+  OR (b.target_kind = 'polygon' AND b.shape_id IN (SELECT x.id FROM polygons x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+  OR (b.target_kind = 'circle'  AND b.shape_id IN (SELECT x.id FROM circles  x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+  OR (b.target_kind = 'line'    AND b.shape_id IN (SELECT x.id FROM lines    x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+  OR (b.target_kind = 'marker'  AND b.shape_id IN (SELECT x.id FROM markers  x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+  OR (b.target_kind = 'image'   AND b.shape_id IN (SELECT x.id FROM images   x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+  OR (b.target_kind = 'model'   AND b.shape_id IN (SELECT x.id FROM models   x WHERE x.tenant_id = $1 AND x.zone_id = $2::bigint))
+)
+ORDER BY b.id
+`
+
+type ListBinsByZoneParams struct {
+	TenantID int64 `json:"tenant_id"`
+	ZoneID   int64 `json:"zone_id"`
+}
+
+// One facility's bins: grid cells of its racks / seating, and bins bound to its shapes. The map asks
+// with ?zoneId — the whole workspace's bins (tens of thousands of seats) made every facility open slow.
+func (q *Queries) ListBinsByZone(ctx context.Context, arg ListBinsByZoneParams) ([]Bin, error) {
+	rows, err := q.db.Query(ctx, listBinsByZone, arg.TenantID, arg.ZoneID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Bin{}
+	for rows.Next() {
+		var i Bin
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.TargetKind,
+			&i.GridID,
+			&i.Row,
+			&i.Col,
+			&i.Level,
+			&i.ShapeID,
+			&i.Status,
+			&i.Sku,
+			&i.Capacity,
+			&i.Notes,
+			&i.ExternalCode,
+			&i.CustomProperties,
+			&i.LastSyncedAt,
+			&i.SyncSource,
+			&i.FloorPlanID,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateBin = `-- name: UpdateBin :one
 UPDATE bins
 SET target_kind = $3, grid_id = $4, row = $5, col = $6, level = $7, shape_id = $8, status = $9, sku = $10, capacity = $11, notes = $12, external_code = $13, custom_properties = $14, sync_source = $15, floor_plan_id = $16, updated_at = now()

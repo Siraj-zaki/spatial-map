@@ -6,6 +6,29 @@ All notable changes to Spatial Map are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-14
+
+### Security
+
+- **Workspace routes now require a signed-in user or the configured API
+  key.** With `SPATIAL_MAP_API_KEY` unset (the `docker compose` default), a
+  request with no session was let through and served whatever workspace its
+  `X-Tenant-Id` header named — reads, changes and deletes — and
+  `GET /api/v1/tenants` listed every workspace. Such requests now get
+  `401 sign in required`. Scripts and integrations keep working with the real
+  API key; webhooks, streams, the public table API and share links are
+  unchanged (they use their own tokens). **Upgrade every install that is
+  reachable from a network.**
+- `.env.example`: `VITE_API_KEY` must never hold the real API key in a served
+  build — it is bundled into the public JavaScript.
+
+### Fixed
+
+- Opening a facility no longer loads every bin in the workspace:
+  `GET /api/v1/bins?zoneId=N` returns that facility's bins only (grid cells
+  of its racks and seating, plus bins bound to its shapes). The map already
+  sent `zoneId`; the API ignored it.
+
 ## [0.1.0] - 2026-10-11
 
 First open-source release of Spatial Map, the self-hosted edition of
@@ -44,5 +67,6 @@ First open-source release of Spatial Map, the self-hosted edition of
 - Six languages (English, German, Spanish, French, Arabic with RTL, Chinese),
   light/dark themes and 46 colour palettes.
 
-[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Siraj-zaki/spatial-map/releases/tag/v0.1.0

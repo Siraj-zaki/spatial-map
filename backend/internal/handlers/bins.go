@@ -203,7 +203,14 @@ func getBin(q *db.Queries) http.HandlerFunc {
 func listBins(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := api.TenantID(r.Context())
-		rows, err := q.ListBins(r.Context(), tenantID)
+		// ?zoneId=N → that facility's bins only (the map's request); without it, every bin as before.
+		var rows []db.Bin
+		var err error
+		if zoneID := api.Int64Query(r, "zoneId", 0); zoneID > 0 {
+			rows, err = q.ListBinsByZone(r.Context(), db.ListBinsByZoneParams{TenantID: tenantID, ZoneID: zoneID})
+		} else {
+			rows, err = q.ListBins(r.Context(), tenantID)
+		}
 		if err != nil {
 			api.InternalError(w, r, err)
 			return
