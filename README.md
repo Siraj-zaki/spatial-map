@@ -4,42 +4,98 @@
 
 # Spatial Map — open-source indoor mapping software
 
-**Open-source indoor maps and digital twins for real facilities** — draw multi-floor layouts on
-a live map, link them to your own data (sensors, RFID, inventory, any table or
-API), and turn it into live 3D views, dashboards and reports.
+**English** · [Español](docs/i18n/README.es.md) · [Français](docs/i18n/README.fr.md) · [Deutsch](docs/i18n/README.de.md) · [中文](docs/i18n/README.zh-CN.md) · [العربية](docs/i18n/README.ar.md)
+
+**Turn CAD, DWG and PDF floor plans into live 3D indoor maps and digital twins.**
+Map warehouses, hospitals, malls, factories and campuses floor by floor, then
+connect live data from RTLS, RFID, BLE and IoT sensors, your WMS or ERP, or any
+table, webhook or API, and watch it on the map with heatmaps, alerts,
+turn-by-turn wayfinding, dashboards and reports. Self-hosted with Docker. MIT.
 
 [![CI](https://github.com/Siraj-zaki/spatial-map/actions/workflows/ci.yml/badge.svg)](https://github.com/Siraj-zaki/spatial-map/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Siraj-zaki/spatial-map?sort=semver)](https://github.com/Siraj-zaki/spatial-map/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/Siraj-zaki?tab=packages&repo_name=spatial-map)
 
 [**Documentation**](https://spatialmap.io/docs) ·
 [**Cloud version**](https://spatialmap.io) ·
 [Quick start](#quick-start) ·
+[Features](#features) ·
 [Releases](https://github.com/Siraj-zaki/spatial-map/releases) ·
 [Contributing](CONTRIBUTING.md)
 
 <img src="docs/media/hero.webp" alt="A warehouse in Spatial Map: racks, bins, workers and safety markers orbiting in 3D" width="100%" />
 
+<a href="docs/media/spatial-map-tour.mp4"><img src="docs/media/tour-poster.jpg" alt="Watch the 50-second product tour" width="49%" /></a>
+<img src="docs/media/cad-to-live.webp" alt="A CAD floor plan becomes walls, racks and bins coloured by live inventory" width="49%" />
+
+▶ [**Watch the 50-second tour**](docs/media/spatial-map-tour.mp4) · from a CAD drawing to a live warehouse map
+
 </div>
 
 ---
 
-## What it does
+## Features
+
+### From floor plan to live indoor map
 
 | | |
 |---|---|
-| ![Live 3D viewer](docs/media/viewer.jpg) | **Live 3D viewer** — every floor, rack, bin, area and 3D model on a real map, with live data from your systems coloured and labelled by your own rules. Share read-only links with chosen floors, layers and filters. |
-| ![Facility editor](docs/media/editor.jpg) | **Facility editor** — import floor plans (PDF, DWG, images) and draw areas, walls, doors, stairs, lifts, racks, markers, labels and 3D models, with snapping, bulk editing, undo/redo and keyboard shortcuts. |
-| ![Full-map report](docs/media/report-map.jpg) | **Reports & dashboards** — a report builder with KPIs, charts, tables and filters, ready-made reports for every facility and data table, and a full-map layout that auto-refreshes. |
-| ![Tables](docs/media/tables.jpg) | **Tables & data links** — built-in tables with CSV/XLSX import and a REST API per table, or pull from REST APIs, webhooks, files and live streams; link any row to a shape by name, code or coordinates. |
+| <img src="docs/media/cad-to-live.webp" alt="CAD drawing to live map" width="420" /> | **Import any floor plan**: PDF, DWG (AutoCAD) or an image, placed on a real map and scaled with a **calibration** tool (measure a known length). Draw walls that **join cleanly at corners**, leaning walls, areas, doors, stairs, lifts and escalators, **racks with bins** (straight or **bent along a path**), markers, labels and 3D models. A **Measure** tool (`U`) with live dimensions, **typed lengths** for every point (`3.5`, `350cm`, `12'6`) and an angle lock make it CAD-precise. |
+| <img src="docs/media/multi-floor.webp" alt="Every floor modelled to scale" width="420" /> | **Multi-floor buildings in 3D**: every floor stacked at its real height, with per-floor reference views, a blank sheet for floors without a drawing, bulk editing in every saved-shapes list, undo/redo, keyboard shortcuts, and **export** to GeoJSON, CSV, XLSX and **3D `.glb`**. |
+| <img src="docs/media/building-3d.webp" alt="Any building in 3D with live markers" width="420" /> | **Live 3D viewer and digital twin**: every floor, rack, bin, area and 3D model on a real Mapbox map, with live data coloured and labelled by your own rules. **Focus mode** fades only what is in the way of the item you click. Share read-only links with chosen floors, layers and filters. |
 
-Also: workspaces with roles (owner / admin / editor / viewer), solutions to
-group facilities and reports, an optional AI tool that detects rooms and walls
-on a floor plan, six languages (incl. RTL), light/dark themes and 46 palettes.
-Self-hosted means everything is unlocked: no plans, no limits.
+### Live data: RTLS, RFID, BLE, IoT, WMS and ERP
+
+| | |
+|---|---|
+| <img src="docs/media/playback.webp" alt="Replay any moment, reader by reader" width="420" /> | **Data links**: bind rows from tables, REST APIs, webhooks, files or live WebSocket streams to shapes by name, code or coordinates. Positions from an RTLS, RFID reads, BLE tags, sensor values and WMS / ERP records all arrive the same way. **History playback** with a time range replays any moment. |
+| <img src="docs/media/alerts.webp" alt="Every alert pinned to the spot" width="420" /> | **Alerts** (new in 0.3.0): rules over any table (a condition, held for a duration, a stale value, or a count), checked on the server every 15 s, pinned to the spot on the map, with a bell and a chime. |
+| <img src="docs/media/reports.webp" alt="Reports built in" width="420" /> | **Reports and dashboards**: a report builder with KPIs, charts, tables and viewer filters, a **master report** per facility, ready-made reports for every facility and table, full-map layouts, **heatmaps** that stop at walls, **point clustering**, and **public links to a single report**. |
+
+### Wayfinding
+
+| | |
+|---|---|
+| <img src="docs/media/navigation.webp" alt="Turn-by-turn indoor navigation" width="420" /> | **Turn-by-turn indoor navigation**: routes follow the building's axes, pass through door centres and go **across floors** by stairs and lifts, with step-by-step directions. **Place search** finds addresses, coordinates and Google Maps / OpenStreetMap links. |
+
+### And also
+
+- **Workspaces, members and custom roles**: four built-in roles plus your own
+  permission sets; admins can create accounts directly; viewers are read-only
+  on the API, not just in the UI.
+- **Tables** with CSV/XLSX import, a REST API and bearer tokens per table,
+  polling sources and row history.
+- **Solutions** group facilities, reports and data (e.g. "Anti-theft").
+- **Six languages** (English, Spanish, French, German, Chinese, Arabic with RTL),
+  light/dark themes and 46 colour palettes.
+- An optional **AI floor-plan tool** that detects rooms and walls.
+- **Self-hosted means everything is unlocked**: no plans, no limits, no telemetry.
 
 > **Prefer not to host it yourself?** [spatialmap.io](https://spatialmap.io) is
 > the managed cloud version of Spatial Map.
+
+### What's new
+
+| Version | Highlights |
+|---|---|
+| **0.3.0** | Alerts, custom roles, admins create accounts, a complete "Duplicate facility", welcome tour, sign-up guard |
+| **0.2.0** | Focus mode, measure and calibrate, wall joins, leaning walls, path-layout racks, multi-floor routing, heatmaps, clustering, master reports, report share links, 3D export |
+| **0.1.1** | Security: workspace routes require a sign-in or the configured API key |
+
+Full list: [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## Use cases
+
+| | |
+|---|---|
+| **Warehouses and logistics (WMS)** | Racks and bins coloured by stock, pick paths, dock doors, forklifts and pickers on the map, inbound / outbound dashboards |
+| **Hospitals and healthcare (RTLS)** | Staff, patient and equipment locations, room occupancy, cold-chain and environment alerts |
+| **Retail, malls and supermarkets** | Store layouts, shelves and fixtures, footfall heatmaps, anti-theft alerts, in-store wayfinding |
+| **Manufacturing and factories (IoT)** | Machines and sensors on the floor plan, live status, maintenance and safety alerts |
+| **Offices, campuses, venues and museums** | Rooms, desks and assets, visitor wayfinding, event layouts |
 
 ---
 
@@ -70,7 +126,7 @@ optional AI floor-plan tool adds a ~1.7 GB worker:
 
 ### Demo workspace
 
-A fresh install comes with a shared **Demo workspace** — five sample
+A fresh install comes with a shared **Demo workspace**: five sample
 facilities (a hospital, a retail mall, a warehouse, a supermarket and a retail
 store) with floors, racks, live data tables, data links and 84 ready-made
 reports, including a full-map RFID dashboard. It is loaded once, on the first
@@ -82,7 +138,8 @@ start** to begin empty.
 ### Send it your data
 
 Every table has its own REST API and bearer tokens (**Tables → your table →
-API & Integrations**). Push a row from anywhere:
+API & Integrations**). Push a row from anywhere: an RTLS server, an IoT
+gateway, your WMS or ERP, or a script:
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/public/tables/rows \
@@ -92,7 +149,9 @@ curl -X POST http://localhost:3000/api/v1/public/tables/rows \
 ```
 
 Then link the table to a facility in the editor (**Data links**) and the row
-shows up on the map, styled by your rules, as soon as it changes.
+shows up on the map, styled by your rules, as soon as it changes. Other ways in:
+webhooks, live WebSocket streams, REST polling of your own API, and CSV / XLSX /
+GeoJSON import.
 
 ---
 
@@ -126,7 +185,7 @@ in this repository:
 
 ## Configuration
 
-All settings for `docker compose` go in `.env` — every option is documented in
+All settings for `docker compose` go in `.env`; every option is documented in
 [.env.example](.env.example). The ones you'll want for production:
 
 | Variable | What |
@@ -143,7 +202,7 @@ All settings for `docker compose` go in `.env` — every option is documented in
 
 Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik) in front of port
 3000 for anything public. The API reads `SGV_*` settings as well
-(`backend/config.prod.example.yaml` documents each one) — see
+(`backend/config.prod.example.yaml` documents each one); see
 [SECURITY.md](SECURITY.md).
 
 Basemaps come from Mapbox's public styles ([map-styles.json](map-styles.json));
@@ -186,14 +245,16 @@ shadcn/ui · Go 1.25 · Chi · sqlc · PostgreSQL/PostGIS · MinIO · Redis.
 
 ## Contributing
 
-Issues and pull requests are welcome — read [CONTRIBUTING.md](CONTRIBUTING.md)
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
 and [AGENTS.md](AGENTS.md) first (the codebase has a few firm conventions:
 spatial store, tenant scoping, i18n in six languages, theme tokens), and follow
 the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues privately
 ([SECURITY.md](SECURITY.md)). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
+If Spatial Map is useful to you, a ⭐ on GitHub helps other people find it.
+
 ## License
 
 [MIT](LICENSE) © Spatial Map contributors. Bundled 3D models are CC BY 4.0 and
-need attribution — see [CREDITS.md](CREDITS.md). Map data and tiles are
+need attribution; see [CREDITS.md](CREDITS.md). Map data and tiles are
 © Mapbox and © OpenStreetMap contributors.
