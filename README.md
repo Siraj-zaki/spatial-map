@@ -24,14 +24,27 @@ turn-by-turn wayfinding, dashboards and reports. Self-hosted with Docker. MIT.
 [Releases](https://github.com/Siraj-zaki/spatial-map/releases) ·
 [Contributing](CONTRIBUTING.md)
 
-<img src="docs/media/hero.webp" alt="A warehouse in Spatial Map: racks, bins, workers and safety markers orbiting in 3D" width="100%" />
+<a href="docs/media/spatial-map-overview.mp4"><img src="docs/media/showcase/platform.jpg" alt="Spatial Map: one live 3D map for every building, floors stacked with live data" width="100%" /></a>
 
-<a href="docs/media/spatial-map-tour.mp4"><img src="docs/media/tour-poster.jpg" alt="Watch the 50-second product tour" width="49%" /></a>
-<img src="docs/media/cad-to-live.webp" alt="A CAD floor plan becomes walls, racks and bins coloured by live inventory" width="49%" />
-
-▶ [**Watch the 50-second tour**](docs/media/spatial-map-tour.mp4) · from a CAD drawing to a live warehouse map
+▶ [**Watch the 90-second overview**](docs/media/spatial-map-overview.mp4)
 
 </div>
+
+---
+
+## Showcase
+
+One app for every kind of building. Each of these is a facility built in Spatial Map: floors drawn over the
+real floor plan, live data on top.
+
+| | |
+|---|---|
+| <img src="docs/media/showcase/warehouse.jpg" alt="Warehouse: racks, inventory, people and safety on one live map" /> **Warehouses** — racks, inventory, people and safety | <img src="docs/media/showcase/hospital.jpg" alt="Hospital: beds, devices, people and safety on one live map" /> **Hospitals** — beds, devices, staff and safety |
+| <img src="docs/media/showcase/inventory.jpg" alt="Inventory: every pallet, live" /> **Inventory** — every rack, carton, dock and forklift | <img src="docs/media/showcase/asset-management.jpg" alt="Asset management: know where every asset is" /> **Asset management** — tags, readers and assets across floors |
+| <img src="docs/media/showcase/cold-chain.jpg" alt="Cold chain: keep every batch in band" /> **Cold chain** — zones, doors and temperature alerts | <img src="docs/media/showcase/logistics.jpg" alt="Logistics: move freight on time" /> **Logistics** — gates, yard, docks and pallets |
+| <img src="docs/media/showcase/supply-chain.jpg" alt="Supply chain: keep every line supplied" /> **Manufacturing and supply chain** — docks, stores, lines and WIP | <img src="docs/media/showcase/anti-theft.jpg" alt="Anti-theft: stop shrink at the door" /> **Anti-theft** — RFID tags, gates, cameras and alarms |
+| <img src="docs/media/showcase/venue.jpg" alt="Venues: keep every crowd flowing" /> **Venues and stadiums** — halls, gates, queues and kit | <img src="docs/media/showcase/museum.jpg" alt="Museums: visitors, collections, security and safety" /> **Museums** — visitors, collections and security |
+| <img src="docs/media/showcase/retail.jpg" alt="Retail: shoppers, shelves, staff and safety" /> **Retail and supermarkets** — shoppers, shelves and staff | <img src="docs/media/showcase/navigation.jpg" alt="Turn-by-turn indoor navigation" /> **Indoor navigation** — turn by turn, across floors |
 
 ---
 
@@ -41,11 +54,13 @@ turn-by-turn wayfinding, dashboards and reports. Self-hosted with Docker. MIT.
 
 | | |
 |---|---|
-| <img src="docs/media/cad-to-live.webp" alt="CAD drawing to live map" width="420" /> | **Import any floor plan**: PDF, DWG (AutoCAD) or an image, placed on a real map and scaled with a **calibration** tool (measure a known length). Draw walls that **join cleanly at corners**, leaning walls, areas, doors, stairs, lifts and escalators, **racks with bins** (straight or **bent along a path**), markers, labels and 3D models. A **Measure** tool (`U`) with live dimensions, **typed lengths** for every point (`3.5`, `350cm`, `12'6`) and an angle lock make it CAD-precise. |
+| <img src="docs/media/showcase/museum.jpg" alt="Multi-floor building drawn over its floor plans" width="420" /> | **Import any floor plan**: PDF, DWG (AutoCAD) or an image, placed on a real map and scaled with a **calibration** tool (measure a known length). Draw walls that **join cleanly at corners**, leaning walls, areas, doors, stairs, lifts and escalators, **racks with bins** (straight or **bent along a path**), markers, labels and 3D models. A **Measure** tool (`U`) with live dimensions, **typed lengths** for every point (`3.5`, `350cm`, `12'6`) and an angle lock make it CAD-precise. |
 | <img src="docs/media/multi-floor.webp" alt="Every floor modelled to scale" width="420" /> | **Multi-floor buildings in 3D**: every floor stacked at its real height, with per-floor reference views, a blank sheet for floors without a drawing, bulk editing in every saved-shapes list, undo/redo, keyboard shortcuts, and **export** to GeoJSON, CSV, XLSX and **3D `.glb`**. |
 | <img src="docs/media/building-3d.webp" alt="Any building in 3D with live markers" width="420" /> | **Live 3D viewer and digital twin**: every floor, rack, bin, area and 3D model on a real Mapbox map, with live data coloured and labelled by your own rules. **Focus mode** fades only what is in the way of the item you click. Share read-only links with chosen floors, layers and filters. |
 
 ### Live data: RTLS, RFID, BLE, IoT, WMS and ERP
+
+<img src="docs/media/showcase/integrations.jpg" alt="Your RFID, sensors and ERP on one live map" width="100%" />
 
 | | |
 |---|---|

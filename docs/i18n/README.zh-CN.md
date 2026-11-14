@@ -20,14 +20,26 @@ WMS 或 ERP，以及任意数据表、Webhook 或 API 的实时数据，并在�
 [快速开始](#快速开始) ·
 [版本发布](https://github.com/Siraj-zaki/spatial-map/releases)
 
-<img src="../media/hero.webp" alt="Spatial Map 中的仓库：货架、货位、人员和安全标识的 3D 视图" width="100%" />
+<a href="../media/spatial-map-overview.mp4"><img src="../media/showcase/platform.jpg" alt="Spatial Map：每栋建筑一张实时 3D 地图" width="100%" /></a>
 
-<a href="../media/spatial-map-tour.mp4"><img src="../media/tour-poster.jpg" alt="观看 50 秒产品导览" width="49%" /></a>
-<img src="../media/cad-to-live.webp" alt="CAD 平面图变成墙体、货架和按实时库存着色的货位" width="49%" />
-
-▶ [**观看 50 秒产品导览**](../media/spatial-map-tour.mp4) · 从 CAD 图纸到实时仓库地图
+▶ [**观看 90 秒概览**](../media/spatial-map-overview.mp4)
 
 </div>
+
+---
+
+## 案例展示
+
+一个应用覆盖各类建筑。每张图都是在 Spatial Map 中搭建的设施：楼层画在真实平面图上，实时数据叠加其上。
+
+| | |
+|---|---|
+| <img src="../media/showcase/warehouse.jpg" alt="" /> **仓库**：货架、库存、人员与安全 | <img src="../media/showcase/hospital.jpg" alt="" /> **医院**：床位、设备、人员与安全 |
+| <img src="../media/showcase/inventory.jpg" alt="" /> **库存**：每个货架、纸箱、装卸口和叉车 | <img src="../media/showcase/asset-management.jpg" alt="" /> **资产管理**：跨楼层的标签、读写器和资产 |
+| <img src="../media/showcase/cold-chain.jpg" alt="" /> **冷链**：区域、门和温度告警 | <img src="../media/showcase/logistics.jpg" alt="" /> **物流**：门岗、堆场、装卸口和托盘 |
+| <img src="../media/showcase/supply-chain.jpg" alt="" /> **制造与供应链**：装卸口、库房、产线和在制品 | <img src="../media/showcase/anti-theft.jpg" alt="" /> **防盗**：RFID 标签、门禁、摄像头和警报 |
+| <img src="../media/showcase/venue.jpg" alt="" /> **场馆与体育场**：展厅、入口、排队和设备 | <img src="../media/showcase/museum.jpg" alt="" /> **博物馆**：访客、藏品与安保 |
+| <img src="../media/showcase/retail.jpg" alt="" /> **零售与超市**：顾客、货架和员工 | <img src="../media/showcase/navigation.jpg" alt="" /> **室内导航**：逐步导航，跨越楼层 |
 
 ---
 
@@ -37,11 +49,13 @@ WMS 或 ERP，以及任意数据表、Webhook 或 API 的实时数据，并在�
 
 | | |
 |---|---|
-| <img src="../media/cad-to-live.webp" alt="从 CAD 图纸到实时地图" width="420" /> | **导入任意平面图**：PDF、DWG（AutoCAD）或图片，放置在真实地图上，并用**校准**工具按已知长度缩放。绘制在拐角处**自动对接**的墙体、倾斜墙、区域、门、楼梯、电梯和扶梯、**带货位的货架**（直线或**沿路径弯曲**）、标记、文字和 3D 模型。**测量**工具（`U`）、实时尺寸和**输入长度**（`3.5`、`350cm`、`12'6`）带来 CAD 级精度。 |
+| <img src="../media/showcase/museum.jpg" alt="在平面图上绘制的多层建筑" width="420" /> | **导入任意平面图**：PDF、DWG（AutoCAD）或图片，放置在真实地图上，并用**校准**工具按已知长度缩放。绘制在拐角处**自动对接**的墙体、倾斜墙、区域、门、楼梯、电梯和扶梯、**带货位的货架**（直线或**沿路径弯曲**）、标记、文字和 3D 模型。**测量**工具（`U`）、实时尺寸和**输入长度**（`3.5`、`350cm`、`12'6`）带来 CAD 级精度。 |
 | <img src="../media/multi-floor.webp" alt="每一层都按比例建模" width="420" /> | **3D 多层建筑**：每层按真实高度叠放，支持分层参考视图、无图纸楼层的空白底图、批量编辑、撤销/重做、快捷键，以及导出为 GeoJSON、CSV、XLSX 和 **3D `.glb`**。 |
 | <img src="../media/building-3d.webp" alt="任意建筑的 3D 实时视图" width="420" /> | **实时 3D 查看器与数字孪生**：每层、货架、货位、区域和 3D 模型都显示在真实地图上，实时数据按你的规则着色。**聚焦模式**只淡化挡住所选对象的部分。可分享只读链接。 |
 
 ### 实时数据：RTLS、RFID、BLE、IoT、WMS 和 ERP
+
+<img src="../media/showcase/integrations.jpg" alt="RFID、传感器和 ERP 数据汇聚在一张实时地图上" width="100%" />
 
 | | |
 |---|---|

@@ -21,14 +21,26 @@ alertas, navegación paso a paso, paneles e informes. Autoalojado con Docker. MI
 [Inicio rápido](#inicio-rápido) ·
 [Versiones](https://github.com/Siraj-zaki/spatial-map/releases)
 
-<img src="../media/hero.webp" alt="Un almacén en Spatial Map: estanterías, ubicaciones, trabajadores y señales de seguridad en 3D" width="100%" />
+<a href="../media/spatial-map-overview.mp4"><img src="../media/showcase/platform.jpg" alt="Spatial Map: un mapa 3D en vivo para cada edificio" width="100%" /></a>
 
-<a href="../media/spatial-map-tour.mp4"><img src="../media/tour-poster.jpg" alt="Ver el recorrido de 50 segundos" width="49%" /></a>
-<img src="../media/cad-to-live.webp" alt="Un plano CAD se convierte en muros, estanterías y ubicaciones coloreadas por el inventario en vivo" width="49%" />
-
-▶ [**Ver el recorrido de 50 segundos**](../media/spatial-map-tour.mp4) · de un plano CAD a un mapa de almacén en vivo
+▶ [**Ver el resumen de 90 segundos**](../media/spatial-map-overview.mp4)
 
 </div>
+
+---
+
+## Galería
+
+Una sola aplicación para cada tipo de edificio. Cada imagen es una instalación creada en Spatial Map: plantas dibujadas sobre el plano real y datos en vivo encima.
+
+| | |
+|---|---|
+| <img src="../media/showcase/warehouse.jpg" alt="" /> **Almacenes**: estanterías, inventario, personas y seguridad | <img src="../media/showcase/hospital.jpg" alt="" /> **Hospitales**: camas, equipos, personal y seguridad |
+| <img src="../media/showcase/inventory.jpg" alt="" /> **Inventario**: cada estantería, caja, muelle y carretilla | <img src="../media/showcase/asset-management.jpg" alt="" /> **Gestión de activos**: etiquetas, lectores y activos en varias plantas |
+| <img src="../media/showcase/cold-chain.jpg" alt="" /> **Cadena de frío**: zonas, puertas y alertas de temperatura | <img src="../media/showcase/logistics.jpg" alt="" /> **Logística**: accesos, patio, muelles y palés |
+| <img src="../media/showcase/supply-chain.jpg" alt="" /> **Fabricación y cadena de suministro**: muelles, almacenes, líneas y WIP | <img src="../media/showcase/anti-theft.jpg" alt="" /> **Antirrobo**: etiquetas RFID, arcos, cámaras y alarmas |
+| <img src="../media/showcase/venue.jpg" alt="" /> **Recintos y estadios**: salas, accesos, colas y material | <img src="../media/showcase/museum.jpg" alt="" /> **Museos**: visitantes, colecciones y seguridad |
+| <img src="../media/showcase/retail.jpg" alt="" /> **Comercio y supermercados**: clientes, estanterías y personal | <img src="../media/showcase/navigation.jpg" alt="" /> **Navegación de interiores**: paso a paso, entre plantas |
 
 ---
 
@@ -38,11 +50,13 @@ alertas, navegación paso a paso, paneles e informes. Autoalojado con Docker. MI
 
 | | |
 |---|---|
-| <img src="../media/cad-to-live.webp" alt="Del plano CAD al mapa en vivo" width="420" /> | **Importa cualquier plano**: PDF, DWG (AutoCAD) o imagen, colocado sobre un mapa real y escalado con la herramienta de **calibración** (mide una longitud conocida). Dibuja muros que **se unen limpiamente en las esquinas**, muros inclinados, áreas, puertas, escaleras, ascensores y escaleras mecánicas, **estanterías con ubicaciones** (rectas o **a lo largo de un trazado**), marcadores, etiquetas y modelos 3D. La herramienta **Medir** (`U`), las cotas en vivo y las **longitudes escritas** (`3.5`, `350cm`, `12'6`) dan precisión de CAD. |
+| <img src="../media/showcase/museum.jpg" alt="Edificio de varias plantas dibujado sobre sus planos" width="420" /> | **Importa cualquier plano**: PDF, DWG (AutoCAD) o imagen, colocado sobre un mapa real y escalado con la herramienta de **calibración** (mide una longitud conocida). Dibuja muros que **se unen limpiamente en las esquinas**, muros inclinados, áreas, puertas, escaleras, ascensores y escaleras mecánicas, **estanterías con ubicaciones** (rectas o **a lo largo de un trazado**), marcadores, etiquetas y modelos 3D. La herramienta **Medir** (`U`), las cotas en vivo y las **longitudes escritas** (`3.5`, `350cm`, `12'6`) dan precisión de CAD. |
 | <img src="../media/multi-floor.webp" alt="Cada planta a escala" width="420" /> | **Edificios de varias plantas en 3D**: cada planta a su altura real, vistas de referencia por planta, hoja en blanco para plantas sin plano, edición masiva, deshacer/rehacer, atajos de teclado y **exportación** a GeoJSON, CSV, XLSX y **3D `.glb`**. |
 | <img src="../media/building-3d.webp" alt="Cualquier edificio en 3D con marcadores en vivo" width="420" /> | **Visor 3D en vivo y gemelo digital**: cada planta, estantería, ubicación, área y modelo 3D sobre un mapa real, con datos en vivo coloreados según tus reglas. El **modo enfoque** atenúa solo lo que tapa el elemento que eliges. Comparte enlaces de solo lectura. |
 
 ### Datos en vivo: RTLS, RFID, BLE, IoT, WMS y ERP
+
+<img src="../media/showcase/integrations.jpg" alt="Tus RFID, sensores y ERP en un mapa en vivo" width="100%" />
 
 | | |
 |---|---|

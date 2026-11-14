@@ -22,14 +22,26 @@ Selbst gehostet mit Docker. MIT.
 [Schnellstart](#schnellstart) ·
 [Releases](https://github.com/Siraj-zaki/spatial-map/releases)
 
-<img src="../media/hero.webp" alt="Ein Lager in Spatial Map: Regale, Fächer, Mitarbeiter und Sicherheitsmarker in 3D" width="100%" />
+<a href="../media/spatial-map-overview.mp4"><img src="../media/showcase/platform.jpg" alt="Spatial Map: eine Live-3D-Karte für jedes Gebäude" width="100%" /></a>
 
-<a href="../media/spatial-map-tour.mp4"><img src="../media/tour-poster.jpg" alt="Die 50-Sekunden-Tour ansehen" width="49%" /></a>
-<img src="../media/cad-to-live.webp" alt="Ein CAD-Grundriss wird zu Wänden, Regalen und Fächern, eingefärbt nach Live-Bestand" width="49%" />
-
-▶ [**Die 50-Sekunden-Tour ansehen**](../media/spatial-map-tour.mp4) · vom CAD-Plan zur Live-Lagerkarte
+▶ [**Die 90-Sekunden-Übersicht ansehen**](../media/spatial-map-overview.mp4)
 
 </div>
+
+---
+
+## Galerie
+
+Eine App für jede Art von Gebäude. Jedes Bild ist ein in Spatial Map erstellter Standort: Etagen über dem echten Grundriss gezeichnet, Live-Daten darüber.
+
+| | |
+|---|---|
+| <img src="../media/showcase/warehouse.jpg" alt="" /> **Lager**: Regale, Bestand, Personen und Sicherheit | <img src="../media/showcase/hospital.jpg" alt="" /> **Krankenhäuser**: Betten, Geräte, Personal und Sicherheit |
+| <img src="../media/showcase/inventory.jpg" alt="" /> **Bestand**: jedes Regal, jeder Karton, jedes Tor und jeder Stapler | <img src="../media/showcase/asset-management.jpg" alt="" /> **Anlagenverwaltung**: Tags, Lesegeräte und Anlagen über mehrere Etagen |
+| <img src="../media/showcase/cold-chain.jpg" alt="" /> **Kühlkette**: Zonen, Türen und Temperaturalarme | <img src="../media/showcase/logistics.jpg" alt="" /> **Logistik**: Tore, Hof, Rampen und Paletten |
+| <img src="../media/showcase/supply-chain.jpg" alt="" /> **Fertigung und Lieferkette**: Rampen, Lager, Linien und WIP | <img src="../media/showcase/anti-theft.jpg" alt="" /> **Diebstahlschutz**: RFID-Tags, Schleusen, Kameras und Alarme |
+| <img src="../media/showcase/venue.jpg" alt="" /> **Veranstaltungsorte und Stadien**: Hallen, Eingänge, Schlangen und Ausrüstung | <img src="../media/showcase/museum.jpg" alt="" /> **Museen**: Besucher, Sammlungen und Sicherheit |
+| <img src="../media/showcase/retail.jpg" alt="" /> **Handel und Supermärkte**: Kunden, Regale und Personal | <img src="../media/showcase/navigation.jpg" alt="" /> **Indoor-Navigation**: Schritt für Schritt, über Etagen hinweg |
 
 ---
 
@@ -39,11 +51,13 @@ Selbst gehostet mit Docker. MIT.
 
 | | |
 |---|---|
-| <img src="../media/cad-to-live.webp" alt="Vom CAD-Plan zur Live-Karte" width="420" /> | **Jeden Grundriss importieren**: PDF, DWG (AutoCAD) oder Bild, auf einer echten Karte platziert und per **Kalibrierung** skaliert (eine bekannte Länge messen). Zeichnen Sie Wände, die **sauber an Ecken anschließen**, geneigte Wände, Flächen, Türen, Treppen, Aufzüge und Rolltreppen, **Regale mit Fächern** (gerade oder **entlang eines Pfads**), Marker, Beschriftungen und 3D-Modelle. Das **Messwerkzeug** (`U`), Live-Maße und **eingetippte Längen** (`3.5`, `350cm`, `12'6`) sorgen für CAD-Genauigkeit. |
+| <img src="../media/showcase/museum.jpg" alt="Mehrstöckiges Gebäude über seinen Grundrissen gezeichnet" width="420" /> | **Jeden Grundriss importieren**: PDF, DWG (AutoCAD) oder Bild, auf einer echten Karte platziert und per **Kalibrierung** skaliert (eine bekannte Länge messen). Zeichnen Sie Wände, die **sauber an Ecken anschließen**, geneigte Wände, Flächen, Türen, Treppen, Aufzüge und Rolltreppen, **Regale mit Fächern** (gerade oder **entlang eines Pfads**), Marker, Beschriftungen und 3D-Modelle. Das **Messwerkzeug** (`U`), Live-Maße und **eingetippte Längen** (`3.5`, `350cm`, `12'6`) sorgen für CAD-Genauigkeit. |
 | <img src="../media/multi-floor.webp" alt="Jede Etage maßstabsgetreu" width="420" /> | **Mehrstöckige Gebäude in 3D**: jede Etage in ihrer echten Höhe, Referenzansichten pro Etage, leeres Blatt für Etagen ohne Plan, Massenbearbeitung, Rückgängig/Wiederholen, Tastenkürzel und **Export** als GeoJSON, CSV, XLSX und **3D `.glb`**. |
 | <img src="../media/building-3d.webp" alt="Jedes Gebäude in 3D mit Live-Markern" width="420" /> | **Live-3D-Ansicht und digitaler Zwilling**: jede Etage, jedes Regal, Fach, jede Fläche und jedes 3D-Modell auf einer echten Karte, Live-Daten nach Ihren Regeln eingefärbt. Der **Fokusmodus** blendet nur aus, was das gewählte Element verdeckt. Teilen Sie schreibgeschützte Links. |
 
 ### Live-Daten: RTLS, RFID, BLE, IoT, WMS und ERP
+
+<img src="../media/showcase/integrations.jpg" alt="Ihre RFID-, Sensor- und ERP-Daten auf einer Live-Karte" width="100%" />
 
 | | |
 |---|---|

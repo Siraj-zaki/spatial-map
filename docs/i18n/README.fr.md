@@ -22,14 +22,26 @@ tableaux de bord et rapports. Auto-hébergé avec Docker. MIT.
 [Démarrage rapide](#démarrage-rapide) ·
 [Versions](https://github.com/Siraj-zaki/spatial-map/releases)
 
-<img src="../media/hero.webp" alt="Un entrepôt dans Spatial Map : rayonnages, emplacements, opérateurs et signalisation de sécurité en 3D" width="100%" />
+<a href="../media/spatial-map-overview.mp4"><img src="../media/showcase/platform.jpg" alt="Spatial Map : une carte 3D en direct pour chaque bâtiment" width="100%" /></a>
 
-<a href="../media/spatial-map-tour.mp4"><img src="../media/tour-poster.jpg" alt="Voir la visite de 50 secondes" width="49%" /></a>
-<img src="../media/cad-to-live.webp" alt="Un plan CAO devient murs, rayonnages et emplacements colorés par le stock en direct" width="49%" />
-
-▶ [**Voir la visite de 50 secondes**](../media/spatial-map-tour.mp4) · d’un plan CAO à la carte d’entrepôt en direct
+▶ [**Voir la présentation de 90 secondes**](../media/spatial-map-overview.mp4)
 
 </div>
+
+---
+
+## Vitrine
+
+Une seule application pour tous les types de bâtiments. Chaque image est un site créé dans Spatial Map : étages dessinés sur le vrai plan, données en direct par-dessus.
+
+| | |
+|---|---|
+| <img src="../media/showcase/warehouse.jpg" alt="" /> **Entrepôts** : rayonnages, stock, personnes et sécurité | <img src="../media/showcase/hospital.jpg" alt="" /> **Hôpitaux** : lits, équipements, personnel et sécurité |
+| <img src="../media/showcase/inventory.jpg" alt="" /> **Stocks** : chaque rayonnage, carton, quai et chariot | <img src="../media/showcase/asset-management.jpg" alt="" /> **Gestion des actifs** : étiquettes, lecteurs et actifs sur plusieurs étages |
+| <img src="../media/showcase/cold-chain.jpg" alt="" /> **Chaîne du froid** : zones, portes et alertes de température | <img src="../media/showcase/logistics.jpg" alt="" /> **Logistique** : accès, cour, quais et palettes |
+| <img src="../media/showcase/supply-chain.jpg" alt="" /> **Production et chaîne d’approvisionnement** : quais, magasins, lignes et en-cours | <img src="../media/showcase/anti-theft.jpg" alt="" /> **Antivol** : étiquettes RFID, portiques, caméras et alarmes |
+| <img src="../media/showcase/venue.jpg" alt="" /> **Salles et stades** : halls, accès, files et matériel | <img src="../media/showcase/museum.jpg" alt="" /> **Musées** : visiteurs, collections et sécurité |
+| <img src="../media/showcase/retail.jpg" alt="" /> **Commerce et supermarchés** : clients, rayons et personnel | <img src="../media/showcase/navigation.jpg" alt="" /> **Navigation intérieure** : pas à pas, entre les étages |
 
 ---
 
@@ -39,11 +51,13 @@ tableaux de bord et rapports. Auto-hébergé avec Docker. MIT.
 
 | | |
 |---|---|
-| <img src="../media/cad-to-live.webp" alt="Du plan CAO à la carte en direct" width="420" /> | **Importez n’importe quel plan** : PDF, DWG (AutoCAD) ou image, placé sur une vraie carte et mis à l’échelle par **calibrage** (mesure d’une longueur connue). Dessinez des murs qui **se raccordent proprement aux angles**, des murs inclinés, des zones, portes, escaliers, ascenseurs et escalators, des **rayonnages avec emplacements** (droits ou **le long d’un tracé**), des repères, étiquettes et modèles 3D. L’outil **Mesurer** (`U`), les cotes en direct et les **longueurs saisies** (`3.5`, `350cm`, `12'6`) offrent la précision d’un logiciel de CAO. |
+| <img src="../media/showcase/museum.jpg" alt="Bâtiment multi-étages dessiné sur ses plans" width="420" /> | **Importez n’importe quel plan** : PDF, DWG (AutoCAD) ou image, placé sur une vraie carte et mis à l’échelle par **calibrage** (mesure d’une longueur connue). Dessinez des murs qui **se raccordent proprement aux angles**, des murs inclinés, des zones, portes, escaliers, ascenseurs et escalators, des **rayonnages avec emplacements** (droits ou **le long d’un tracé**), des repères, étiquettes et modèles 3D. L’outil **Mesurer** (`U`), les cotes en direct et les **longueurs saisies** (`3.5`, `350cm`, `12'6`) offrent la précision d’un logiciel de CAO. |
 | <img src="../media/multi-floor.webp" alt="Chaque étage à l’échelle" width="420" /> | **Bâtiments multi-étages en 3D** : chaque étage à sa hauteur réelle, vues de référence par étage, feuille vierge pour les étages sans plan, modification en masse, annuler/rétablir, raccourcis clavier et **export** GeoJSON, CSV, XLSX et **3D `.glb`**. |
 | <img src="../media/building-3d.webp" alt="N’importe quel bâtiment en 3D avec repères en direct" width="420" /> | **Visionneuse 3D en direct et jumeau numérique** : chaque étage, rayonnage, emplacement, zone et modèle 3D sur une vraie carte, avec des données en direct colorées selon vos règles. Le **mode focus** n’estompe que ce qui masque l’élément choisi. Partagez des liens en lecture seule. |
 
 ### Données en direct : RTLS, RFID, BLE, IoT, WMS et ERP
+
+<img src="../media/showcase/integrations.jpg" alt="Vos RFID, capteurs et ERP sur une carte en direct" width="100%" />
 
 | | |
 |---|---|
