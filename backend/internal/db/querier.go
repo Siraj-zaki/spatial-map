@@ -11,12 +11,16 @@ import (
 )
 
 type Querier interface {
+	AcknowledgeAlert(ctx context.Context, arg AcknowledgeAlertParams) (AlertEvent, error)
 	AddSolutionDataSources(ctx context.Context, arg AddSolutionDataSourcesParams) error
 	AddSolutionReports(ctx context.Context, arg AddSolutionReportsParams) error
 	// Adds take a list of ids and keep only the ones this tenant owns, so an
 	// id from another workspace is silently ignored. Re-adding is a no-op.
 	AddSolutionZones(ctx context.Context, arg AddSolutionZonesParams) error
-	AddUserTenant(ctx context.Context, arg AddUserTenantParams) (UserTenant, error)
+	AddUserTenant(ctx context.Context, arg AddUserTenantParams) (AddUserTenantRow, error)
+	// The bell: active alerts, active critical ones, and the caller's unread
+	// (active, for them, opened since they last opened the bell).
+	AlertSummaryForUser(ctx context.Context, arg AlertSummaryForUserParams) (AlertSummaryForUserRow, error)
 	// ============================================================ history
 	// Groups events on `data_source_row_events` into fixed time buckets +
 	// operation (insert / update / delete). Powers the History widget's
@@ -79,6 +83,7 @@ type Querier interface {
 	// given user_models row (asset id is the JSON string `user_<id>`).
 	// Used to gate destructive deletes of a shared catalog entry.
 	CountModelPlacementsForUserModel(ctx context.Context, arg CountModelPlacementsForUserModelParams) (int64, error)
+	CountRoleMembers(ctx context.Context, customRoleID pgtype.Int8) (int64, error)
 	// Tenants that still own the object. Physical deletion from the Files
 	// screen waits until this is zero, so one workspace freeing a shared
 	// upload never removes it from another.
@@ -94,6 +99,7 @@ type Querier interface {
 	CountUserModelsByURL(ctx context.Context, arg CountUserModelsByURLParams) (int64, error)
 	CreateAIJob(ctx context.Context, arg CreateAIJobParams) (CreateAIJobRow, error)
 	CreateAlert(ctx context.Context, arg CreateAlertParams) (Alert, error)
+	CreateAlertRule(ctx context.Context, arg CreateAlertRuleParams) (AlertRule, error)
 	CreateAttributeDefinition(ctx context.Context, arg CreateAttributeDefinitionParams) (CreateAttributeDefinitionRow, error)
 	CreateAuditLogEntry(ctx context.Context, arg CreateAuditLogEntryParams) (AuditLog, error)
 	CreateBin(ctx context.Context, arg CreateBinParams) (Bin, error)
@@ -151,6 +157,7 @@ type Querier interface {
 	// A public link to one report. zone_id is the report's facility (NULL for
 	// a workspace-wide report) — kept for the audit trail and the cascade.
 	CreateReportShareLink(ctx context.Context, arg CreateReportShareLinkParams) (ShareLink, error)
+	CreateRole(ctx context.Context, arg CreateRoleParams) (int64, error)
 	CreateRoute(ctx context.Context, arg CreateRouteParams) (Route, error)
 	CreateShareLink(ctx context.Context, arg CreateShareLinkParams) (ShareLink, error)
 	CreateSolution(ctx context.Context, arg CreateSolutionParams) (Solution, error)
@@ -186,6 +193,7 @@ type Querier interface {
 	CreateUserModel(ctx context.Context, arg CreateUserModelParams) (UserModel, error)
 	CreateZone(ctx context.Context, arg CreateZoneParams) (CreateZoneRow, error)
 	DeleteAlert(ctx context.Context, arg DeleteAlertParams) error
+	DeleteAlertRule(ctx context.Context, arg DeleteAlertRuleParams) error
 	// Used before a full "replace ACL" write from the builder.
 	DeleteAllReportPermissions(ctx context.Context, reportID int64) error
 	DeleteAppSetting(ctx context.Context, key string) error
@@ -226,6 +234,7 @@ type Querier interface {
 	// to owner role at the handler layer.
 	DeleteReport(ctx context.Context, arg DeleteReportParams) error
 	DeleteReportPermission(ctx context.Context, arg DeleteReportPermissionParams) error
+	DeleteRole(ctx context.Context, id int64) error
 	DeleteRoute(ctx context.Context, arg DeleteRouteParams) error
 	// Hard-delete for the "purge from history" flow. Only exposed to owners.
 	DeleteShareLink(ctx context.Context, arg DeleteShareLinkParams) error
@@ -260,6 +269,7 @@ type Querier interface {
 	FailAIJob(ctx context.Context, arg FailAIJobParams) error
 	GetAIJob(ctx context.Context, arg GetAIJobParams) (GetAIJobRow, error)
 	GetAlert(ctx context.Context, arg GetAlertParams) (Alert, error)
+	GetAlertRule(ctx context.Context, arg GetAlertRuleParams) (AlertRule, error)
 	GetAppSetting(ctx context.Context, key string) (AppSetting, error)
 	GetAttributeDefinition(ctx context.Context, arg GetAttributeDefinitionParams) (GetAttributeDefinitionRow, error)
 	GetBin(ctx context.Context, arg GetBinParams) (Bin, error)
@@ -285,6 +295,10 @@ type Querier interface {
 	GetLatestActiveOTP(ctx context.Context, arg GetLatestActiveOTPParams) (OtpCode, error)
 	GetLine(ctx context.Context, arg GetLineParams) (Line, error)
 	GetMarker(ctx context.Context, arg GetMarkerParams) (Marker, error)
+	// Custom roles (migration 0051). A role belongs to one workspace.
+	// What TenantMiddleware needs per request: the member's role and, when a
+	// custom role is assigned, its name and permissions.
+	GetMemberAccess(ctx context.Context, arg GetMemberAccessParams) (GetMemberAccessRow, error)
 	GetModel(ctx context.Context, arg GetModelParams) (Model, error)
 	GetPolygon(ctx context.Context, arg GetPolygonParams) (Polygon, error)
 	GetReport(ctx context.Context, arg GetReportParams) (Report, error)
@@ -298,6 +312,8 @@ type Querier interface {
 	// the last view keeps working (view_count <= max_views); revoking or
 	// expiry stop it at once.
 	GetReportShareLinkForData(ctx context.Context, token string) (ShareLink, error)
+	// One role, only when it belongs to this workspace.
+	GetRoleForTenant(ctx context.Context, arg GetRoleForTenantParams) (GetRoleForTenantRow, error)
 	GetRoute(ctx context.Context, arg GetRouteParams) (Route, error)
 	// Tenant-scoped read for the editor UI. Returns even revoked rows so the
 	// dashboard's Manage-Links table can render a "Revoked" badge and expose
@@ -341,13 +357,17 @@ type Querier interface {
 	// authenticated request, so it touches only the primary-key index.
 	GetUserPasswordChangedAt(ctx context.Context, id int64) (pgtype.Timestamptz, error)
 	// Used by middleware to verify a user has access to the requested tenant.
-	GetUserTenantMembership(ctx context.Context, arg GetUserTenantMembershipParams) (UserTenant, error)
+	GetUserTenantMembership(ctx context.Context, arg GetUserTenantMembershipParams) (GetUserTenantMembershipRow, error)
 	GetZone(ctx context.Context, arg GetZoneParams) (GetZoneRow, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	GetZoneByID(ctx context.Context, id int64) (GetZoneByIDRow, error)
 	// Public read by share token. Used by /api/v1/public/warehouses/by-token/:token.
 	// The handler is responsible for the is_public check (returns 404 when false).
 	GetZoneByShareToken(ctx context.Context, shareToken pgtype.Text) (GetZoneByShareTokenRow, error)
+	// True when an account already uses the Gmail inbox `identity` — the local
+	// part without dots or a +suffix (handlers/signup_guard.go gmailIdentity):
+	// le.d.ao.0.0.8@gmail.com and ledao008+x@googlemail.com are the same inbox.
+	GmailInboxHasUser(ctx context.Context, identity string) (bool, error)
 	// View access to every report of a workspace, for a member who joins the
 	// demo workspace (handlers/auth.go): editors don't see a report without
 	// a grant, and the demo's reports are the point of joining it.
@@ -384,6 +404,14 @@ type Querier interface {
 	// so we can disable the button + re-attach the SSE stream instead of
 	// kicking off a duplicate job.
 	LatestAIJobForImage(ctx context.Context, arg LatestAIJobForImageParams) (LatestAIJobForImageRow, error)
+	// The Alerts page. `status`: 'active' (open + acknowledged), 'resolved', or
+	// '' for every alert. `for_me` = the caller is one of the rule's recipients
+	// (a rule without recipients notifies everyone).
+	ListAlertEvents(ctx context.Context, arg ListAlertEventsParams) ([]ListAlertEventsRow, error)
+	// Alert rules + alerts (migration 0048). The engine's set-based evaluation
+	// lives in handlers/alert_engine.go (dynamic SQL over data_source_rows);
+	// these are the CRUD and listing queries.
+	ListAlertRules(ctx context.Context, arg ListAlertRulesParams) ([]AlertRule, error)
 	ListAlerts(ctx context.Context, tenantID int64) ([]Alert, error)
 	ListAppSettings(ctx context.Context) ([]AppSetting, error)
 	// Returns rows visible to the calling warehouse: tenant-shared
@@ -446,6 +474,8 @@ type Querier interface {
 	ListDoors(ctx context.Context, tenantID int64) ([]Door, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	ListDoorsByZone(ctx context.Context, zoneID pgtype.Int8) ([]Door, error)
+	// Every tenant's enabled rules, for the engine.
+	ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error)
 	// Windowed lookup for heatmap + track render modes. `since_ts` is the
 	// lower bound; pass e.g. `now() - interval '30 seconds'` from the
 	// handler.
@@ -571,6 +601,7 @@ type Querier interface {
 	ListReportsForTenantByZone(ctx context.Context, arg ListReportsForTenantByZoneParams) ([]Report, error)
 	// Admin variant — includes archived. Not exposed to non-admins.
 	ListReportsForTenantWithArchived(ctx context.Context, tenantID int64) ([]Report, error)
+	ListRolesForTenant(ctx context.Context, tenantID int64) ([]ListRolesForTenantRow, error)
 	ListRoutes(ctx context.Context, tenantID int64) ([]Route, error)
 	// Public read (no tenant scope) for the shareable presentation view.
 	ListRoutesByZone(ctx context.Context, zoneID pgtype.Int8) ([]Route, error)
@@ -611,6 +642,7 @@ type Querier interface {
 	ListTenantFiles(ctx context.Context, tenantID int64) ([]ListTenantFilesRow, error)
 	// For the admin invite/manage screen: who else has access to this tenant.
 	ListTenantMembers(ctx context.Context, tenantID int64) ([]ListTenantMembersRow, error)
+	ListTenantMembersWithRoles(ctx context.Context, tenantID int64) ([]ListTenantMembersWithRolesRow, error)
 	// Basic tenant CRUD used by the /tenants admin endpoint and the bootstrap
 	// flow. Self-hosted Spatial Map has no plans, trials or quotas, so a tenant
 	// is just (id, name, color).
@@ -640,6 +672,7 @@ type Querier interface {
 	ListUserTenants(ctx context.Context, userID int64) ([]ListUserTenantsRow, error)
 	ListZones(ctx context.Context, tenantID int64) ([]ListZonesRow, error)
 	MarkAIJobRunning(ctx context.Context, id int64) error
+	MarkAlertsSeen(ctx context.Context, arg MarkAlertsSeenParams) error
 	MarkOTPUsed(ctx context.Context, id int64) error
 	// Called from the complete-signup handler after OTP verification succeeds
 	// and the password is set. Also stamped by the bootstrap admin path.
@@ -661,6 +694,9 @@ type Querier interface {
 	RemoveSolutionReports(ctx context.Context, arg RemoveSolutionReportsParams) error
 	RemoveSolutionZones(ctx context.Context, arg RemoveSolutionZonesParams) error
 	RemoveUserTenant(ctx context.Context, arg RemoveUserTenantParams) error
+	ResolveAlert(ctx context.Context, arg ResolveAlertParams) (AlertEvent, error)
+	// Close a rule's active alerts (rule edited, disabled or source changed).
+	ResolveAlertsForRule(ctx context.Context, ruleID int64) error
 	// Soft-delete. The row stays for audit; the public endpoint returns 404
 	// because GetShareLinkByToken filters on `revoked_at IS NULL`. Idempotent:
 	// running twice does not clobber the original revoker/timestamp because
@@ -678,6 +714,12 @@ type Querier interface {
 	// Persist the ai-worker's Dramatiq task id on the job row so the
 	// polling goroutine can resume across API restarts.
 	SetAIJobWorkerTaskID(ctx context.Context, arg SetAIJobWorkerTaskIDParams) error
+	SetAlertRuleEvaluated(ctx context.Context, arg SetAlertRuleEvaluatedParams) error
+	// Keeps every member's base role in step after a custom role is edited.
+	SetMemberBaseRoleForRole(ctx context.Context, arg SetMemberBaseRoleForRoleParams) error
+	// Assigns a built-in role (custom_role_id NULL) or a custom role (role =
+	// its base role).
+	SetMemberRole(ctx context.Context, arg SetMemberRoleParams) error
 	// Soft-delete / restore. History rows stay intact.
 	SetReportArchived(ctx context.Context, arg SetReportArchivedParams) error
 	SoftDeleteConnection(ctx context.Context, arg SoftDeleteConnectionParams) error
@@ -710,6 +752,9 @@ type Querier interface {
 	// job. Mirrors `TrimDataSourceRowEventsBefore` / `TrimEntityEventsBefore`.
 	TrimReportRunsBefore(ctx context.Context, arg TrimReportRunsBeforeParams) error
 	UpdateAlert(ctx context.Context, arg UpdateAlertParams) (Alert, error)
+	// Full replace of the editable fields. Changing the source or kind of a rule
+	// makes its open alerts meaningless — the handler resolves them.
+	UpdateAlertRule(ctx context.Context, arg UpdateAlertRuleParams) (AlertRule, error)
 	UpdateAttributeDefinition(ctx context.Context, arg UpdateAttributeDefinitionParams) (UpdateAttributeDefinitionRow, error)
 	UpdateBin(ctx context.Context, arg UpdateBinParams) (Bin, error)
 	UpdateCircle(ctx context.Context, arg UpdateCircleParams) (Circle, error)
@@ -737,6 +782,7 @@ type Querier interface {
 	// above this. `updated_at` is bumped explicitly so the directory sort
 	// ("recently updated") tracks meaningful changes, not silent DB writes.
 	UpdateReport(ctx context.Context, arg UpdateReportParams) (Report, error)
+	UpdateRole(ctx context.Context, arg UpdateRoleParams) error
 	UpdateRoute(ctx context.Context, arg UpdateRouteParams) (Route, error)
 	// Sparse update for the "edit link" flow. All settings/expiry/label/max_views
 	// can be re-set from the dialog; the token, tenant_id, zone_id, view_count,

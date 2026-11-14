@@ -138,6 +138,11 @@ type AuthConfig struct {
 	// to disable. Idempotent: existing users are not touched.
 	BootstrapEmail    string `koanf:"bootstrap_email"`
 	BootstrapPassword string `koanf:"bootstrap_password"`
+	// SignupGuard turns on the sign-up abuse guards (handlers/signup_guard.go):
+	// one account per Gmail inbox, no throwaway inboxes, at most 3 new
+	// accounts per network per day. Off by default; turn it on when public
+	// sign-up is open to the internet. Env: SGV_AUTH.SIGNUP_GUARD=true.
+	SignupGuard bool `koanf:"signup_guard"`
 }
 
 // MailConfig describes outbound-email delivery for OTP / notifications.

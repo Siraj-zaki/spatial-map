@@ -22,6 +22,8 @@ import ProfilePage from '@/routes/profile'
 import ReportBuilderPage from '@/routes/report-builder'
 import ReportDetailPage from '@/routes/report-detail'
 import ReportsPage from '@/routes/reports'
+import AlertsPage from '@/routes/alerts'
+import RolesPage from '@/routes/roles'
 import SharedReportPage from '@/routes/shared-report'
 import SignupPage from '@/routes/signup'
 import SolutionPage from '@/routes/solution'
@@ -155,6 +157,8 @@ function AppContent() {
               <Route path="/data" element={<DataPage />} />
               <Route path="/solutions/:id" element={<SolutionPage />} />
               <Route path="/reports" element={<ReportsPage />} />
+              <Route path="/alerts" element={<AlertsPage />} />
+              <Route path="/roles" element={<RolesPage />} />
               <Route path="/reports/new" element={<ReportBuilderPage />} />
               <Route path="/reports/:id" element={<ReportDetailPage />} />
               <Route path="/reports/:id/edit" element={<ReportBuilderPage />} />

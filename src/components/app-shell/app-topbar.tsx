@@ -18,6 +18,7 @@ import { activeNavItem } from './nav-items'
 import { useSolutionLocation } from './sidebar-solutions'
 import { SolutionIcon } from '@/components/solutions/solution-identity'
 import { solutionPath, useSolutions } from '@/lib/solutions-client'
+import { AlertsBell } from '@/components/alerts/alerts-bell'
 
 const isMac = typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.platform)
 
@@ -94,6 +95,7 @@ export function AppTopbar({
       </nav>
 
       <div className="ms-auto flex items-center gap-1.5">
+        <AlertsBell />
         <Button
           variant="outline"
           size="sm"

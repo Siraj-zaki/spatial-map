@@ -122,6 +122,24 @@ func (q *Queries) GetUserPasswordChangedAt(ctx context.Context, id int64) (pgtyp
 	return password_changed_at, err
 }
 
+const gmailInboxHasUser = `-- name: GmailInboxHasUser :one
+SELECT EXISTS (
+  SELECT 1 FROM users
+  WHERE split_part(lower(email), '@', 2) IN ('gmail.com', 'googlemail.com')
+    AND replace(split_part(split_part(lower(email), '@', 1), '+', 1), '.', '') = $1::text
+)::boolean
+`
+
+// True when an account already uses the Gmail inbox `identity` — the local
+// part without dots or a +suffix (handlers/signup_guard.go gmailIdentity):
+// le.d.ao.0.0.8@gmail.com and ledao008+x@googlemail.com are the same inbox.
+func (q *Queries) GmailInboxHasUser(ctx context.Context, identity string) (bool, error) {
+	row := q.db.QueryRow(ctx, gmailInboxHasUser, identity)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const markUserVerified = `-- name: MarkUserVerified :exec
 UPDATE users SET verified_at = now(), updated_at = now()
 WHERE id = $1 AND verified_at IS NULL

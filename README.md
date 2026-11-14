@@ -139,6 +139,7 @@ All settings for `docker compose` go in `.env` — every option is documented in
 | `SPATIAL_MAP_SMTP_*` | SMTP for sign-up and password-reset codes |
 | `SPATIAL_MAP_PORT` | Port the app is served on (default `3000`) |
 | `SPATIAL_MAP_DEMO` | Load the demo workspace into an empty database (default `true`) |
+| `SPATIAL_MAP_SIGNUP_GUARD` | Sign-up abuse guards for a server open to the internet: one account per Gmail inbox, no throwaway inboxes, at most 3 new accounts per network per day (default `false`) |
 
 Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik) in front of port
 3000 for anything public. The API reads `SGV_*` settings as well

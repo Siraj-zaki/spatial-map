@@ -132,7 +132,7 @@ func TenantMiddleware(q *db.Queries) func(http.Handler) http.Handler {
 			}
 			ctx := r.Context()
 			if userID := UserID(ctx); userID != 0 {
-				m, err := q.GetUserTenantMembership(ctx, db.GetUserTenantMembershipParams{
+				m, err := q.GetMemberAccess(ctx, db.GetMemberAccessParams{
 					UserID:   userID,
 					TenantID: tenantID,
 				})
@@ -144,8 +144,15 @@ func TenantMiddleware(q *db.Queries) func(http.Handler) http.Handler {
 					InternalError(w, r, err)
 					return
 				}
-				// The member's role decides their permissions (permissions.go).
+				// The member's role decides their permissions (permissions.go);
+				// a custom role's permissions replace the built-in role's.
 				ctx = context.WithValue(ctx, tenantRoleKey{}, m.Role)
+				perms := BuiltinPermissions(m.Role)
+				if m.CustomRoleID.Valid {
+					perms = m.CustomPermissions
+					ctx = context.WithValue(ctx, tenantRoleNameKey{}, m.CustomRoleName)
+				}
+				ctx = context.WithValue(ctx, tenantPermsKey{}, perms)
 			}
 			ctx = context.WithValue(ctx, tenantKey{}, tenantID)
 			next.ServeHTTP(w, r.WithContext(ctx))

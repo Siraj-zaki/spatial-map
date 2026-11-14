@@ -68,3 +68,13 @@ SET avatar_url = $2,
 WHERE id = $1
 RETURNING id, email, password_hash, created_at, updated_at, last_login_at,
           display_name, bio, location, pronouns, job_title, avatar_url, verified_at, password_changed_at;
+
+-- name: GmailInboxHasUser :one
+-- True when an account already uses the Gmail inbox `identity` — the local
+-- part without dots or a +suffix (handlers/signup_guard.go gmailIdentity):
+-- le.d.ao.0.0.8@gmail.com and ledao008+x@googlemail.com are the same inbox.
+SELECT EXISTS (
+  SELECT 1 FROM users
+  WHERE split_part(lower(email), '@', 2) IN ('gmail.com', 'googlemail.com')
+    AND replace(split_part(split_part(lower(email), '@', 1), '+', 1), '.', '') = sqlc.arg(identity)::text
+)::boolean;

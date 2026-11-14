@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -73,6 +74,26 @@ func requireMembershipOn(w http.ResponseWriter, r *http.Request, q *db.Queries, 
 		return "", false
 	}
 	return m.Role, true
+}
+
+// requirePermissionOn is api.RequirePermission for a workspace named in the
+// path (the /tenants routes run outside TenantMiddleware): the caller's
+// built-in or custom role on tenantID must hold perm.
+func requirePermissionOn(w http.ResponseWriter, r *http.Request, q *db.Queries, tenantID int64, perm string) bool {
+	m, err := q.GetMemberAccess(r.Context(), db.GetMemberAccessParams{UserID: api.UserID(r.Context()), TenantID: tenantID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			api.Error(w, http.StatusForbidden, "not a member of this workspace")
+			return false
+		}
+		api.InternalError(w, r, err)
+		return false
+	}
+	if slices.Contains(authTenantPermissions(m.Role, m.CustomRoleID, m.CustomPermissions), perm) {
+		return true
+	}
+	api.ErrorCode(w, http.StatusForbidden, api.CodePermissionDenied, "your role doesn't allow this")
+	return false
 }
 
 // requireRoleOn is the role-restricted variant of requireMembershipOn.
@@ -249,7 +270,7 @@ func updateTenant(q *db.Queries) http.HandlerFunc {
 		var role string
 		if userID != 0 {
 			var ok bool
-			if !requireRoleOn(w, r, q, id, RoleOwner, RoleAdmin) {
+			if !requirePermissionOn(w, r, q, id, api.PermWorkspaceManage) {
 				return
 			}
 			// Re-fetch the caller's role so we can build the response with

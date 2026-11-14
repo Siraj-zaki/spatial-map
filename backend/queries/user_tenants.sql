@@ -7,9 +7,13 @@ RETURNING user_id, tenant_id, role, created_at;
 -- name: ListUserTenants :many
 -- Returns every tenant a user is a member of, with role and tenant metadata.
 SELECT ut.user_id, ut.tenant_id, ut.role, ut.created_at,
-       t.name AS tenant_name, t.color AS tenant_color
+       t.name AS tenant_name, t.color AS tenant_color,
+       ut.custom_role_id,
+       coalesce(r.name, '')::text AS custom_role_name,
+       coalesce(r.permissions, '{}'::text[])::text[] AS custom_permissions
 FROM user_tenants ut
 JOIN tenants t ON t.id = ut.tenant_id
+LEFT JOIN roles r ON r.id = ut.custom_role_id
 WHERE ut.user_id = $1
 ORDER BY ut.created_at ASC;
 

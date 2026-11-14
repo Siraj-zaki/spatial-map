@@ -24,9 +24,16 @@ type AddUserTenantParams struct {
 	Role     string `json:"role"`
 }
 
-func (q *Queries) AddUserTenant(ctx context.Context, arg AddUserTenantParams) (UserTenant, error) {
+type AddUserTenantRow struct {
+	UserID    int64              `json:"user_id"`
+	TenantID  int64              `json:"tenant_id"`
+	Role      string             `json:"role"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) AddUserTenant(ctx context.Context, arg AddUserTenantParams) (AddUserTenantRow, error) {
 	row := q.db.QueryRow(ctx, addUserTenant, arg.UserID, arg.TenantID, arg.Role)
-	var i UserTenant
+	var i AddUserTenantRow
 	err := row.Scan(
 		&i.UserID,
 		&i.TenantID,
@@ -47,10 +54,17 @@ type GetUserTenantMembershipParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
+type GetUserTenantMembershipRow struct {
+	UserID    int64              `json:"user_id"`
+	TenantID  int64              `json:"tenant_id"`
+	Role      string             `json:"role"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 // Used by middleware to verify a user has access to the requested tenant.
-func (q *Queries) GetUserTenantMembership(ctx context.Context, arg GetUserTenantMembershipParams) (UserTenant, error) {
+func (q *Queries) GetUserTenantMembership(ctx context.Context, arg GetUserTenantMembershipParams) (GetUserTenantMembershipRow, error) {
 	row := q.db.QueryRow(ctx, getUserTenantMembership, arg.UserID, arg.TenantID)
-	var i UserTenant
+	var i GetUserTenantMembershipRow
 	err := row.Scan(
 		&i.UserID,
 		&i.TenantID,
@@ -106,20 +120,27 @@ func (q *Queries) ListTenantMembers(ctx context.Context, tenantID int64) ([]List
 
 const listUserTenants = `-- name: ListUserTenants :many
 SELECT ut.user_id, ut.tenant_id, ut.role, ut.created_at,
-       t.name AS tenant_name, t.color AS tenant_color
+       t.name AS tenant_name, t.color AS tenant_color,
+       ut.custom_role_id,
+       coalesce(r.name, '')::text AS custom_role_name,
+       coalesce(r.permissions, '{}'::text[])::text[] AS custom_permissions
 FROM user_tenants ut
 JOIN tenants t ON t.id = ut.tenant_id
+LEFT JOIN roles r ON r.id = ut.custom_role_id
 WHERE ut.user_id = $1
 ORDER BY ut.created_at ASC
 `
 
 type ListUserTenantsRow struct {
-	UserID      int64              `json:"user_id"`
-	TenantID    int64              `json:"tenant_id"`
-	Role        string             `json:"role"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	TenantName  string             `json:"tenant_name"`
-	TenantColor string             `json:"tenant_color"`
+	UserID            int64              `json:"user_id"`
+	TenantID          int64              `json:"tenant_id"`
+	Role              string             `json:"role"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	TenantName        string             `json:"tenant_name"`
+	TenantColor       string             `json:"tenant_color"`
+	CustomRoleID      pgtype.Int8        `json:"custom_role_id"`
+	CustomRoleName    string             `json:"custom_role_name"`
+	CustomPermissions []string           `json:"custom_permissions"`
 }
 
 // Returns every tenant a user is a member of, with role and tenant metadata.
@@ -139,6 +160,9 @@ func (q *Queries) ListUserTenants(ctx context.Context, userID int64) ([]ListUser
 			&i.CreatedAt,
 			&i.TenantName,
 			&i.TenantColor,
+			&i.CustomRoleID,
+			&i.CustomRoleName,
+			&i.CustomPermissions,
 		); err != nil {
 			return nil, err
 		}

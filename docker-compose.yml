@@ -62,6 +62,9 @@ services:
       SGV_AUTH.API_KEY: ${SPATIAL_MAP_API_KEY:-}
       SGV_AUTH.BOOTSTRAP_EMAIL: ${SPATIAL_MAP_ADMIN_EMAIL:-}
       SGV_AUTH.BOOTSTRAP_PASSWORD: ${SPATIAL_MAP_ADMIN_PASSWORD:-}
+      # Sign-up abuse guards: one account per Gmail inbox, no throwaway
+      # inboxes, at most 3 new accounts per network per day.
+      SGV_AUTH.SIGNUP_GUARD: ${SPATIAL_MAP_SIGNUP_GUARD:-false}
       # Used for links in auth emails.
       SGV_APP.PUBLIC_URL: ${SPATIAL_MAP_PUBLIC_URL:-http://localhost:3000}
       SGV_MIGRATION.ON_START: "true"

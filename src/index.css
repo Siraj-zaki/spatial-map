@@ -803,6 +803,77 @@
   pointer-events: none !important;
 }
 
+/* Welcome host (welcome-dialog.tsx). Skin/hair/ink are illustration
+ * colours — the same in every palette and theme; her top, the backdrop and
+ * sparkles use --primary so she matches the workspace palette.
+ *   .sgv-host         — rises in with a little bounce
+ *   .sgv-host-arm     — waves three times
+ *   .sgv-host-eyes    — blinks a few times
+ *   .sgv-host-spark   — sparkles twinkle in
+ *   .sgv-host-bubble  — the "Hi!" bubble pops; its 👋 waves */
+:root {
+  --sgv-host-skin: hsl(24 78% 82%);
+  --sgv-host-skin-shade: hsl(20 60% 72%);
+  --sgv-host-hair: hsl(275 28% 22%);
+  --sgv-host-ink: hsl(255 20% 18%);
+  --sgv-host-blush: hsl(350 85% 72%);
+  --sgv-host-mouth: hsl(350 55% 45%);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sgv-host {
+    animation: sgv-host-in 620ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    transform-origin: 50% 100%;
+  }
+  .sgv-host-arm {
+    animation: sgv-host-wave 1100ms ease-in-out 600ms 3 both;
+  }
+  .sgv-host-eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: sgv-host-blink 3600ms ease-in-out 1200ms 4;
+  }
+  .sgv-host-spark {
+    animation: sgv-host-spark 1400ms ease-in-out both 3;
+    animation-delay: calc(var(--sgv-i, 0) * 260ms + 400ms);
+  }
+  .sgv-host-bubble {
+    animation: sgv-msg-pop 520ms cubic-bezier(0.34, 1.56, 0.64, 1) 420ms both;
+    transform-origin: bottom left;
+  }
+  [dir='rtl'] .sgv-host-bubble {
+    transform-origin: bottom right;
+  }
+  .sgv-host-wave-emoji {
+    animation: sgv-host-wave 1100ms ease-in-out 900ms 2 both;
+    transform-origin: 70% 80%;
+  }
+}
+@keyframes sgv-host-in {
+  from { opacity: 0; transform: translateY(28px) scale(0.85); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sgv-host-wave {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(18deg); }
+  40% { transform: rotate(-10deg); }
+  60% { transform: rotate(16deg); }
+  80% { transform: rotate(-6deg); }
+}
+@keyframes sgv-host-blink {
+  0%, 92%, 100% { transform: none; }
+  95% { transform: scaleY(0.1); }
+}
+@keyframes sgv-host-spark {
+  0%, 100% { opacity: 0.35; transform: scale(0.6) rotate(0deg); }
+  50% { opacity: 1; transform: scale(1.15) rotate(45deg); }
+}
+/* The "Hi!" bubble's pop. */
+@keyframes sgv-msg-pop {
+  0% { opacity: 0; transform: translateY(14px) scale(0.55); filter: blur(6px); }
+  55% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: none; filter: none; }
+}
+
 /* ====================================================================
    Focus mode (src/lib/focus/, map-marker-overlay.tsx, map-focus-overlay.tsx)
    --------------------------------------------------------------------

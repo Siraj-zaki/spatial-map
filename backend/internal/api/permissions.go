@@ -10,7 +10,8 @@ import (
 // Workspace permissions. A role is a list of permissions; reading is never
 // a permission (every member sees the workspace's facilities and data) — a
 // permission allows a kind of change. The four built-in roles map to the
-// lists below; the SPA mirrors them in src/lib/permissions.ts.
+// lists below (the SPA mirrors them in src/lib/permissions.ts); a custom
+// role (handlers/roles.go) is any list of AssignablePermissions.
 const (
 	PermFacilitiesEdit   = "facilities.edit"   // layout editor: shapes, floors, models, imports
 	PermFacilitiesManage = "facilities.manage" // create / duplicate / delete facilities
@@ -25,12 +26,28 @@ const (
 	PermAIMap            = "ai.map"            // AI Map on floor plans
 	PermFilesManage      = "files.manage"      // the Files page: delete stored files
 	PermMembersManage    = "members.manage"    // add people, change roles, remove
-	PermRolesManage      = "roles.manage"      // reserved for custom roles
+	PermRolesManage      = "roles.manage"      // create / edit custom roles
 	PermWorkspaceManage  = "workspace.manage"  // rename the workspace
 
 	// PermWorkspaceOwn is the owner's alone: delete the workspace.
 	PermWorkspaceOwn = "workspace.own"
 )
+
+// AssignablePermissions is every permission a custom role may hold, in
+// display order (everything but owning the workspace).
+var AssignablePermissions = adminPermissions
+
+// IsAssignablePermission reports whether p can be part of a custom role.
+func IsAssignablePermission(p string) bool { return slices.Contains(AssignablePermissions, p) }
+
+// BaseRoleFor is the built-in role stored next to a custom role: 'editor'
+// when it allows any change, else 'viewer'.
+func BaseRoleFor(perms []string) string {
+	if len(perms) > 0 {
+		return "editor"
+	}
+	return "viewer"
+}
 
 // adminPermissions is everything but owning the workspace.
 var adminPermissions = []string{
@@ -64,10 +81,22 @@ func BuiltinPermissions(role string) []string {
 // current tenant. Set by TenantMiddleware.
 type tenantRoleKey struct{}
 
+// tenantPermsKey / tenantRoleNameKey hold a custom role's permissions and
+// name. Set by TenantMiddleware.
+type tenantPermsKey struct{}
+type tenantRoleNameKey struct{}
+
 // TenantRole returns the signed-in caller's role on the current tenant
-// ("owner" / "admin" / "editor" / "viewer"), or "" for an API-key caller.
+// ("owner" / "admin" / "editor" / "viewer" — a custom role's base role), or
+// "" for an API-key caller.
 func TenantRole(ctx context.Context) string {
 	v, _ := ctx.Value(tenantRoleKey{}).(string)
+	return v
+}
+
+// TenantRoleName is the custom role's name, or "" for a built-in role.
+func TenantRoleName(ctx context.Context) string {
+	v, _ := ctx.Value(tenantRoleNameKey{}).(string)
 	return v
 }
 
@@ -77,6 +106,9 @@ var allPermissions = append(slices.Clone(adminPermissions), PermWorkspaceOwn)
 
 // Permissions returns the caller's permissions on the current workspace.
 func Permissions(ctx context.Context) []string {
+	if v, ok := ctx.Value(tenantPermsKey{}).([]string); ok {
+		return v
+	}
 	if role := TenantRole(ctx); role != "" {
 		return BuiltinPermissions(role)
 	}
@@ -89,6 +121,18 @@ func Permissions(ctx context.Context) []string {
 // HasPermission reports whether the caller may do p on the current workspace.
 func HasPermission(ctx context.Context, p string) bool {
 	return slices.Contains(Permissions(ctx), p)
+}
+
+// HasAllPermissions reports whether the caller holds every one of ps (used
+// so nobody can grant or assign more than they have themselves).
+func HasAllPermissions(ctx context.Context, ps []string) bool {
+	have := Permissions(ctx)
+	for _, p := range ps {
+		if !slices.Contains(have, p) {
+			return false
+		}
+	}
+	return true
 }
 
 // RequirePermission writes a 403 and returns false when the caller lacks p.
@@ -110,6 +154,7 @@ const CodePermissionDenied = "permission_denied"
 // finer rules) still need the area permission here.
 var writeAreas = map[string]string{
 	"members": PermMembersManage,
+	"roles":   PermRolesManage,
 	"data":    PermDataManage,
 	"zones":   PermFacilitiesEdit, "grids": PermFacilitiesEdit, "bins": PermFacilitiesEdit,
 	"polygons": PermFacilitiesEdit, "circles": PermFacilitiesEdit, "lines": PermFacilitiesEdit,
@@ -123,12 +168,14 @@ var writeAreas = map[string]string{
 	"data-sources": PermDataManage, "tables": PermDataManage, "data-links": PermDataManage,
 	"import-jobs": PermDataManage, "correlation-rules": PermDataManage, "streams": PermDataManage,
 	"entity-states": PermDataManage, "demo": PermDataManage, "audit-log": PermDataManage,
-	"files":       PermFilesManage,
-	"solutions":   PermSolutionsManage,
-	"reports":     PermReportsEdit,
-	"alerts":      PermAlertsManage,
-	"share-links": PermReportsShare,
-	"warehouses":  PermReportsShare, // only /warehouses/{id}/share-links is mounted under it
+	"files":        PermFilesManage,
+	"solutions":    PermSolutionsManage,
+	"reports":      PermReportsEdit,
+	"alerts":       PermAlertsManage,
+	"alert-rules":  PermAlertsManage,
+	"alert-events": PermAlertsRespond,
+	"share-links":  PermReportsShare,
+	"warehouses":   PermReportsShare, // only /warehouses/{id}/share-links is mounted under it
 }
 
 // WritePermissionFor is the permission a non-read request needs, by path.
@@ -166,14 +213,15 @@ func WritePermissionFor(r *http.Request) string {
 
 // readShapedCall reports whether a request only reads: GET / HEAD /
 // OPTIONS, and the POSTs that run a report or query rows (the path ends in
-// /run or /query).
+// /run or /query, or marks the alert bell read).
 func readShapedCall(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return true
 	case http.MethodPost:
 		p := strings.TrimSuffix(r.URL.Path, "/")
-		return strings.HasSuffix(p, "/run") || strings.HasSuffix(p, "/query")
+		// …and marking the alert bell read.
+		return strings.HasSuffix(p, "/run") || strings.HasSuffix(p, "/query") || strings.HasSuffix(p, "/alert-events/seen")
 	}
 	return false
 }

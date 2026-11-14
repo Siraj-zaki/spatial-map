@@ -6,6 +6,40 @@ All notable changes to Spatial Map are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-14
+
+### Added
+
+- **Alerts** — rules over table rows (a condition, held for a duration, a
+  stale value, or a count), evaluated on the server every 15 s; an alert bell
+  in the top bar with a chime, and an Alerts page to set rules up and
+  acknowledge / resolve what they raise. Migration `0050_alert_rules`.
+- **Custom roles** — a Roles page (from Members) where a workspace makes its
+  own roles from a permission checklist next to the four built-in ones;
+  members get a built-in or a custom role. Nobody can grant or assign more
+  than they hold. Migration `0051_roles`.
+- **Admins add people directly** — on Members, an owner or admin can create
+  the account (name, password) instead of asking the person to sign up first.
+- **Welcome dialog** on the dashboard for new users — docs, a tutorial and
+  the GitHub issue tracker.
+- **Sign-up guard** (off by default, `SPATIAL_MAP_SIGNUP_GUARD=true`): one
+  account per Gmail inbox (dots and `+aliases` count as the same inbox), no
+  throwaway inboxes, at most 3 new accounts per network per day.
+
+### Changed
+
+- **Duplicate facility** copies everything through one clone engine: every
+  shape kind (doors, image planes, routes included), bins, data sources and
+  their fields, data links and style rules, with every id inside JSON
+  rewritten to the copy.
+- Renaming a workspace needs the `workspace.manage` permission (owners and
+  admins, or a custom role that holds it).
+
+### Fixed
+
+- The **Alerts** item in the side menu (added in 0.2.0) now opens the Alerts
+  page.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
@@ -125,7 +159,8 @@ First open-source release of Spatial Map, the self-hosted edition of
 - Six languages (English, German, Spanish, French, Arabic with RTL, Chinese),
   light/dark themes and 46 colour palettes.
 
-[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Siraj-zaki/spatial-map/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Siraj-zaki/spatial-map/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Siraj-zaki/spatial-map/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Siraj-zaki/spatial-map/releases/tag/v0.1.0

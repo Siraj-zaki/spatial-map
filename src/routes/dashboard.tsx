@@ -55,6 +55,7 @@ import { EmptyState } from '@/components/empty-state'
 import { FacilityCard, FacilityCardSkeleton } from '@/components/facility-card'
 import { PageContainer, PageHero, rise } from '@/components/page-shell'
 import { StatCard } from '@/components/stat-card'
+import { WelcomeDialog } from '@/components/onboarding/welcome-dialog'
 import { useAuthStore, type AuthTenant } from '@/lib/auth-store'
 import { getCurrentTenantIdSync, subscribeTenantChanges } from '@/lib/tenant-store'
 import { cn } from '@/lib/utils'
@@ -116,6 +117,7 @@ export default function Dashboard() {
 
   return (
     <PageContainer>
+      <WelcomeDialog />
       <div {...rise(0)}>
         <PageHero
           title={

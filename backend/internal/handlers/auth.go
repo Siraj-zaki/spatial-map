@@ -75,6 +75,7 @@ const (
 	codeOTPIncorrect        = "otp_incorrect"
 	codeVerificationExpired = "verification_expired"
 	codeEmailTaken          = "email_taken"
+	codeEmailDisposable     = "email_disposable"
 	codePasswordWeak        = "password_weak"
 	codeInvalidCredentials  = "invalid_credentials"
 	codeNotAuthenticated    = "not_authenticated"
@@ -216,6 +217,19 @@ type AuthTenant struct {
 	SubscriptionStatus string `json:"subscriptionStatus"`
 	SubscribedAt       string `json:"subscribedAt,omitempty"`
 	IsLocked           bool   `json:"isLocked"`
+	// Permissions decide what the UI offers (the API enforces the same,
+	// api/permissions.go). CustomRoleID / RoleName are set for a custom role.
+	Permissions  []string `json:"permissions"`
+	CustomRoleID int64    `json:"customRoleId,omitempty"`
+	RoleName     string   `json:"roleName,omitempty"`
+}
+
+// authTenantPermissions is a membership's permission list for the session.
+func authTenantPermissions(role string, customRoleID pgtype.Int8, customPerms []string) []string {
+	if customRoleID.Valid {
+		return customPerms
+	}
+	return api.BuiltinPermissions(role)
 }
 
 // AuthResponse is returned by signup and login.
@@ -230,7 +244,12 @@ type AuthResponse struct {
 type AuthMember struct {
 	UserID int64  `json:"userId"`
 	Email  string `json:"email"`
-	Role   string `json:"role"`
+	// Role is the built-in role, or for a custom role its base role
+	// (editor / viewer); CustomRoleID + RoleName then name the custom role.
+	Role         string `json:"role"`
+	CustomRoleID int64  `json:"customRoleId,omitempty"`
+	RoleName     string `json:"roleName,omitempty"`
+	DisplayName  string `json:"displayName,omitempty"`
 }
 
 // ---- Router ----------------------------------------------------------------
@@ -286,7 +305,11 @@ func AuthRouter(q *db.Queries, pool *pgxpool.Pool, jwtSecret string, m mailer.Ma
 		Post("/signup-request", authSignupRequest(q, m, otpSendEmail, tooManyMsg))
 	r.With(api.RateLimitByIP(otpVerifyIP, tooManyMsg)).
 		Post("/verify-otp", authVerifyOTP(q, jwtSecret, otpVerifyEmail, tooManyMsg))
-	r.Post("/complete-signup", authCompleteSignup(q, pool, jwtSecret))
+	// New accounts per IP per day (counted when an account is created, so
+	// typos and weak-password retries don't use it up). In memory: a restart
+	// resets it. Only with the sign-up guard on (signup_guard.go).
+	signupDailyIP := api.NewKeyedLimiter(3.0/86400.0, 3, 25*time.Hour)
+	r.Post("/complete-signup", authCompleteSignup(q, pool, jwtSecret, signupDailyIP))
 	r.With(api.RateLimitByIP(loginIP, tooManyMsg)).
 		Post("/login", authLogin(q, jwtSecret, loginEmail, tooManyMsg))
 	r.With(api.RateLimitByIP(resetSendIP, tooManyMsg)).
@@ -302,10 +325,10 @@ func AuthRouter(q *db.Queries, pool *pgxpool.Pool, jwtSecret string, m mailer.Ma
 
 // TenantMembersRouter mounts membership management for the current tenant.
 // Tenant-scoped (requires X-Tenant-Id) and JWT-protected.
-func TenantMembersRouter(q *db.Queries) chi.Router {
+func TenantMembersRouter(q *db.Queries, pool *pgxpool.Pool) chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", listTenantMembers(q))
-	r.Post("/", inviteTenantMember(q))
+	r.Post("/", inviteTenantMember(q, pool))
 	r.Patch("/{userId}", updateTenantMemberRole(q))
 	r.Delete("/{userId}", removeTenantMember(q))
 	return r
@@ -325,6 +348,10 @@ func authSignupRequest(q *db.Queries, m mailer.Mailer, emailLimiter *api.KeyedLi
 			api.ErrorCode(w, http.StatusBadRequest, codeInvalidEmail, "invalid email")
 			return
 		}
+		if signupGuard && isDisposableEmail(email) {
+			api.ErrorCode(w, http.StatusBadRequest, codeEmailDisposable, "please sign up with a permanent email address")
+			return
+		}
 		// Per-email throttle: stops an attacker who rotates IPs from
 		// email-bombing one victim's inbox with sign-up codes.
 		if ok, wait := emailLimiter.Check(email); !ok {
@@ -342,6 +369,16 @@ func authSignupRequest(q *db.Queries, m mailer.Mailer, emailLimiter *api.KeyedLi
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			api.InternalError(w, r, err)
 			return
+		}
+		// Sign-up guard: another spelling of a Gmail inbox that already has
+		// an account (dots, +alias) counts as the same account.
+		if id := gmailIdentity(email); signupGuard && !alreadyRegistered && id != "" {
+			taken, err := q.GmailInboxHasUser(r.Context(), id)
+			if err != nil {
+				api.InternalError(w, r, err)
+				return
+			}
+			alreadyRegistered = taken
 		}
 
 		if !alreadyRegistered {
@@ -455,7 +492,7 @@ func authVerifyOTP(q *db.Queries, jwtSecret string, emailLimiter *api.KeyedLimit
 
 // ---- Signup step 3: verification token + password → session ----------------
 
-func authCompleteSignup(q *db.Queries, pool *pgxpool.Pool, jwtSecret string) http.HandlerFunc {
+func authCompleteSignup(q *db.Queries, pool *pgxpool.Pool, jwtSecret string, dailyIP *api.KeyedLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req CompleteSignupBody
 		if err := api.DecodeBody(r, &req); err != nil {
@@ -488,6 +525,32 @@ func authCompleteSignup(q *db.Queries, pool *pgxpool.Pool, jwtSecret string) htt
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			api.InternalError(w, r, err)
 			return
+		}
+		if signupGuard {
+			// Another spelling of the same Gmail inbox, and throwaway inboxes
+			// (signup-request refuses them too; this covers a token minted
+			// before the guard was turned on).
+			if id := gmailIdentity(email); id != "" {
+				taken, err := q.GmailInboxHasUser(r.Context(), id)
+				if err != nil {
+					api.InternalError(w, r, err)
+					return
+				}
+				if taken {
+					api.ErrorCode(w, http.StatusConflict, codeEmailTaken, "an account with this email already exists")
+					return
+				}
+			}
+			if isDisposableEmail(email) {
+				api.ErrorCode(w, http.StatusBadRequest, codeEmailDisposable, "please sign up with a permanent email address")
+				return
+			}
+			// Daily new-account cap per IP, spent only now that an account
+			// is about to be created.
+			if ok, wait := dailyIP.Check(api.ClientIP(r)); !ok {
+				api.TooManyRequests(w, wait, "too many new accounts from this network today — please try again tomorrow")
+				return
+			}
 		}
 
 		hash, err := auth.HashPassword(req.Password)
@@ -945,6 +1008,7 @@ func newAuthTenant(id int64, name, color, role string) AuthTenant {
 		WarehouseLimit:     0,
 		SubscriptionStatus: SelfHostedSubscriptionStatus,
 		IsLocked:           false,
+		Permissions:        api.BuiltinPermissions(role),
 	}
 }
 
@@ -959,6 +1023,9 @@ func toAuthTenants(rows []db.ListUserTenantsRow) []AuthTenant {
 	out := make([]AuthTenant, len(rows))
 	for i, row := range rows {
 		out[i] = newAuthTenant(row.TenantID, row.TenantName, row.TenantColor, row.Role)
+		out[i].Permissions = authTenantPermissions(row.Role, row.CustomRoleID, row.CustomPermissions)
+		out[i].CustomRoleID = row.CustomRoleID.Int64
+		out[i].RoleName = row.CustomRoleName
 	}
 	return out
 }
@@ -970,30 +1037,43 @@ func toAuthTenants(rows []db.ListUserTenantsRow) []AuthTenant {
 func listTenantMembers(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := api.TenantID(r.Context())
-		rows, err := q.ListTenantMembers(r.Context(), tenantID)
+		rows, err := q.ListTenantMembersWithRoles(r.Context(), tenantID)
 		if err != nil {
 			api.InternalError(w, r, err)
 			return
 		}
 		out := make([]AuthMember, len(rows))
 		for i, row := range rows {
-			out[i] = AuthMember{UserID: row.UserID, Email: row.UserEmail, Role: row.Role}
+			out[i] = AuthMember{UserID: row.UserID, Email: row.Email, Role: row.Role,
+				CustomRoleID: row.CustomRoleID.Int64, RoleName: row.CustomRoleName, DisplayName: row.DisplayName}
 		}
 		api.JSON(w, http.StatusOK, out)
 	}
 }
 
-// InviteMemberRequest is the body for adding an existing user to a tenant.
-// For now invites require the invitee to already have an account — a future
-// migration will add an email-token invite flow for unknown emails.
+// InviteMemberRequest is the body for adding a user to a tenant. With only
+// an email the invitee must already have an account. With a password too,
+// an owner/admin creates the account when the email has none (a workspace
+// without public sign-up can still add its people); an existing account is
+// added as it is and keeps its own password.
 type InviteMemberRequest struct {
-	Email string `json:"email"`
-	Role  string `json:"role"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	Name     string `json:"name,omitempty"`
+	Password string `json:"password,omitempty"`
+	// RoleID picks a custom role instead of Role.
+	RoleID int64 `json:"roleId,omitempty"`
 }
 
-func inviteTenantMember(q *db.Queries) http.HandlerFunc {
+// InviteMemberResponse says whether the account was created by the call.
+type InviteMemberResponse struct {
+	AuthMember
+	Created bool `json:"created"`
+}
+
+func inviteTenantMember(q *db.Queries, pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermMembersManage) {
 			return
 		}
 		var req InviteMemberRequest
@@ -1006,52 +1086,97 @@ func inviteTenantMember(q *db.Queries) http.HandlerFunc {
 			api.ErrorCode(w, http.StatusBadRequest, codeInvalidEmail, "invalid email")
 			return
 		}
-		if !isValidRole(req.Role) {
-			api.BadRequest(w, "invalid role")
-			return
-		}
-		// Owner can only be assigned by the tenant creator at signup; admins
-		// can only invite at admin/editor/viewer levels.
-		if req.Role == RoleOwner {
-			api.BadRequest(w, "cannot assign owner role via invite")
+		// Owner can only be assigned by the tenant creator at signup; nobody
+		// gives a role with permissions they don't hold themselves.
+		choice, ok := resolveRoleChoice(w, r, q, req.Role, req.RoleID)
+		if !ok {
 			return
 		}
 
-		invitee, err := q.GetUserByEmail(r.Context(), req.Email)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				api.NotFound(w, "no user with that email — they must sign up first")
-				return
-			}
+		ctx := r.Context()
+		tenantID := api.TenantID(ctx)
+		invitee, err := q.GetUserByEmail(ctx, req.Email)
+		exists := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			api.InternalError(w, r, err)
 			return
 		}
+		if !exists && req.Password == "" {
+			api.NotFound(w, "no user with that email — they must sign up first")
+			return
+		}
+		hash := ""
+		if !exists {
+			if err := auth.ValidatePassword(req.Password); err != nil {
+				api.ErrorCode(w, http.StatusBadRequest, codePasswordWeak, err.Error())
+				return
+			}
+			if hash, err = auth.HashPassword(req.Password); err != nil {
+				api.InternalError(w, r, err)
+				return
+			}
+		}
 
-		tenantID := api.TenantID(r.Context())
-		if _, err := q.AddUserTenant(r.Context(), db.AddUserTenantParams{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			api.InternalError(w, r, err)
+			return
+		}
+		defer tx.Rollback(ctx)
+		qtx := q.WithTx(tx)
+		if !exists {
+			u, err := qtx.CreateUser(ctx, db.CreateUserParams{Email: req.Email, PasswordHash: hash})
+			if err != nil {
+				api.InternalError(w, r, err)
+				return
+			}
+			// Created by a workspace admin, who vouches for the address.
+			if err := qtx.MarkUserVerified(ctx, u.ID); err != nil {
+				api.InternalError(w, r, err)
+				return
+			}
+			if name := strings.TrimSpace(req.Name); name != "" {
+				if u, err = qtx.UpdateUserProfile(ctx, db.UpdateUserProfileParams{ID: u.ID, DisplayName: name}); err != nil {
+					api.InternalError(w, r, err)
+					return
+				}
+			}
+			invitee = u
+		}
+		if _, err := qtx.AddUserTenant(ctx, db.AddUserTenantParams{
 			UserID:   invitee.ID,
 			TenantID: tenantID,
-			Role:     req.Role,
+			Role:     choice.Base,
 		}); err != nil {
 			api.InternalError(w, r, err)
 			return
 		}
-		api.JSON(w, http.StatusOK, AuthMember{
-			UserID: invitee.ID,
-			Email:  invitee.Email,
-			Role:   req.Role,
+		if err := qtx.SetMemberRole(ctx, db.SetMemberRoleParams{Role: choice.Base, CustomRoleID: choice.CustomID, UserID: invitee.ID, TenantID: tenantID}); err != nil {
+			api.InternalError(w, r, err)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			api.InternalError(w, r, err)
+			return
+		}
+		api.JSON(w, http.StatusOK, InviteMemberResponse{
+			AuthMember: AuthMember{UserID: invitee.ID, Email: invitee.Email, Role: choice.Base,
+				CustomRoleID: choice.CustomID.Int64, RoleName: choice.CustomName, DisplayName: invitee.DisplayName},
+			Created: !exists,
 		})
 	}
 }
 
-// UpdateMemberRequest is the body for changing a member's role.
+// UpdateMemberRequest is the body for changing a member's role: a built-in
+// Role, or a custom role by RoleID.
 type UpdateMemberRequest struct {
-	Role string `json:"role"`
+	Role   string `json:"role"`
+	RoleID int64  `json:"roleId,omitempty"`
 }
 
 func updateTenantMemberRole(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermMembersManage) {
 			return
 		}
 		targetUserID, err := api.IDParam(r, "userId")
@@ -1064,17 +1189,11 @@ func updateTenantMemberRole(q *db.Queries) http.HandlerFunc {
 			api.ErrorCode(w, http.StatusBadRequest, codeInvalidRequest, "invalid request body")
 			return
 		}
-		if !isValidRole(req.Role) {
-			api.BadRequest(w, "invalid role")
-			return
-		}
 		tenantID := api.TenantID(r.Context())
 		// Don't let admins downgrade an owner — only an owner can demote
 		// themselves, and that's left to a future "transfer ownership" flow.
-		existing, err := q.GetUserTenantMembership(r.Context(), db.GetUserTenantMembershipParams{
-			UserID:   targetUserID,
-			TenantID: tenantID,
-		})
+		// Nobody changes someone who can do more than they can.
+		existingRole, existingPerms, err := memberPermissions(r, q, targetUserID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				api.NotFound(w, "member not found")
@@ -1083,25 +1202,31 @@ func updateTenantMemberRole(q *db.Queries) http.HandlerFunc {
 			api.InternalError(w, r, err)
 			return
 		}
-		if existing.Role == RoleOwner {
+		if existingRole == RoleOwner {
 			api.Error(w, http.StatusForbidden, "cannot change the owner's role")
 			return
 		}
-		if err := q.UpdateUserTenantRole(r.Context(), db.UpdateUserTenantRoleParams{
-			UserID:   targetUserID,
-			TenantID: tenantID,
-			Role:     req.Role,
+		if !api.HasAllPermissions(r.Context(), existingPerms) {
+			api.ErrorCode(w, http.StatusForbidden, codeRoleEscalates, "you can't change someone who can do more than you")
+			return
+		}
+		choice, ok := resolveRoleChoice(w, r, q, req.Role, req.RoleID)
+		if !ok {
+			return
+		}
+		if err := q.SetMemberRole(r.Context(), db.SetMemberRoleParams{
+			Role: choice.Base, CustomRoleID: choice.CustomID, UserID: targetUserID, TenantID: tenantID,
 		}); err != nil {
 			api.InternalError(w, r, err)
 			return
 		}
-		api.JSON(w, http.StatusOK, AuthMember{UserID: targetUserID, Role: req.Role})
+		api.JSON(w, http.StatusOK, AuthMember{UserID: targetUserID, Role: choice.Base, CustomRoleID: choice.CustomID.Int64, RoleName: choice.CustomName})
 	}
 }
 
 func removeTenantMember(q *db.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, q, RoleOwner, RoleAdmin) {
+		if !api.RequirePermission(w, r, api.PermMembersManage) {
 			return
 		}
 		targetUserID, err := api.IDParam(r, "userId")
@@ -1110,10 +1235,7 @@ func removeTenantMember(q *db.Queries) http.HandlerFunc {
 			return
 		}
 		tenantID := api.TenantID(r.Context())
-		existing, err := q.GetUserTenantMembership(r.Context(), db.GetUserTenantMembershipParams{
-			UserID:   targetUserID,
-			TenantID: tenantID,
-		})
+		existingRole, existingPerms, err := memberPermissions(r, q, targetUserID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				api.NotFound(w, "member not found")
@@ -1122,8 +1244,12 @@ func removeTenantMember(q *db.Queries) http.HandlerFunc {
 			api.InternalError(w, r, err)
 			return
 		}
-		if existing.Role == RoleOwner {
+		if existingRole == RoleOwner {
 			api.Error(w, http.StatusForbidden, "cannot remove the owner")
+			return
+		}
+		if !api.HasAllPermissions(r.Context(), existingPerms) {
+			api.ErrorCode(w, http.StatusForbidden, codeRoleEscalates, "you can't remove someone who can do more than you")
 			return
 		}
 		if err := q.RemoveUserTenant(r.Context(), db.RemoveUserTenantParams{

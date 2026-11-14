@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { CircleAlert, Loader2, Search, Trash2, UserPlus, Users, X } from 'lucide-react'
+import { CircleAlert, KeyRound, Loader2, Search, Trash2, UserPlus, Users, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -44,13 +44,15 @@ import { useAuthStore, type AuthRole } from '@/lib/auth-store'
 import { getCurrentTenantIdSync } from '@/lib/tenant-store'
 import { toast } from '@/lib/toast-store'
 import { cn } from '@/lib/utils'
+import { listRoles, roleChoiceOf, type RoleChoice, type RoleView } from '@/lib/permissions'
+import { Link } from 'react-router-dom'
 
 // "owner" is never assignable — there is exactly one, created at signup.
 const ASSIGNABLE_ROLES: AuthRole[] = ['admin', 'editor', 'viewer']
 const ROLE_ORDER: Record<AuthRole, number> = { owner: 0, admin: 1, editor: 2, viewer: 3 }
 
 const ROLE_DESCRIPTIONS: Record<AuthRole, string> = {
-  owner: 'Everything, including deleting the workspace.',
+  owner: 'Everything, including billing and deleting the workspace.',
   admin: 'Manage members, integrations and files, plus everything editors can do.',
   editor: 'Create and edit facilities, tables and reports.',
   viewer: 'See facilities, data and reports. Can’t change anything.',
@@ -85,6 +87,18 @@ export default function MembersPage() {
   }, [queryKey])
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), [])
+
+  // Custom roles offered in this workspace (its own).
+  const [customRoles, setCustomRoles] = useState<RoleView[]>([])
+  useEffect(() => {
+    let cancelled = false
+    listRoles()
+      .then((r) => !cancelled && setCustomRoles(r.roles.filter((x) => !x.builtIn)))
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [tenantId])
   const loading = result?.key !== queryKey && !result?.members.length
   const members = useMemo(() => result?.members ?? [], [result])
   const setMembers = (fn: (m: MemberRow[]) => MemberRow[]) =>
@@ -113,21 +127,30 @@ export default function MembersPage() {
   const [removeError, setRemoveError] = useState<string | null>(null)
 
   const roleName = (role: AuthRole) => t(`members.role.${role}`, { defaultValue: role })
+  /** The role a member shows: a custom role's name, else the built-in one. */
+  const memberRoleLabel = (m: MemberRow) => m.roleName || roleName(m.role)
 
-  const changeRole = async (m: MemberRow, role: AuthRole, undo = false) => {
-    const previous = m.role
-    if (previous === role) return
-    setMembers((list) => list.map((x) => (x.userId === m.userId ? { ...x, role } : x)))
+  const changeRole = async (m: MemberRow, choice: RoleChoice, undo = false) => {
+    const previous = roleChoiceOf(m)
+    if (previous === choice) return
+    const before = { role: m.role, customRoleId: m.customRoleId, roleName: m.roleName }
     try {
-      await updateMemberRole(m.userId, role)
+      const row = await updateMemberRole(m.userId, choice)
+      const after = { role: row.role, customRoleId: row.customRoleId, roleName: row.roleName }
+      setMembers((list) => list.map((x) => (x.userId === m.userId ? { ...x, ...after } : x)))
       if (!undo) {
-        toast.success(t('members.roleChanged', { defaultValue: '{{email}} is now {{role}}', email: m.email, role: roleName(role) }), {
-          action: { label: t('common.undo', { defaultValue: 'Undo' }), onClick: () => void changeRole({ ...m, role }, previous, true) },
+        toast.success(t('members.roleChanged', { defaultValue: '{{email}} is now {{role}}', email: m.email, role: row.roleName || roleName(row.role) }), {
+          action: { label: t('common.undo', { defaultValue: 'Undo' }), onClick: () => void changeRole({ ...m, ...after }, previous, true) },
         })
       }
     } catch (err) {
-      setMembers((list) => list.map((x) => (x.userId === m.userId ? { ...x, role: previous } : x)))
-      toast.error(t('members.updateFailed', { defaultValue: 'Could not update role.' }), { description: (err as Error).message })
+      setMembers((list) => list.map((x) => (x.userId === m.userId ? { ...x, ...before } : x)))
+      toast.error(
+        err instanceof ApiError && err.code === 'role_escalates'
+          ? t('members.roleEscalates', { defaultValue: "You can't give a role that can do more than yours." })
+          : t('members.updateFailed', { defaultValue: 'Could not update role.' }),
+        { description: err instanceof ApiError && err.code === 'role_escalates' ? undefined : (err as Error).message },
+      )
     }
   }
 
@@ -173,7 +196,17 @@ export default function MembersPage() {
               ? t('members.subtitle', { defaultValue: 'People with access to {{workspace}}.', workspace: workspace.name })
               : t('members.subtitleFallback', { defaultValue: 'People with access to this workspace.' })
           }
-          actions={inviteButton}
+          actions={
+            <div className="flex flex-wrap gap-2">
+              <Button asChild variant="outline">
+                <Link to="/roles">
+                  <KeyRound className="h-4 w-4" />
+                  {t('roles.title', { defaultValue: 'Roles' })}
+                </Link>
+              </Button>
+              {inviteButton}
+            </div>
+          }
         />
       </div>
 
@@ -259,22 +292,34 @@ export default function MembersPage() {
                         {isSelf && <Badge variant="muted">{t('members.you', { defaultValue: 'You' })}</Badge>}
                       </p>
                       <p className="mt-0.5 hidden truncate text-xs text-muted-foreground sm:block">
-                        {t(`members.roleDesc.${m.role}`, { defaultValue: ROLE_DESCRIPTIONS[m.role] })}
+                        {m.customRoleId
+                          ? customRoles.find((r) => r.id === m.customRoleId)?.description ||
+                            t('members.customRoleDesc', { defaultValue: 'Custom role' })
+                          : t(`members.roleDesc.${m.role}`, { defaultValue: ROLE_DESCRIPTIONS[m.role] })}
                       </p>
                     </div>
                     {editable ? (
                       <>
                         <select
-                          value={m.role}
-                          onChange={(e) => void changeRole(m, e.target.value as AuthRole)}
+                          value={roleChoiceOf(m)}
+                          onChange={(e) => void changeRole(m, e.target.value as RoleChoice)}
                           aria-label={t('members.roleFor', { defaultValue: 'Role for {{email}}', email: m.email })}
                           className="h-9 rounded-md border border-input bg-background px-2.5 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                         >
                           {ASSIGNABLE_ROLES.map((r) => (
-                            <option key={r} value={r}>
+                            <option key={r} value={`builtin:${r}`}>
                               {roleName(r)}
                             </option>
                           ))}
+                          {customRoles.length > 0 && (
+                            <optgroup label={t('roles.custom', { defaultValue: 'Custom roles' })}>
+                              {customRoles.map((r) => (
+                                <option key={r.id} value={`custom:${r.id}`}>
+                                  {r.name}
+                                </option>
+                              ))}
+                            </optgroup>
+                          )}
                         </select>
                         <Button
                           variant="ghost"
@@ -292,7 +337,7 @@ export default function MembersPage() {
                       </>
                     ) : (
                       <Badge variant={m.role === 'owner' ? 'secondary' : 'outline'} className="font-normal">
-                        {roleName(m.role)}
+                        {memberRoleLabel(m)}
                       </Badge>
                     )}
                   </li>
@@ -340,6 +385,7 @@ export default function MembersPage() {
           open={inviteOpen}
           onOpenChange={setInviteOpen}
           members={members}
+          customRoles={customRoles}
           workspaceName={workspace?.name}
           onInvited={(row) => {
             setMembers((list) => [...list.filter((x) => x.userId !== row.userId), row])
@@ -374,18 +420,24 @@ function InviteDialog({
   open,
   onOpenChange,
   members,
+  customRoles,
   workspaceName,
   onInvited,
 }: {
   open: boolean
   onOpenChange: (o: boolean) => void
   members: MemberRow[]
+  customRoles: RoleView[]
   workspaceName?: string
   onInvited: (row: MemberRow) => void
 }) {
   const { t } = useTranslation()
+  // Client sites have no sign-up, so adding someone usually means creating their account.
+  const [mode, setMode] = useState<'existing' | 'new'>('existing')
   const [email, setEmail] = useState('')
-  const [role, setRole] = useState<AuthRole>('editor')
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [role, setRole] = useState<RoleChoice>('builtin:editor')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const roleName = (r: AuthRole) => t(`members.role.${r}`, { defaultValue: r })
@@ -395,24 +447,37 @@ function InviteDialog({
     if (!clean) return
     const existing = members.find((m) => m.email.toLowerCase() === clean)
     if (existing) {
-      setError(t('members.alreadyMember', { defaultValue: '{{email}} is already a member ({{role}}).', email: clean, role: roleName(existing.role) }))
+      setError(t('members.alreadyMember', { defaultValue: '{{email}} is already a member ({{role}}).', email: clean, role: existing.roleName || roleName(existing.role) }))
+      return
+    }
+    if (mode === 'new' && password.length < 12) {
+      setError(t('members.passwordRule', { defaultValue: 'Use at least 12 characters, mixing 3 of: lowercase, uppercase, digits, symbols.' }))
       return
     }
     setBusy(true)
     setError(null)
     try {
-      const row = await inviteMember(clean, role)
-      onInvited(row.email ? row : { userId: row.userId, email: clean, role })
-      toast.success(t('members.invited', { defaultValue: '{{email}} added as {{role}}', email: clean, role: roleName(role) }))
+      const row = await inviteMember(clean, role, mode === 'new' ? { name: name.trim(), password } : undefined)
+      onInvited(row.email ? row : { ...row, email: clean })
+      const chosen = row.roleName || roleName(row.role)
+      toast.success(
+        mode === 'new' && row.created
+          ? t('members.created', { defaultValue: 'Account created for {{email}} ({{role}})', email: clean, role: chosen })
+          : mode === 'new'
+            ? t('members.addedExisting', { defaultValue: '{{email}} already had an account — added as {{role}} with their own password', email: clean, role: chosen })
+            : t('members.invited', { defaultValue: '{{email}} added as {{role}}', email: clean, role: chosen }),
+      )
       onOpenChange(false)
     } catch (err) {
+      const code = err instanceof ApiError ? err.code : undefined
       setError(
         err instanceof ApiError && err.status === 404
-          ? t('members.noAccount', {
-              defaultValue: 'No Spatial Map account uses {{email}}. Ask them to sign up first, then invite them here.',
-              email: clean,
-            })
-          : (err as Error).message,
+          ? t('members.noAccountCreate', { defaultValue: 'No account uses {{email}}. Choose “New account” to create one.', email: clean })
+          : code === 'password_weak'
+            ? t('members.passwordRule', { defaultValue: 'Use at least 12 characters, mixing 3 of: lowercase, uppercase, digits, symbols.' })
+            : code === 'role_escalates'
+              ? t('members.roleEscalates', { defaultValue: "You can't give a role that can do more than yours." })
+              : (err as Error).message,
       )
     } finally {
       setBusy(false)
@@ -425,9 +490,11 @@ function InviteDialog({
         <DialogHeader>
           <DialogTitle>{t('members.inviteTitle', { defaultValue: 'Invite to {{workspace}}', workspace: workspaceName ?? '' })}</DialogTitle>
           <DialogDescription>
-            {t('members.inviteHint', {
-              defaultValue: 'The invitee must already have an account. They’ll see this workspace after their next sign-in.',
-            })}
+            {mode === 'new'
+              ? t('members.createHint', { defaultValue: 'Create their sign-in. Give them the email and password; they can change the password later.' })
+              : t('members.inviteHint', {
+                  defaultValue: 'The invitee must already have an account. They’ll see this workspace after their next sign-in.',
+                })}
           </DialogDescription>
         </DialogHeader>
         <form
@@ -438,6 +505,32 @@ function InviteDialog({
             void submit()
           }}
         >
+          <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="radiogroup" aria-label={t('members.accountKind', { defaultValue: 'Account' })}>
+            {(['new', 'existing'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                role="radio"
+                aria-checked={mode === m}
+                onClick={() => {
+                  setMode(m)
+                  setError(null)
+                }}
+                className={cn(
+                  'rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  mode === m ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {m === 'new' ? t('members.newAccount', { defaultValue: 'New account' }) : t('members.existingAccount', { defaultValue: 'Existing account' })}
+              </button>
+            ))}
+          </div>
+          {mode === 'new' && (
+            <div className="space-y-1.5">
+              <Label htmlFor="invite-name">{t('members.name', { defaultValue: 'Name' })}</Label>
+              <Input id="invite-name" autoComplete="off" value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+          )}
           <div className="space-y-1.5">
             <Label htmlFor="invite-email">{t('auth.email', { defaultValue: 'Email' })}</Label>
             <Input
@@ -456,29 +549,58 @@ function InviteDialog({
               aria-invalid={!!error}
             />
           </div>
+          {mode === 'new' && (
+            <div className="space-y-1.5">
+              <Label htmlFor="invite-password">{t('auth.password', { defaultValue: 'Password' })}</Label>
+              <Input
+                id="invite-password"
+                type="text"
+                dir="ltr"
+                autoComplete="new-password"
+                spellCheck={false}
+                value={password}
+                onChange={(e) => {
+                  setPassword(e.target.value)
+                  setError(null)
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('members.passwordHint', { defaultValue: "If the email already has an account, it's added as it is and keeps its own password." })}
+              </p>
+            </div>
+          )}
           <fieldset className="space-y-2">
             <legend className="mb-1.5 text-sm font-medium">{t('members.roleLabel', { defaultValue: 'Role' })}</legend>
-            {ASSIGNABLE_ROLES.map((r) => (
+            {[
+              ...ASSIGNABLE_ROLES.map((r) => ({
+                choice: `builtin:${r}` as RoleChoice,
+                name: roleName(r),
+                description: t(`members.roleDesc.${r}`, { defaultValue: ROLE_DESCRIPTIONS[r] }),
+              })),
+              ...customRoles.map((r) => ({
+                choice: `custom:${r.id}` as RoleChoice,
+                name: r.name,
+                description: r.description || t('members.customRoleDesc', { defaultValue: 'Custom role' }),
+              })),
+            ].map((r) => (
               <label
-                key={r}
+                key={r.choice}
                 className={cn(
                   'flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors',
-                  role === r ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:bg-accent/50',
+                  role === r.choice ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:bg-accent/50',
                 )}
               >
                 <input
                   type="radio"
                   name="invite-role"
-                  value={r}
-                  checked={role === r}
-                  onChange={() => setRole(r)}
+                  value={r.choice}
+                  checked={role === r.choice}
+                  onChange={() => setRole(r.choice)}
                   className="mt-1 accent-[hsl(var(--primary))]"
                 />
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium">{roleName(r)}</span>
-                  <span className="block text-sm text-muted-foreground">
-                    {t(`members.roleDesc.${r}`, { defaultValue: ROLE_DESCRIPTIONS[r] })}
-                  </span>
+                  <span className="block text-sm font-medium">{r.name}</span>
+                  <span className="block text-sm text-muted-foreground">{r.description}</span>
                 </span>
               </label>
             ))}
@@ -496,7 +618,7 @@ function InviteDialog({
           </Button>
           <Button type="submit" form="invite-form" disabled={busy || !email.trim()}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" /> : <UserPlus className="h-4 w-4" />}
-            {t('members.sendInvite', { defaultValue: 'Add to workspace' })}
+            {mode === 'new' ? t('members.createAccount', { defaultValue: 'Create account' }) : t('members.sendInvite', { defaultValue: 'Add to workspace' })}
           </Button>
         </DialogFooter>
       </DialogContent>

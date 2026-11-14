@@ -33,6 +33,11 @@ export interface AuthTenant {
   name: string
   color: string
   role: AuthRole
+  /** What the member may change here (custom roles; see lib/permissions.ts). */
+  permissions?: string[]
+  /** Set for a custom role: its id and name (`role` is then its base role). */
+  customRoleId?: number
+  roleName?: string
 }
 
 export interface AuthSession {

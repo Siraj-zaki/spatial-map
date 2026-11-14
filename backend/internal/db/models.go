@@ -365,6 +365,65 @@ type Alert struct {
 	AcknowledgedAt pgtype.Timestamptz `json:"acknowledged_at"`
 }
 
+type AlertEvent struct {
+	ID             int64              `json:"id"`
+	TenantID       int64              `json:"tenant_id"`
+	RuleID         int64              `json:"rule_id"`
+	ZoneID         pgtype.Int8        `json:"zone_id"`
+	SourceID       pgtype.Int8        `json:"source_id"`
+	EntityKey      string             `json:"entity_key"`
+	ItemLabel      string             `json:"item_label"`
+	Severity       string             `json:"severity"`
+	Message        string             `json:"message"`
+	Status         string             `json:"status"`
+	Snapshot       json.RawMessage    `json:"snapshot"`
+	OpenedAt       pgtype.Timestamptz `json:"opened_at"`
+	AcknowledgedAt pgtype.Timestamptz `json:"acknowledged_at"`
+	AcknowledgedBy pgtype.Int8        `json:"acknowledged_by"`
+	ResolvedAt     pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedBy     pgtype.Int8        `json:"resolved_by"`
+	Note           string             `json:"note"`
+}
+
+type AlertRule struct {
+	ID               int64              `json:"id"`
+	TenantID         int64              `json:"tenant_id"`
+	ZoneID           pgtype.Int8        `json:"zone_id"`
+	SourceID         int64              `json:"source_id"`
+	Name             string             `json:"name"`
+	Description      string             `json:"description"`
+	Kind             string             `json:"kind"`
+	Condition        json.RawMessage    `json:"condition"`
+	DurationSec      int32              `json:"duration_sec"`
+	StaleField       string             `json:"stale_field"`
+	Comparison       string             `json:"comparison"`
+	Threshold        int32              `json:"threshold"`
+	Severity         string             `json:"severity"`
+	Message          string             `json:"message"`
+	LabelField       string             `json:"label_field"`
+	RecipientRoles   []string           `json:"recipient_roles"`
+	RecipientUserIds []int64            `json:"recipient_user_ids"`
+	CooldownSec      int32              `json:"cooldown_sec"`
+	Enabled          bool               `json:"enabled"`
+	CreatedBy        pgtype.Int8        `json:"created_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	LastEvaluatedAt  pgtype.Timestamptz `json:"last_evaluated_at"`
+	LastError        string             `json:"last_error"`
+}
+
+type AlertRuleState struct {
+	RuleID        int64              `json:"rule_id"`
+	EntityKey     string             `json:"entity_key"`
+	MatchingSince pgtype.Timestamptz `json:"matching_since"`
+}
+
+type AlertSeen struct {
+	TenantID int64              `json:"tenant_id"`
+	UserID   int64              `json:"user_id"`
+	SeenAt   pgtype.Timestamptz `json:"seen_at"`
+}
+
 type AppSetting struct {
 	Key       string             `json:"key"`
 	Value     json.RawMessage    `json:"value"`
@@ -766,6 +825,17 @@ type ReportRun struct {
 	QueryName      string             `json:"query_name"`
 }
 
+type Role struct {
+	ID          int64              `json:"id"`
+	TenantID    int64              `json:"tenant_id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Permissions []string           `json:"permissions"`
+	CreatedBy   pgtype.Int8        `json:"created_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Route struct {
 	ID          int64              `json:"id"`
 	TenantID    int64              `json:"tenant_id"`
@@ -983,10 +1053,11 @@ type UserModel struct {
 }
 
 type UserTenant struct {
-	UserID    int64              `json:"user_id"`
-	TenantID  int64              `json:"tenant_id"`
-	Role      string             `json:"role"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UserID       int64              `json:"user_id"`
+	TenantID     int64              `json:"tenant_id"`
+	Role         string             `json:"role"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	CustomRoleID pgtype.Int8        `json:"custom_role_id"`
 }
 
 type WebhookEvent struct {

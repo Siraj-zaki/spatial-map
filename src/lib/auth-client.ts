@@ -11,6 +11,7 @@ import { ApiError, apiGet, apiPost, apiPatch, apiDelete } from './api-client'
 import { useAuthStore, type AuthSession, type AuthRole } from './auth-store'
 import { resetTenantStore } from './tenant-store'
 import { useDoorStore } from './door/store'
+import { roleChoiceBody, type RoleChoice } from './permissions'
 
 /**
  * Wipe every user-scoped store so a login / signup / logout doesn't
@@ -216,19 +217,32 @@ export async function refreshSession(): Promise<void> {
 export interface MemberRow {
   userId: number
   email: string
+  /** Built-in role, or a custom role's base role (then customRoleId / roleName are set). */
   role: AuthRole
+  customRoleId?: number
+  roleName?: string
+  displayName?: string
 }
 
 export function listMembers(): Promise<MemberRow[]> {
   return apiGet<MemberRow[]>('/members')
 }
 
-export function inviteMember(email: string, role: AuthRole): Promise<MemberRow> {
-  return apiPost<MemberRow>('/members', { email, role })
+/**
+ * Adds someone to the current workspace. With `account` the server creates
+ * the account when the email has none (an existing account is added as it
+ * is and keeps its password).
+ */
+export function inviteMember(
+  email: string,
+  role: RoleChoice,
+  account?: { name: string; password: string },
+): Promise<MemberRow & { created?: boolean }> {
+  return apiPost<MemberRow & { created?: boolean }>('/members', { email, ...roleChoiceBody(role), ...(account ?? {}) })
 }
 
-export function updateMemberRole(userId: number, role: AuthRole): Promise<MemberRow> {
-  return apiPatch<MemberRow>(`/members/${userId}`, { role })
+export function updateMemberRole(userId: number, role: RoleChoice): Promise<MemberRow> {
+  return apiPatch<MemberRow>(`/members/${userId}`, roleChoiceBody(role))
 }
 
 export function removeMember(userId: number): Promise<void> {

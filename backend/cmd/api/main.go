@@ -165,6 +165,10 @@ func main() {
 	// is canceled at shutdown.
 	pollingWorker := polling.New(queries)
 	pollingWorker.Start(ctx)
+	// Alert rules over table rows, evaluated server-side every 15 s.
+	handlers.StartAlertEngine(ctx, queries, pool, logger)
+	// Sign-up abuse guards (off unless auth.signup_guard is set).
+	handlers.SetSignupGuard(cfg.Auth.SignupGuard)
 	logger.Info("polling worker started", "tickInterval", "60s")
 
 	// PDF floor-plan conversion. Init compiles a 5 MB PDFium WASM module,
@@ -345,7 +349,9 @@ func main() {
 			// TenantMiddleware checks membership and the broadcaster only
 			// forwards that tenant's events.
 			r.Get("/events", sseBroadcaster.ServeHTTP)
-			r.Mount("/members", handlers.TenantMembersRouter(queries))
+			r.Mount("/members", handlers.TenantMembersRouter(queries, pool))
+			// Custom roles (handlers/roles.go); changes need roles.manage.
+			r.Mount("/roles", handlers.RolesRouter(queries))
 			r.Mount("/dashboard-overview", handlers.DashboardOverviewRouter(pool, objectStore))
 			r.Mount("/warehouse-summaries", handlers.WarehouseSummariesRouter(pool))
 			r.Mount("/data", handlers.DataScreenRouter(queries, pool))
@@ -406,6 +412,10 @@ func main() {
 			r.Mount("/data-links", handlers.DataLinkConfigsRouter(queries))
 			r.Mount("/import-jobs", handlers.ImportJobsRouter(queries, pool))
 			r.Mount("/correlation-rules", handlers.CorrelationRulesRouter(queries))
+			// Alert rules over table rows and the alerts they raise (the engine
+			// above evaluates them); /alerts is the older correlation-alert list.
+			r.Mount("/alert-rules", handlers.AlertRulesRouter(queries, pool))
+			r.Mount("/alert-events", handlers.AlertEventsRouter(queries))
 			r.Mount("/alerts", handlers.AlertsRouter(queries))
 			r.Mount("/audit-log", handlers.AuditLogRouter(queries))
 			r.Mount("/bulk-assign", handlers.BulkAssignRouter(queries))
